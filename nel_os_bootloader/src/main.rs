@@ -35,6 +35,8 @@ fn get_fs() -> Directory {
 fn main() -> Status {
     uefi::helpers::init().unwrap();
 
+    uefi::system::with_stdout(|stdout| stdout.clear().unwrap());
+
     println!("\nnel_os bootloader");
 
     let memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
