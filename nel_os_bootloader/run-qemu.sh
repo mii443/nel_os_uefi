@@ -2,6 +2,7 @@
 
 EFI_BINARY="$1"
 
+./clean.sh
 ./create-iso.sh "$EFI_BINARY"
 
 qemu-system-x86_64 -enable-kvm \

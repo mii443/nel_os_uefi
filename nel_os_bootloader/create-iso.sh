@@ -2,8 +2,6 @@
 
 EFI_BINARY="$1"
 
-rm -rf iso fat.img cdimage.iso
-
 dd if=/dev/zero of=fat.img bs=1k count=1440
 mformat -i fat.img -f 1440 ::
 mmd -i fat.img ::/EFI
