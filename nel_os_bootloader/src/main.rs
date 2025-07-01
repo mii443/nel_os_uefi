@@ -5,7 +5,7 @@ extern crate alloc;
 
 use alloc::{boxed::Box, vec};
 use core::{arch::asm, slice};
-use goblin::elf::{self, Elf};
+use goblin::elf;
 use uefi::{
     allocator::Allocator,
     boot::{AllocateType, MemoryType, ScopedProtocol},
@@ -104,7 +104,7 @@ fn main() -> Status {
 
     uefi::system::with_stdout(|stdout| stdout.clear().unwrap());
 
-    println!("\nnel_os bootloader");
+    println!("nel_os bootloader");
 
     let memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
     println!("memory_map len: {}", memory_map.len());
