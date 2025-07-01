@@ -3,6 +3,7 @@
 
 pub mod constant;
 pub mod logging;
+pub mod memory;
 pub mod paging;
 pub mod serial;
 
@@ -60,10 +61,14 @@ fn hlt_loop() -> ! {
 pub extern "sysv64" fn main() {
     println!("{} v{}", BANNER, PKG_VERSION);
 
-    info!("Page table test:");
-    let virt = VirtAddr::new(0xb8000);
+    let virt = VirtAddr::new(
+        x86_64::registers::control::Cr3::read()
+            .0
+            .start_address()
+            .as_u64(),
+    );
     let phys = paging::translate_addr(virt);
-    info!("  {:?} -> {:?}", virt, phys);
+    info!("Level 4 page table: {:?} -> {:?}", virt, phys);
 
     hlt_loop();
 }
