@@ -8,3 +8,4 @@ goblin = { version = "0.10.0", features = ["elf32", "elf64", "endian_fd"], defau
 log = "0.4.27"
 uefi = { version = "0.35.0", features = ["logger", "panic_handler", "alloc"] }
 x86 = "0.52.0"
+nel_os_common = { path = "../nel_os_common" }

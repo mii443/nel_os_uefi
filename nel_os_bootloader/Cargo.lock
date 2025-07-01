@@ -49,9 +49,14 @@ version = "0.1.0"
 dependencies = [
  "goblin",
  "log",
+ "nel_os_common",
  "uefi",
  "x86",
 ]
+
+[[package]]
+name = "nel_os_common"
+version = "0.1.0"
 
 [[package]]
 name = "plain"
