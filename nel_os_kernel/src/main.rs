@@ -58,7 +58,7 @@ fn hlt_loop() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn main() {
+pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory) {
     println!("{} v{}", BANNER, PKG_VERSION);
 
     let virt = VirtAddr::new(
@@ -69,6 +69,8 @@ pub extern "sysv64" fn main() {
     );
     let phys = paging::translate_addr(virt);
     info!("Level 4 page table: {:?} -> {:?}", virt, phys);
+
+    info!("Usable memory len: {}", usable_memory.len);
 
     hlt_loop();
 }

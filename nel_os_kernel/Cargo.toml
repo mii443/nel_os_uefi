@@ -8,3 +8,4 @@ lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
 spin = "0.10.0"
 uart_16550 = "0.3.2"
 x86_64 = "0.15.2"
+nel_os_common = { path = "../nel_os_common" }

@@ -46,10 +46,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nel_os_common"
+version = "0.1.0"
+
+[[package]]
 name = "nel_os_kernel"
 version = "0.1.0"
 dependencies = [
  "lazy_static",
+ "nel_os_common",
  "spin 0.10.0",
  "uart_16550",
  "x86_64",

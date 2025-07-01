@@ -1,15 +1,17 @@
+#![feature(vec_into_raw_parts)]
 #![no_main]
 #![no_std]
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::{arch::asm, slice};
 use goblin::elf;
+use nel_os_common::memory;
 use uefi::{
     allocator::Allocator,
     boot::{AllocateType, MemoryType, ScopedProtocol},
-    mem::memory_map::MemoryMap,
+    mem::memory_map::{MemoryMap, MemoryMapOwned},
     prelude::*,
     println,
     proto::media::{
@@ -106,31 +108,51 @@ fn main() -> Status {
 
     println!("nel_os bootloader");
 
-    let memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
-    println!("memory_map len: {}", memory_map.len());
-
-    println!("Conventional memory:");
-    for entry in memory_map.entries() {
-        if entry.ty != MemoryType::CONVENTIONAL {
-            continue;
-        }
-        println!("    Size: {:?}MiB", entry.page_count * 4 / 1024);
-        println!("    PhysStart: {:?}", entry.phys_start);
-    }
-
     let kernel = read_kernel(cstr16!("nel_os_kernel.elf"));
 
     let entry_point = load_elf(kernel);
 
     println!("Entry point: {:#x}", entry_point);
 
-    let entry: extern "sysv64" fn() = unsafe { core::mem::transmute(entry_point) };
+    let entry: extern "sysv64" fn(&memory::UsableMemory) =
+        unsafe { core::mem::transmute(entry_point) };
 
-    unsafe {
-        let _ = uefi::boot::exit_boot_services(Some(MemoryType::LOADER_DATA));
-    }
+    let size = uefi::boot::memory_map(MemoryType::LOADER_DATA)
+        .unwrap()
+        .len()
+        + 8 * core::mem::size_of::<memory::Range>();
+    let mut ranges: Vec<memory::Range> = Vec::with_capacity(size);
 
-    entry();
+    println!("Usable memory size: {}", size);
+
+    let memory_map = unsafe { uefi::boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
+
+    memory_map
+        .entries()
+        .filter(|entry| {
+            matches!(
+                entry.ty,
+                MemoryType::CONVENTIONAL
+                    | MemoryType::BOOT_SERVICES_CODE
+                    | MemoryType::BOOT_SERVICES_DATA
+            )
+        })
+        .for_each(|entry| {
+            ranges.push(memory::Range {
+                start: entry.phys_start,
+                end: entry.phys_start + entry.page_count * 4096,
+            })
+        });
+
+    let usable_memory = {
+        let (ptr, len, _) = ranges.into_raw_parts();
+        memory::UsableMemory {
+            ranges: ptr as *const memory::Range,
+            len: len as u64,
+        }
+    };
+
+    entry(&usable_memory);
 
     hlt_loop();
 }
