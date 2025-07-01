@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/sh -ex
 
 EFI_BINARY="$1"
 
