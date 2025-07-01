@@ -15,5 +15,13 @@
     "features": "-mmx,-sse,+soft-float",
     "rustc-abi": "x86-softfloat",
 	"code-model": "kernel",
-	"max-atomic-width": 64
+	"max-atomic-width": 64,
+	"position-independent-executables": false,
+	"post-link-args": {
+		"ld.lld": [
+			"--entry=asm_main",
+			"--image-base=0x100000",
+			"--static"
+		]
+	}
 }
