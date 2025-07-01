@@ -70,7 +70,12 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
     let phys = paging::translate_addr(virt);
     info!("Level 4 page table: {:?} -> {:?}", virt, phys);
 
-    info!("Usable memory len: {}", usable_memory.len);
+    let ranges = usable_memory.ranges();
+    let mut count = 0;
+    for range in ranges {
+        count += range.end - range.start;
+    }
+    info!("Usable memory: {}MiB", count / 1024 / 1024);
 
     hlt_loop();
 }
