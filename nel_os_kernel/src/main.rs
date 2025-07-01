@@ -1,10 +1,18 @@
 #![no_std]
 #![no_main]
 
+pub mod constant;
+pub mod logging;
+pub mod serial;
+
 use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr::addr_of;
 
+use crate::constant::BANNER;
+
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const STACK_SIZE: usize = 1024 * 1024;
 
 #[repr(C, align(16))]
@@ -52,5 +60,6 @@ fn hlt_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main() {
+    println!("{} v{}", BANNER, PKG_VERSION);
     hlt_loop();
 }

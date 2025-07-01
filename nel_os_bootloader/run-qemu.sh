@@ -13,4 +13,5 @@ qemu-system-x86_64 -enable-kvm \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_VARS.fd \
 	-cdrom nel_os.iso \
-	-boot d
+	-boot d \
+	-s
