@@ -3,11 +3,14 @@
 
 pub mod constant;
 pub mod logging;
+pub mod paging;
 pub mod serial;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr::addr_of;
+
+use x86_64::VirtAddr;
 
 use crate::constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION};
 
@@ -39,7 +42,8 @@ pub extern "sysv64" fn asm_main() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    println!("{}", info);
     hlt_loop();
 }
 
@@ -55,5 +59,11 @@ fn hlt_loop() -> ! {
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main() {
     println!("{} v{}", BANNER, PKG_VERSION);
+
+    info!("Page table test:");
+    let virt = VirtAddr::new(0xb8000);
+    let phys = paging::translate_addr(virt);
+    info!("  {:?} -> {:?}", virt, phys);
+
     hlt_loop();
 }

@@ -1,0 +1,77 @@
+use x86_64::{
+    registers::control::Cr3,
+    structures::paging::{page_table::FrameError, PageTable, PhysFrame},
+    PhysAddr, VirtAddr,
+};
+
+pub fn get_active_level_4_table() -> &'static mut PageTable {
+    let (level_4_table_frame, _) = Cr3::read();
+
+    frame_to_page_table(level_4_table_frame)
+}
+
+pub fn frame_to_page_table(frame: PhysFrame) -> &'static mut PageTable {
+    let page_table_addr = frame.start_address().as_u64();
+    let page_table_ptr: *mut PageTable = VirtAddr::new(page_table_addr).as_mut_ptr();
+
+    unsafe { &mut *page_table_ptr }
+}
+
+pub fn translate_addr(addr: VirtAddr) -> Option<PhysAddr> {
+    let (level_4_table_frame, _) = Cr3::read();
+
+    let table_indexes = [
+        addr.p4_index(),
+        addr.p3_index(),
+        addr.p2_index(),
+        addr.p1_index(),
+    ];
+
+    let mut frame = level_4_table_frame;
+
+    let table = frame_to_page_table(frame);
+    let entry = &table[table_indexes[0]];
+    frame = match entry.frame() {
+        Ok(frame) => frame,
+        Err(FrameError::FrameNotPresent) => return None,
+        Err(FrameError::HugeFrame) => panic!("1GiB pages at level 4 are not supported"),
+    };
+
+    let table = frame_to_page_table(frame);
+    let entry = &table[table_indexes[1]];
+    match entry.frame() {
+        Ok(frame_4k) => {
+            frame = frame_4k;
+        }
+        Err(FrameError::FrameNotPresent) => return None,
+        Err(FrameError::HugeFrame) => {
+            let huge_frame_addr = entry.addr();
+            let offset_1gib = addr.as_u64() & 0x3FFF_FFFF;
+            return Some(huge_frame_addr + offset_1gib);
+        }
+    };
+
+    let table = frame_to_page_table(frame);
+    let entry = &table[table_indexes[2]];
+    match entry.frame() {
+        Ok(frame_4k) => {
+            frame = frame_4k;
+        }
+        Err(FrameError::FrameNotPresent) => return None,
+        Err(FrameError::HugeFrame) => {
+            let huge_frame_addr = entry.addr();
+            let offset_2mib = addr.as_u64() & 0x1F_FFFF;
+            return Some(huge_frame_addr + offset_2mib);
+        }
+    };
+
+    let table = frame_to_page_table(frame);
+    let entry = &table[table_indexes[3]];
+    frame = match entry.frame() {
+        Ok(frame) => frame,
+        Err(FrameError::FrameNotPresent) => return None,
+        Err(FrameError::HugeFrame) => panic!("Huge pages at level 1 are not supported"),
+    };
+
+    Some(frame.start_address() + u64::from(addr.page_offset()))
+}
