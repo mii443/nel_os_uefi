@@ -18,7 +18,7 @@ impl BitmapMemoryTable {
     }
 
     pub fn init(usable_memory: &UsableMemory) -> Self {
-        let mut table = Self::new();
+        let mut table = Self::default();
         for range in usable_memory.ranges() {
             table.set_range(range);
         }
@@ -35,7 +35,9 @@ impl BitmapMemoryTable {
         table
     }
 
-    pub fn get_free_frame(&self) {}
+    pub fn get_free_pfn(&self) -> Option<usize> {
+        (self.start..self.end).find(|&i| self.get_bit(i))
+    }
 
     pub fn set_range(&mut self, range: &memory::Range) {
         let start = Self::addr_to_pfn(range.start as usize);
@@ -78,5 +80,11 @@ impl BitmapMemoryTable {
 
     pub fn frame_to_offset(frame: usize) -> usize {
         frame % BITS_PER_ENTRY
+    }
+}
+
+impl Default for BitmapMemoryTable {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -14,7 +14,7 @@ use core::ptr::addr_of;
 use x86_64::VirtAddr;
 
 use crate::{
-    constant::{BANNER, BITS_PER_ENTRY, KERNEL_STACK_SIZE, PKG_VERSION},
+    constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
     memory::BitmapMemoryTable,
 };
 
