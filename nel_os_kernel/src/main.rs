@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+pub mod allocator;
 pub mod constant;
 pub mod logging;
 pub mod memory;
@@ -11,11 +12,12 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr::addr_of;
 
-use x86_64::VirtAddr;
+use x86_64::{structures::paging::OffsetPageTable, VirtAddr};
 
 use crate::{
     constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
     memory::BitmapMemoryTable,
+    paging::get_active_level_4_table,
 };
 
 #[repr(C, align(16))]
@@ -80,7 +82,7 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
     }
     info!("Usable memory: {}MiB", count / 1024 / 1024);
 
-    let bitmap_table = BitmapMemoryTable::init(usable_memory);
+    let mut bitmap_table = BitmapMemoryTable::init(usable_memory);
     info!(
         "Memory bitmap initialized: {} -> {}",
         bitmap_table.start, bitmap_table.end
@@ -94,6 +96,11 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
     }
 
     info!("Usable memory in bitmap: {}MiB", usable_frame * 4 / 1024);
+
+    let level_4_table = get_active_level_4_table();
+    let mut mapper = unsafe { OffsetPageTable::new(level_4_table, VirtAddr::new(0x0)) };
+
+    allocator::init_heap(&mut mapper, &mut bitmap_table).unwrap();
 
     hlt_loop();
 }
