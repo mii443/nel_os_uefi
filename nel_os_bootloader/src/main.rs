@@ -7,16 +7,19 @@ extern crate alloc;
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::{arch::asm, slice};
 use goblin::elf;
-use nel_os_common::memory;
+use nel_os_common::{gop, memory};
 use uefi::{
     allocator::Allocator,
     boot::{AllocateType, MemoryType, ScopedProtocol},
     mem::memory_map::{MemoryMap, MemoryMapOwned},
     prelude::*,
     println,
-    proto::media::{
-        file::{Directory, File, FileAttribute, FileInfo, FileMode},
-        fs::SimpleFileSystem,
+    proto::{
+        console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput, PixelFormat},
+        media::{
+            file::{Directory, File, FileAttribute, FileInfo, FileMode},
+            fs::SimpleFileSystem,
+        },
     },
     CStr16,
 };
@@ -100,6 +103,29 @@ fn load_elf(bin: Box<[u8]>) -> u64 {
     elf.entry
 }
 
+fn get_frame_buffer() -> gop::FrameBuffer {
+    let gop_handle = uefi::boot::get_handle_for_protocol::<GraphicsOutput>().unwrap();
+    let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
+
+    let info = gop.current_mode_info();
+    let (width, height) = info.resolution();
+    let frame_buffer = gop.frame_buffer().as_mut_ptr();
+    let stride = info.stride();
+    let pixel_format = info.pixel_format();
+
+    gop::FrameBuffer {
+        frame_buffer,
+        width,
+        height,
+        stride,
+        pixl_format: match pixel_format {
+            PixelFormat::Rgb => gop::PixelFormat::Rgb,
+            PixelFormat::Bgr => gop::PixelFormat::Bgr,
+            format => panic!("Unsupported pixel_format: {:?}", format),
+        },
+    }
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -114,8 +140,10 @@ fn main() -> Status {
 
     println!("Entry point: {:#x}", entry_point);
 
-    let entry: extern "sysv64" fn(&memory::UsableMemory) =
+    let entry: extern "sysv64" fn(&nel_os_common::BootInfo) =
         unsafe { core::mem::transmute(entry_point) };
+
+    let frame_buffer = get_frame_buffer();
 
     let size = uefi::boot::memory_map(MemoryType::LOADER_DATA)
         .unwrap()
@@ -152,7 +180,10 @@ fn main() -> Status {
         }
     };
 
-    entry(&usable_memory);
+    entry(&nel_os_common::BootInfo {
+        usable_memory,
+        frame_buffer,
+    });
 
     hlt_loop();
 }

@@ -7,7 +7,6 @@ EFI_BINARY="$1"
 
 qemu-system-x86_64 -enable-kvm \
     -m 4G \
-    -nographic \
     -serial mon:stdio \
     -no-reboot \
     -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd \

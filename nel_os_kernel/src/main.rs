@@ -66,7 +66,7 @@ fn hlt_loop() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory) {
+pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     println!("{} v{}", BANNER, PKG_VERSION);
 
     let virt = VirtAddr::new(
@@ -78,14 +78,14 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
     let phys = paging::translate_addr(virt);
     info!("Level 4 page table: {:?} -> {:?}", virt, phys);
 
-    let ranges = usable_memory.ranges();
+    let ranges = boot_info.usable_memory.ranges();
     let mut count = 0;
     for range in ranges {
         count += range.end - range.start;
     }
     info!("Usable memory: {}MiB", count / 1024 / 1024);
 
-    let mut bitmap_table = BitmapMemoryTable::init(usable_memory);
+    let mut bitmap_table = BitmapMemoryTable::init(&boot_info.usable_memory);
     info!(
         "Memory bitmap initialized: {} -> {}",
         bitmap_table.start, bitmap_table.end
