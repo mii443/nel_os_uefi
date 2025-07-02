@@ -1,23 +1,34 @@
 use x86_64::{
     registers::control::Cr3,
     structures::paging::{
-        page_table::FrameError, FrameAllocator, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+        page_table::FrameError, FrameAllocator, PageSize, PageTable, PageTableFlags, PhysFrame,
+        Size1GiB, Size4KiB,
     },
     PhysAddr, VirtAddr,
 };
 
-pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> PhysFrame {
-    let (lv4_frame, lv4_table) = new_page_table(frame_allocator);
+pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> &mut PageTable {
+    let (_, lv4_table) = new_page_table(frame_allocator);
     let (lv3_frame, lv3_table) = new_page_table(frame_allocator);
 
     let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::GLOBAL;
 
+    let lv4: &mut PageTable = unsafe { &mut *lv4_table };
+
+    lv4[0].set_frame(lv3_frame, base_flags);
+
     unsafe {
-        let lv4: &mut PageTable = &mut *lv4_table;
-        lv4[0].set_frame(lv3_frame, base_flags);
+        let lv3: &mut PageTable = &mut *lv3_table;
+
+        for (index, lv3_pte) in lv3.iter_mut().enumerate() {
+            lv3_pte.set_addr(
+                PhysAddr::new(index as u64 * Size1GiB::SIZE),
+                base_flags | PageTableFlags::HUGE_PAGE,
+            );
+        }
     }
 
-    lv4_frame
+    lv4
 }
 
 fn new_page_table(
