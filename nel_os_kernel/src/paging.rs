@@ -13,7 +13,7 @@ pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> *
     let (lv4_frame, lv4_table) = new_page_table(frame_allocator);
     let (lv3_frame, lv3_table) = new_page_table(frame_allocator);
 
-    let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::GLOBAL;
+    let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::ACCESSED;
 
     let lv4: &mut PageTable = unsafe { &mut *lv4_table };
 

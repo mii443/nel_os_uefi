@@ -1,12 +1,16 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 pub mod allocator;
 pub mod constant;
 pub mod logging;
 pub mod memory;
 pub mod paging;
 pub mod serial;
+
+use alloc::vec;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -17,7 +21,6 @@ use x86_64::{structures::paging::OffsetPageTable, VirtAddr};
 use crate::{
     constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
     memory::BitmapMemoryTable,
-    paging::get_active_level_4_table,
 };
 
 #[repr(C, align(16))]
@@ -106,6 +109,10 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
     info!("Page table initialized");
 
     allocator::init_heap(&mut mapper, &mut bitmap_table).unwrap();
+
+    let mut test_vec = vec![1, 2, 3, 4, 9];
+    test_vec.push(10);
+    info!("Vector test: {:?}", test_vec);
 
     hlt_loop();
 }
