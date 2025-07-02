@@ -1,6 +1,9 @@
 use nel_os_common::memory::{self, UsableMemory};
 
-use crate::constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE};
+use crate::{
+    constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE},
+    info,
+};
 
 pub struct BitmapMemoryTable {
     pub used_map: [usize; ENTRY_COUNT],
@@ -17,19 +20,50 @@ impl BitmapMemoryTable {
         }
     }
 
-    pub fn init(usable_memory: UsableMemory) -> Self {
-        let table = Self::new();
-        for range in usable_memory.ranges() {}
+    pub fn init(usable_memory: &UsableMemory) -> Self {
+        let mut table = Self::new();
+        for range in usable_memory.ranges() {
+            table.set_range(range);
+        }
+
+        for i in 0..ENTRY_COUNT {
+            let index = ENTRY_COUNT - i - 1;
+            if table.used_map[index] != 0 {
+                let offset = 63 - table.used_map[index].leading_zeros();
+                table.end = (index + 1) * BITS_PER_ENTRY + offset as usize;
+            }
+        }
 
         table
     }
 
-    pub fn set_range(&mut self, range: memory::Range) {
-        let start = range.start;
-        let end = range.end;
+    pub fn set_range(&mut self, range: &memory::Range) {
+        let start = Self::addr_to_pfn(range.start as usize);
+        let size = (range.end - range.start) / PAGE_SIZE as u64;
+
+        for i in 0..size {
+            self.set_frame(start + i as usize, true);
+        }
     }
 
-    pub fn set_frame(frame: usize, state: bool) {}
+    pub fn set_frame(&mut self, frame: usize, state: bool) {
+        let index = Self::frame_to_index(frame);
+        let offset = Self::frame_to_offset(frame);
+
+        if state {
+            self.used_map[index] |= 1usize << offset;
+            self.start = self.start.min(frame);
+        } else {
+            self.used_map[index] &= !(1usize << offset);
+            if self.start == frame {
+                self.start += 1;
+            }
+        }
+    }
+
+    pub fn addr_to_pfn(addr: usize) -> usize {
+        addr / PAGE_SIZE
+    }
 
     pub fn frame_to_index(frame: usize) -> usize {
         frame / BITS_PER_ENTRY

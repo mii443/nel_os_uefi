@@ -13,7 +13,10 @@ use core::ptr::addr_of;
 
 use x86_64::VirtAddr;
 
-use crate::constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION};
+use crate::{
+    constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
+    memory::BitmapMemoryTable,
+};
 
 #[repr(C, align(16))]
 struct AlignedStack {
@@ -76,6 +79,16 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
         count += range.end - range.start;
     }
     info!("Usable memory: {}MiB", count / 1024 / 1024);
+
+    let bitmap_table = BitmapMemoryTable::init(usable_memory);
+    info!(
+        "Memory bitmap initialized: {} -> {}",
+        bitmap_table.start, bitmap_table.end
+    );
+    info!("Usable memory map:");
+    for i in bitmap_table.start..bitmap_table.end {
+        info!("     {:064b}", bitmap_table.used_map[i]);
+    }
 
     hlt_loop();
 }
