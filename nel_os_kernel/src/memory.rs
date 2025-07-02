@@ -1,4 +1,8 @@
 use nel_os_common::memory::{self, UsableMemory};
+use x86_64::{
+    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
+    PhysAddr,
+};
 
 use crate::constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE};
 
@@ -74,6 +78,10 @@ impl BitmapMemoryTable {
         addr / PAGE_SIZE
     }
 
+    pub fn pfn_to_addr(frame: usize) -> usize {
+        frame * PAGE_SIZE
+    }
+
     pub fn frame_to_index(frame: usize) -> usize {
         frame / BITS_PER_ENTRY
     }
@@ -86,5 +94,19 @@ impl BitmapMemoryTable {
 impl Default for BitmapMemoryTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+unsafe impl FrameAllocator<Size4KiB> for BitmapMemoryTable {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        if let Some(frame) = self.get_free_pfn() {
+            self.set_frame(frame, false);
+            Some(
+                PhysFrame::from_start_address(PhysAddr::new(Self::pfn_to_addr(frame) as u64))
+                    .unwrap(),
+            )
+        } else {
+            None
+        }
     }
 }

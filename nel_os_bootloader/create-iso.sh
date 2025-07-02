@@ -2,6 +2,10 @@
 
 EFI_BINARY="$1"
 
+cd ../nel_os_kernel
+cargo build --release -q
+cd ../nel_os_bootloader
+
 dd if=/dev/zero of=fat.img bs=1k count=1440
 mformat -i fat.img -f 1440 ::
 mmd -i fat.img ::/EFI
