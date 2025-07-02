@@ -1,6 +1,6 @@
 use nel_os_common::memory::{self, UsableMemory};
 
-use crate::constant::ENTRY_COUNT;
+use crate::constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE};
 
 pub struct BitmapMemoryTable {
     pub used_map: [usize; ENTRY_COUNT],
@@ -22,5 +22,20 @@ impl BitmapMemoryTable {
         for range in usable_memory.ranges() {}
 
         table
+    }
+
+    pub fn set_range(&mut self, range: memory::Range) {
+        let start = range.start;
+        let end = range.end;
+    }
+
+    pub fn set_frame(frame: usize, state: bool) {}
+
+    pub fn frame_to_index(frame: usize) -> usize {
+        frame / BITS_PER_ENTRY
+    }
+
+    pub fn frame_to_offset(frame: usize) -> usize {
+        frame % BITS_PER_ENTRY
     }
 }
