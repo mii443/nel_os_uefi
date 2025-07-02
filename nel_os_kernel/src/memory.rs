@@ -1,3 +1,5 @@
+use core::slice;
+
 use nel_os_common::memory::{self, UsableMemory};
 use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
@@ -7,31 +9,52 @@ use x86_64::{
 use crate::constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE};
 
 pub struct BitmapMemoryTable {
-    pub used_map: [usize; ENTRY_COUNT],
+    pub used_map: &'static mut [usize],
     pub start: usize,
     pub end: usize,
 }
 
 impl BitmapMemoryTable {
-    pub fn new() -> Self {
-        Self {
-            used_map: [0; ENTRY_COUNT],
+    pub fn init(usable_memory: &UsableMemory) -> Self {
+        let mut max_addr = 0u64;
+        for range in usable_memory.ranges() {
+            max_addr = max_addr.max(range.end);
+        }
+
+        let bitmap_size = ENTRY_COUNT * core::mem::size_of::<usize>();
+
+        let bitmap_addr = ((max_addr as usize).saturating_sub(bitmap_size)) & !(PAGE_SIZE - 1);
+
+        let used_map = unsafe {
+            let ptr = bitmap_addr as *mut usize;
+            slice::from_raw_parts_mut(ptr, ENTRY_COUNT)
+        };
+
+        (0..ENTRY_COUNT).for_each(|i| {
+            used_map[i] = 0;
+        });
+
+        let mut table = Self {
+            used_map,
             start: 0,
             end: usize::MAX,
-        }
-    }
+        };
 
-    pub fn init(usable_memory: &UsableMemory) -> Self {
-        let mut table = Self::default();
         for range in usable_memory.ranges() {
             table.set_range(range);
+        }
+
+        let bitmap_start_frame = Self::addr_to_pfn(bitmap_addr);
+        let bitmap_frames = bitmap_size.div_ceil(PAGE_SIZE);
+        for i in 0..bitmap_frames {
+            table.set_frame(bitmap_start_frame + i, false);
         }
 
         for i in 0..ENTRY_COUNT {
             let index = ENTRY_COUNT - i - 1;
             if table.used_map[index] != 0 {
                 let offset = 63 - table.used_map[index].leading_zeros();
-                table.end = (index + 1) * BITS_PER_ENTRY + offset as usize;
+                table.end = index * BITS_PER_ENTRY + (BITS_PER_ENTRY - offset as usize);
                 break;
             }
         }
@@ -88,12 +111,6 @@ impl BitmapMemoryTable {
 
     pub fn frame_to_offset(frame: usize) -> usize {
         frame % BITS_PER_ENTRY
-    }
-}
-
-impl Default for BitmapMemoryTable {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

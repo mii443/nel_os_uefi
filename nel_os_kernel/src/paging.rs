@@ -1,8 +1,35 @@
 use x86_64::{
     registers::control::Cr3,
-    structures::paging::{page_table::FrameError, PageTable, PhysFrame},
+    structures::paging::{
+        page_table::FrameError, FrameAllocator, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    },
     PhysAddr, VirtAddr,
 };
+
+pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> PhysFrame {
+    let (lv4_frame, lv4_table) = new_page_table(frame_allocator);
+    let (lv3_frame, lv3_table) = new_page_table(frame_allocator);
+
+    let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::GLOBAL;
+
+    unsafe {
+        let lv4: &mut PageTable = &mut *lv4_table;
+        lv4[0].set_frame(lv3_frame, base_flags);
+    }
+
+    lv4_frame
+}
+
+fn new_page_table(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> (PhysFrame, *mut PageTable) {
+    let frame = frame_allocator.allocate_frame().unwrap();
+
+    (
+        frame,
+        VirtAddr::new(frame.start_address().as_u64()).as_mut_ptr(),
+    )
+}
 
 pub fn get_active_level_4_table() -> &'static mut PageTable {
     let (level_4_table_frame, _) = Cr3::read();
