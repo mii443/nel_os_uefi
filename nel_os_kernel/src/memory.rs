@@ -1,9 +1,6 @@
 use nel_os_common::memory::{self, UsableMemory};
 
-use crate::{
-    constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE},
-    info,
-};
+use crate::constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE};
 
 pub struct BitmapMemoryTable {
     pub used_map: [usize; ENTRY_COUNT],
@@ -31,11 +28,14 @@ impl BitmapMemoryTable {
             if table.used_map[index] != 0 {
                 let offset = 63 - table.used_map[index].leading_zeros();
                 table.end = (index + 1) * BITS_PER_ENTRY + offset as usize;
+                break;
             }
         }
 
         table
     }
+
+    pub fn get_free_frame(&self) {}
 
     pub fn set_range(&mut self, range: &memory::Range) {
         let start = Self::addr_to_pfn(range.start as usize);
@@ -59,6 +59,13 @@ impl BitmapMemoryTable {
                 self.start += 1;
             }
         }
+    }
+
+    pub fn get_bit(&self, frame: usize) -> bool {
+        let index = Self::frame_to_index(frame);
+        let offset = Self::frame_to_offset(frame);
+
+        (self.used_map[index] & (1usize << offset)) != 0
     }
 
     pub fn addr_to_pfn(addr: usize) -> usize {

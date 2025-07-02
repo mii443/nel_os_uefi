@@ -14,7 +14,7 @@ use core::ptr::addr_of;
 use x86_64::VirtAddr;
 
 use crate::{
-    constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
+    constant::{BANNER, BITS_PER_ENTRY, KERNEL_STACK_SIZE, PKG_VERSION},
     memory::BitmapMemoryTable,
 };
 
@@ -85,10 +85,15 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
         "Memory bitmap initialized: {} -> {}",
         bitmap_table.start, bitmap_table.end
     );
-    info!("Usable memory map:");
+
+    let mut usable_frame = 0;
     for i in bitmap_table.start..bitmap_table.end {
-        info!("     {:064b}", bitmap_table.used_map[i]);
+        if bitmap_table.get_bit(i) {
+            usable_frame += 1;
+        }
     }
+
+    info!("Usable memory in bitmap: {}MiB", usable_frame * 4 / 1024);
 
     hlt_loop();
 }
