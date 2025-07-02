@@ -1,5 +1,5 @@
 use x86_64::{
-    registers::control::Cr3,
+    registers::control::{Cr3, Cr3Flags},
     structures::paging::{
         page_table::FrameError, FrameAllocator, PageSize, PageTable, PageTableFlags, PhysFrame,
         Size1GiB, Size4KiB,
@@ -7,8 +7,10 @@ use x86_64::{
     PhysAddr, VirtAddr,
 };
 
-pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> &mut PageTable {
-    let (_, lv4_table) = new_page_table(frame_allocator);
+use crate::info;
+
+pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> *mut PageTable {
+    let (lv4_frame, lv4_table) = new_page_table(frame_allocator);
     let (lv3_frame, lv3_table) = new_page_table(frame_allocator);
 
     let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::GLOBAL;
@@ -28,7 +30,13 @@ pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> &
         }
     }
 
-    lv4
+    info!("Setting new page table...");
+
+    unsafe {
+        Cr3::write(lv4_frame, Cr3Flags::empty());
+    }
+
+    lv4_table
 }
 
 fn new_page_table(

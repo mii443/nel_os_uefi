@@ -97,8 +97,13 @@ pub extern "sysv64" fn main(usable_memory: &nel_os_common::memory::UsableMemory)
 
     info!("Usable memory in bitmap: {}MiB", usable_frame * 4 / 1024);
 
-    let lv4_table = paging::init_page_table(&mut bitmap_table);
-    let mut mapper = unsafe { OffsetPageTable::new(lv4_table, VirtAddr::new(0x0)) };
+    let mut mapper = {
+        let lv4_table_ptr = paging::init_page_table(&mut bitmap_table);
+        let lv4_table = unsafe { &mut *lv4_table_ptr };
+        unsafe { OffsetPageTable::new(lv4_table, VirtAddr::new(0x0)) }
+    };
+
+    info!("Page table initialized");
 
     allocator::init_heap(&mut mapper, &mut bitmap_table).unwrap();
 
