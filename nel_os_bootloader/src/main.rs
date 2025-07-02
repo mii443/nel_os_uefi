@@ -106,7 +106,7 @@ fn main() -> Status {
 
     uefi::system::with_stdout(|stdout| stdout.clear().unwrap());
 
-    println!("nel_os bootloader");
+    println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     let kernel = read_kernel(cstr16!("nel_os_kernel.elf"));
 
@@ -123,7 +123,7 @@ fn main() -> Status {
         + 8 * core::mem::size_of::<memory::Range>();
     let mut ranges: Vec<memory::Range> = Vec::with_capacity(size);
 
-    println!("Usable memory size: {}", size);
+    println!("Usable memory table size: {}", size);
 
     let memory_map = unsafe { uefi::boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
 
