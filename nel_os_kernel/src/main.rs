@@ -9,7 +9,6 @@ pub mod cpuid;
 pub mod graphics;
 pub mod logging;
 pub mod memory;
-pub mod paging;
 pub mod serial;
 
 use alloc::vec;
@@ -23,7 +22,8 @@ use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtA
 use crate::{
     constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
     graphics::{FrameBuffer, FRAME_BUFFER},
-    memory::BitmapMemoryTable,
+    memory::memory::BitmapMemoryTable,
+    memory::paging,
 };
 
 #[repr(C, align(16))]
