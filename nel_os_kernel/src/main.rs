@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod constant;
+pub mod graphics;
 pub mod logging;
 pub mod memory;
 pub mod paging;
@@ -20,6 +21,7 @@ use x86_64::{structures::paging::OffsetPageTable, VirtAddr};
 
 use crate::{
     constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
+    graphics::{FrameBuffer, FRAME_BUFFER},
     memory::BitmapMemoryTable,
 };
 
@@ -67,8 +69,6 @@ fn hlt_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
-    println!("{} v{}", BANNER, PKG_VERSION);
-
     let virt = VirtAddr::new(
         x86_64::registers::control::Cr3::read()
             .0
@@ -110,9 +110,22 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     allocator::init_heap(&mut mapper, &mut bitmap_table).unwrap();
 
-    let mut test_vec = vec![1, 2, 3, 4, 9];
-    test_vec.push(10);
-    info!("Vector test: {:?}", test_vec);
+    let frame_buffer = FrameBuffer::from_raw_buffer(&boot_info.frame_buffer);
+
+    for x in 0..frame_buffer.width {
+        for y in 0..frame_buffer.height {
+            frame_buffer.draw_pixel(64, 64, 64, x, y);
+        }
+    }
+
+    FRAME_BUFFER.lock().replace(frame_buffer);
+
+    println!("{} v{}", BANNER, PKG_VERSION);
+    info!(
+        "Usable memory: {}MiB ({:.1}GiB)",
+        usable_frame * 4 / 1024,
+        usable_frame as f64 * 4. / 1024. / 1024.
+    );
 
     hlt_loop();
 }

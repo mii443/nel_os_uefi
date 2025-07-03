@@ -1,6 +1,9 @@
+use alloc::format;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use uart_16550::SerialPort;
+
+use crate::graphics::FRAME_BUFFER;
 
 lazy_static! {
     pub static ref SERIAL1: Mutex<SerialPort> = {
@@ -19,6 +22,13 @@ pub fn _print(args: ::core::fmt::Arguments) {
             .lock()
             .write_fmt(args)
             .expect("Printing to serial failed");
+
+        let mut fb = FRAME_BUFFER.lock();
+        let fb = fb.as_mut();
+
+        if let Some(frame_buffer) = fb {
+            frame_buffer.print_text(format!("{args}").as_str());
+        }
     });
 }
 
