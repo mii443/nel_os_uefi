@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod constant;
+pub mod cpuid;
 pub mod graphics;
 pub mod logging;
 pub mod memory;
@@ -17,7 +18,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr::addr_of;
 
-use x86_64::{structures::paging::OffsetPageTable, VirtAddr};
+use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtAddr};
 
 use crate::{
     constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
@@ -120,7 +121,19 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     FRAME_BUFFER.lock().replace(frame_buffer);
 
-    println!("{} v{}", BANNER, PKG_VERSION);
+    println!("");
+    info!("Kernel initialized successfully");
+
+    info!("Kernel version: {}", PKG_VERSION);
+    info!(
+        "Level 4 page table at {:#x}",
+        Cr3::read().0.start_address().as_u64()
+    );
+    info!(
+        "Memory bitmap: {} -> {}",
+        bitmap_table.start, bitmap_table.end
+    );
+    info!("CPU: {} {}", cpuid::get_vendor_id(), cpuid::get_brand());
     info!(
         "Usable memory: {}MiB ({:.1}GiB)",
         usable_frame * 4 / 1024,
