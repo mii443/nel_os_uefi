@@ -3,15 +3,12 @@
 
 extern crate alloc;
 
-pub mod allocator;
 pub mod constant;
 pub mod cpuid;
 pub mod graphics;
 pub mod logging;
 pub mod memory;
 pub mod serial;
-
-use alloc::vec;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -20,10 +17,9 @@ use core::ptr::addr_of;
 use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtAddr};
 
 use crate::{
-    constant::{BANNER, KERNEL_STACK_SIZE, PKG_VERSION},
+    constant::{KERNEL_STACK_SIZE, PKG_VERSION},
     graphics::{FrameBuffer, FRAME_BUFFER},
-    memory::memory::BitmapMemoryTable,
-    memory::paging,
+    memory::{allocator, memory::BitmapMemoryTable, paging},
 };
 
 #[repr(C, align(16))]
