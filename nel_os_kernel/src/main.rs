@@ -68,6 +68,7 @@ fn hlt_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
+    interrupt::gdt::init();
     interrupt::idt::init_idt();
 
     let virt = VirtAddr::new(
@@ -141,6 +142,10 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     );
 
     x86_64::instructions::interrupts::int3();
+
+    unsafe {
+        *(0xffdeadbeaf as *mut u8) = 0x43;
+    }
 
     hlt_loop();
 }
