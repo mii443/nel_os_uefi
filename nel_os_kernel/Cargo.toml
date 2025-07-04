@@ -12,3 +12,4 @@ nel_os_common = { path = "../nel_os_common" }
 linked_list_allocator = "0.9.1"
 ab_glyph = { version = "0.2", features = ["libm"], default-features = false }
 raw-cpuid = "11.5.0"
+acpi = "5.2.0"

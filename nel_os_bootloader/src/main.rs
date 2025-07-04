@@ -126,6 +126,15 @@ fn get_frame_buffer() -> gop::FrameBuffer {
     }
 }
 
+fn get_rsdp() -> u64 {
+    uefi::system::with_config_table(move |c| {
+        c.iter()
+            .find(|config| config.guid == uefi::table::cfg::ACPI_GUID)
+            .map(|config| config.address as u64)
+            .expect("Failed to find RSDP in config table")
+    })
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().unwrap();
@@ -144,6 +153,8 @@ fn main() -> Status {
         unsafe { core::mem::transmute(entry_point) };
 
     let frame_buffer = get_frame_buffer();
+
+    let rsdp = get_rsdp();
 
     let size = uefi::boot::memory_map(MemoryType::LOADER_DATA)
         .unwrap()
@@ -183,6 +194,7 @@ fn main() -> Status {
     entry(&nel_os_common::BootInfo {
         usable_memory,
         frame_buffer,
+        rsdp,
     });
 
     hlt_loop();
