@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
 pub mod constant;
 pub mod cpuid;
 pub mod graphics;
+pub mod interrupt;
 pub mod logging;
 pub mod memory;
 pub mod serial;
@@ -66,6 +68,8 @@ fn hlt_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
+    interrupt::idt::init_idt();
+
     let virt = VirtAddr::new(
         x86_64::registers::control::Cr3::read()
             .0
@@ -135,6 +139,8 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
         usable_frame * 4 / 1024,
         usable_frame as f64 * 4. / 1024. / 1024.
     );
+
+    x86_64::instructions::interrupts::int3();
 
     hlt_loop();
 }
