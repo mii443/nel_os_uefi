@@ -1,4 +1,5 @@
 use ab_glyph::{Font, FontRef, ScaleFont};
+use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use nel_os_common::gop::{FrameBuffer as RawFrameBuffer, PixelFormat as RawPixelFormat};
 use spin::Mutex;
@@ -22,14 +23,20 @@ pub struct FrameBuffer {
 
     pub pixel_format: PixelFormat,
 
+    pub background_color: (u8, u8, u8),
+
     pub text_cursor: (usize, usize),
+
+    pub text_buffer: Vec<Vec<char>>,
+    pub textscreen_width: usize,
+    pub textscreen_height: usize,
 }
 
 unsafe impl Send for FrameBuffer {}
 unsafe impl Sync for FrameBuffer {}
 
 impl FrameBuffer {
-    pub fn from_raw_buffer(raw_buffer: &RawFrameBuffer) -> Self {
+    pub fn from_raw_buffer(raw_buffer: &RawFrameBuffer, background_color: (u8, u8, u8)) -> Self {
         Self {
             frame_buffer: raw_buffer.frame_buffer,
             width: raw_buffer.width,
@@ -40,7 +47,11 @@ impl FrameBuffer {
                 RawPixelFormat::Rgb => PixelFormat::Rgb,
                 RawPixelFormat::Bgr => PixelFormat::Bgr,
             },
+            background_color,
             text_cursor: (0, 0),
+            text_buffer: Vec::new(),
+            textscreen_width: raw_buffer.width / 8,
+            textscreen_height: raw_buffer.height / 14,
         }
     }
 
@@ -76,37 +87,45 @@ impl FrameBuffer {
         }
     }
 
-    pub fn print_text(&mut self, text: &str) {
-        let (mut x, mut y) = self.text_cursor;
-
-        for c in text.chars() {
-            if c == '\n' {
-                x = 0;
-                y += 14;
-
-                continue;
-            }
-
-            self.draw_char(c, x, y);
-            x += 8;
-            if x + 8 > self.width {
-                x = 0;
-                y += 14;
+    pub fn clear(&self) {
+        let (r, g, b) = self.background_color;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.draw_pixel(r, g, b, x, y);
             }
         }
-
-        self.text_cursor = (x, y);
     }
 
-    pub fn print_char(&mut self, c: char) {
-        let (x, y) = self.text_cursor;
-
-        self.draw_char(c, x, y);
-        self.text_cursor.0 += 8;
-        if self.text_cursor.0 >= self.width {
-            self.text_cursor.0 = 0;
-            self.text_cursor.1 += 14;
+    pub fn update_textscreen(&mut self) {
+        self.clear();
+        for (y, line) in self.text_buffer.iter().enumerate() {
+            let mut x = 0;
+            for &c in line {
+                self.draw_char(c, x, y * 14);
+                x += 8;
+            }
         }
+    }
+
+    pub fn add_text_line(&mut self, text: &str) {
+        if self.text_buffer.len() >= self.textscreen_height {
+            self.text_buffer.remove(0);
+        }
+        self.text_buffer.push(text.chars().collect());
+    }
+
+    pub fn clear_text(&mut self) {
+        self.text_cursor = (0, 0);
+        self.text_buffer.clear();
+        self.clear();
+    }
+
+    pub fn print_text(&mut self, text: &str) {
+        let lines = text.lines();
+        for line in lines {
+            self.add_text_line(line);
+        }
+        self.update_textscreen();
     }
 
     pub fn draw_char(&self, c: char, x: usize, y: usize) {

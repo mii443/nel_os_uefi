@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod constant;
 pub mod cpuid;
 pub mod graphics;
@@ -16,9 +17,11 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 use core::ptr::addr_of;
 
+use ::acpi::AcpiTables;
 use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtAddr};
 
 use crate::{
+    acpi::KernelAcpiHandler,
     constant::{KERNEL_STACK_SIZE, PKG_VERSION},
     graphics::{FrameBuffer, FRAME_BUFFER},
     memory::{allocator, memory::BitmapMemoryTable, paging},
@@ -112,13 +115,8 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     allocator::init_heap(&mut mapper, &mut bitmap_table).unwrap();
 
-    let frame_buffer = FrameBuffer::from_raw_buffer(&boot_info.frame_buffer);
-
-    for x in 0..frame_buffer.width {
-        for y in 0..frame_buffer.height {
-            frame_buffer.draw_pixel(64, 64, 64, x, y);
-        }
-    }
+    let frame_buffer = FrameBuffer::from_raw_buffer(&boot_info.frame_buffer, (64, 64, 64));
+    frame_buffer.clear();
 
     FRAME_BUFFER.lock().replace(frame_buffer);
 
@@ -141,11 +139,13 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
         usable_frame as f64 * 4. / 1024. / 1024.
     );
 
-    x86_64::instructions::interrupts::int3();
+    info!("RSDP: {:#x}", boot_info.rsdp);
 
-    unsafe {
-        *(0xffdeadbeaf as *mut u8) = 0x43;
-    }
+    let acpi_tables =
+        unsafe { AcpiTables::from_rsdp(KernelAcpiHandler, boot_info.rsdp as usize) }.unwrap();
+    let platform_info = acpi_tables.platform_info().unwrap();
+    let processor_info = platform_info.processor_info;
+    info!("Processor info: {:#x?}", processor_info);
 
     hlt_loop();
 }

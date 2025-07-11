@@ -14,4 +14,5 @@ qemu-system-x86_64 -enable-kvm \
 	-cdrom nel_os.iso \
 	-boot d \
 	-cpu host \
+	-smp 1 \
 	-s
