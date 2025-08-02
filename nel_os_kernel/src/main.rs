@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(allocator_api)]
 
 extern crate alloc;
 
@@ -24,6 +25,7 @@ use crate::{
     acpi::KernelAcpiHandler,
     constant::{KERNEL_STACK_SIZE, PKG_VERSION},
     graphics::{FrameBuffer, FRAME_BUFFER},
+    interrupt::apic,
     memory::{allocator, memory::BitmapMemoryTable, paging},
 };
 
@@ -144,8 +146,13 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     let acpi_tables =
         unsafe { AcpiTables::from_rsdp(KernelAcpiHandler, boot_info.rsdp as usize) }.unwrap();
     let platform_info = acpi_tables.platform_info().unwrap();
-    let processor_info = platform_info.processor_info;
-    info!("Processor info: {:#x?}", processor_info);
+
+    apic::init_local_apic(platform_info);
+    info!("Local APIC initialized",);
+
+    x86_64::instructions::interrupts::enable();
+
+    info!("Interrupts enabled");
 
     hlt_loop();
 }
