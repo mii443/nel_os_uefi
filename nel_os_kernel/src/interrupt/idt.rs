@@ -2,7 +2,7 @@ use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::{
-    info_w_int,
+    info,
     interrupt::{
         apic::{EOI, LAPIC},
         gdt,
@@ -66,5 +66,5 @@ extern "x86-interrupt" fn page_fault_handler(
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     LAPIC.get().unwrap().write(EOI, 0);
-    info_w_int!("Timer interrupt received");
+    info!("Timer interrupt received");
 }
