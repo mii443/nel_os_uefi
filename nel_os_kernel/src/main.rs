@@ -13,6 +13,7 @@ pub mod interrupt;
 pub mod logging;
 pub mod memory;
 pub mod serial;
+pub mod time;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -153,6 +154,10 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     x86_64::instructions::interrupts::enable();
 
     info!("Interrupts enabled");
+
+    time::wait_for_ms(1000);
+
+    info!("1 second has passed");
 
     hlt_loop();
 }
