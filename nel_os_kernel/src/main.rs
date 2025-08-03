@@ -12,8 +12,10 @@ pub mod graphics;
 pub mod interrupt;
 pub mod logging;
 pub mod memory;
+pub mod platform;
 pub mod serial;
 pub mod time;
+pub mod vmm;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -155,9 +157,13 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     info!("Interrupts enabled");
 
-    time::wait_for_ms(1000);
-
-    info!("1 second has passed");
+    if platform::is_amd() {
+        info!("AMD CPU detected");
+    } else if platform::is_intel() {
+        info!("Intel CPU detected");
+    } else {
+        info!("Unknown CPU vendor");
+    }
 
     hlt_loop();
 }
