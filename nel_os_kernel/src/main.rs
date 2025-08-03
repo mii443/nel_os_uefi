@@ -157,13 +157,8 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     info!("Interrupts enabled");
 
-    if platform::is_amd() {
-        info!("AMD CPU detected");
-    } else if platform::is_intel() {
-        info!("Intel CPU detected");
-    } else {
-        info!("Unknown CPU vendor");
-    }
+    let mut vcpu = vmm::get_vcpu();
+    vcpu.run();
 
     hlt_loop();
 }

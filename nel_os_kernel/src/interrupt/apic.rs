@@ -1,6 +1,6 @@
 use acpi::PlatformInfo;
 use alloc::alloc::Global;
-use spin::{Lazy, Once};
+use spin::Once;
 use x86_64::instructions::port::Port;
 
 use crate::interrupt::idt::IRQ_TIMER;
