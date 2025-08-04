@@ -8,18 +8,21 @@ use crate::{
 pub mod x86_64;
 
 pub trait VCpu {
+    fn new() -> Result<Self, &'static str>
+    where
+        Self: Sized;
     fn is_supported() -> bool
     where
         Self: Sized;
     fn run(&mut self);
 }
 
-pub fn get_vcpu() -> Box<dyn VCpu> {
+pub fn get_vcpu() -> Result<Box<dyn VCpu>, &'static str> {
     if platform::is_amd() && AMDVCpu::is_supported() {
-        Box::new(AMDVCpu::new())
+        Ok(Box::new(AMDVCpu::new()?))
     } else if platform::is_intel() && IntelVCpu::is_supported() {
-        Box::new(IntelVCpu::new())
+        Ok(Box::new(IntelVCpu::new()?))
     } else {
-        panic!("Unsupported CPU architecture");
+        Err("Unsupported CPU architecture")
     }
 }

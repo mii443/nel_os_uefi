@@ -1,3 +1,5 @@
+mod vmxon;
+
 use raw_cpuid::cpuid;
 
 use crate::{
@@ -7,8 +9,15 @@ use crate::{
 
 pub struct IntelVCpu;
 
-impl IntelVCpu {
-    pub fn new() -> Self {
+impl VCpu for IntelVCpu {
+    fn run(&mut self) {
+        info!("VCpu on Intel");
+    }
+
+    fn new() -> Result<Self, &'static str>
+    where
+        Self: Sized,
+    {
         let mut msr = common::read_msr(0x3a);
         if msr & (1 << 2) == 0 {
             msr |= 1 << 2;
@@ -18,16 +27,10 @@ impl IntelVCpu {
 
         let msr = common::read_msr(0x3a);
         if msr & (1 << 2) == 0 {
-            panic!("VMX is not enabled in the BIOS");
+            return Err("VMX is not enabled in the BIOS");
         }
 
-        IntelVCpu
-    }
-}
-
-impl VCpu for IntelVCpu {
-    fn run(&mut self) {
-        info!("VCpu on Intel");
+        Ok(IntelVCpu)
     }
 
     fn is_supported() -> bool

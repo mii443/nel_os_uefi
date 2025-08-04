@@ -7,19 +7,20 @@ use crate::{
 
 pub struct AMDVCpu;
 
-impl AMDVCpu {
-    pub fn new() -> Self {
+impl VCpu for AMDVCpu {
+    fn run(&mut self) {
+        info!("VCpu on AMD");
+    }
+
+    fn new() -> Result<Self, &'static str>
+    where
+        Self: Sized,
+    {
         let mut efer = common::read_msr(0xc000_0080);
         efer |= 1 << 12;
         common::write_msr(0xc000_0080, efer);
 
-        AMDVCpu
-    }
-}
-
-impl VCpu for AMDVCpu {
-    fn run(&mut self) {
-        info!("VCpu on AMD");
+        Ok(AMDVCpu)
     }
 
     fn is_supported() -> bool
