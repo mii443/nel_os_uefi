@@ -1,3 +1,4 @@
+mod vmcs;
 mod vmxon;
 
 use raw_cpuid::cpuid;
