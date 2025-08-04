@@ -1,3 +1,4 @@
+use ::x86_64::structures::paging::{FrameAllocator, Size4KiB};
 use alloc::boxed::Box;
 
 use crate::{
@@ -8,7 +9,7 @@ use crate::{
 pub mod x86_64;
 
 pub trait VCpu {
-    fn new() -> Result<Self, &'static str>
+    fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
     where
         Self: Sized;
     fn is_supported() -> bool
@@ -17,11 +18,13 @@ pub trait VCpu {
     fn run(&mut self);
 }
 
-pub fn get_vcpu() -> Result<Box<dyn VCpu>, &'static str> {
+pub fn get_vcpu(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<Box<dyn VCpu>, &'static str> {
     if platform::is_amd() && AMDVCpu::is_supported() {
-        Ok(Box::new(AMDVCpu::new()?))
+        Ok(Box::new(AMDVCpu::new(frame_allocator)?))
     } else if platform::is_intel() && IntelVCpu::is_supported() {
-        Ok(Box::new(IntelVCpu::new()?))
+        Ok(Box::new(IntelVCpu::new(frame_allocator)?))
     } else {
         Err("Unsupported CPU architecture")
     }

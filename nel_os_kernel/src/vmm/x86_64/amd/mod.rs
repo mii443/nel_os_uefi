@@ -1,4 +1,5 @@
 use raw_cpuid::cpuid;
+use x86_64::structures::paging::{FrameAllocator, Size4KiB};
 
 use crate::{
     error, info,
@@ -12,7 +13,7 @@ impl VCpu for AMDVCpu {
         info!("VCpu on AMD");
     }
 
-    fn new() -> Result<Self, &'static str>
+    fn new(_frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
     where
         Self: Sized,
     {
