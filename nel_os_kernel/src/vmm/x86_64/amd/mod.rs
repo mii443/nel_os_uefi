@@ -1,7 +1,7 @@
 use raw_cpuid::cpuid;
 
 use crate::{
-    info,
+    error, info,
     vmm::{x86_64::common, VCpu},
 };
 
@@ -27,12 +27,12 @@ impl VCpu for AMDVCpu {
         Self: Sized,
     {
         if cpuid!(0x8000_0001).ecx & (1 << 2) == 0 {
-            info!("SVM not supported by CPU");
+            error!("SVM not supported by CPU");
             return false;
         }
 
         if common::read_msr(0xc001_0114) & (1 << 4) != 0 {
-            info!("SVM disabled by BIOS");
+            error!("SVM disabled by BIOS");
             return false;
         }
 
