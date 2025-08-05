@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 
 use crate::{
     platform,
-    vmm::x86_64::{amd::AMDVCpu, intel::IntelVCpu},
+    vmm::x86_64::{amd::vcpu::AMDVCpu, intel::vcpu::IntelVCpu},
 };
 
 pub mod x86_64;

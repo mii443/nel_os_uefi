@@ -145,6 +145,7 @@ dependencies = [
  "raw-cpuid 11.5.0",
  "spin 0.10.0",
  "uart_16550",
+ "x86",
  "x86_64",
 ]
 
