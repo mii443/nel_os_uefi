@@ -17,6 +17,8 @@ use crate::{
                 register::GuestRegisters,
                 vmcs::{
                     self,
+                    err::InstructionError,
+                    exit_reason::VmxExitReason,
                     segment::{DescriptorType, Granularity, SegmentRights},
                 },
                 vmread, vmwrite, vmxon,
@@ -42,6 +44,66 @@ impl IntelVCpu {
     #[unsafe(naked)]
     unsafe extern "C" fn test_guest_code() -> ! {
         naked_asm!("2: hlt; jmp 2b");
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn intel_set_host_stack(rsp: u64) {
+        vmwrite(x86::vmx::vmcs::host::RSP, rsp).unwrap();
+    }
+
+    fn vmexit_handler(&mut self) -> Result<(), &'static str> {
+        use x86::vmx::vmcs;
+        let exit_reason_raw = vmread(vmcs::ro::EXIT_REASON)? as u32;
+
+        if exit_reason_raw & (1 << 31) != 0 {
+            let reason = exit_reason_raw & 0xFF;
+            info!("VMEntry failure");
+            match reason {
+                33 => {
+                    info!("    Reason: invalid guest state");
+                }
+                _ => {
+                    info!("    Reason: unknown ({})", reason);
+                }
+            }
+        } else {
+            let basic_reason = (exit_reason_raw & 0xFFFF) as u16;
+            let exit_reason: VmxExitReason = basic_reason.try_into().unwrap();
+
+            match exit_reason {
+                VmxExitReason::HLT => {
+                    info!("VM hlt");
+                }
+                _ => {
+                    info!("VM exit reason: {:?}", exit_reason);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn vmentry(&mut self) -> Result<(), InstructionError> {
+        let success = {
+            let result: u16;
+            unsafe {
+                result = crate::vmm::x86_64::intel::asm::asm_vm_entry(self as *mut _);
+            };
+            result == 0
+        };
+
+        if !self.launch_done && success {
+            self.launch_done = true;
+        }
+
+        if !success {
+            let error = InstructionError::read().unwrap();
+            if error as u32 != 0 {
+                return Err(error);
+            }
+        }
+
+        Ok(())
     }
 
     fn activate(&mut self) -> Result<(), &'static str> {
@@ -115,8 +177,9 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::CR3, 0)?;
         vmwrite(
             vmcs::guest::CR4,
-            (vmread(vmcs::guest::CR4)? | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits())
-                & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
+            vmread(vmcs::guest::CR4)?
+                | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()
+                    & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
         )?;
 
         vmwrite(vmcs::guest::CS_BASE, 0)?;
@@ -211,8 +274,8 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::RIP, Self::test_guest_code as u64)?; // TODO: Set linux kernel base
                                                                   // TODO: RSI
 
-        vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
-        vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
+        //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
+        //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
 
         Ok(())
     }
@@ -220,12 +283,13 @@ impl IntelVCpu {
 
 impl VCpu for IntelVCpu {
     fn run(&mut self) -> Result<(), &'static str> {
-        info!("VCpu on Intel");
-
         if !self.activated {
             self.activate()?;
             self.activated = true;
         }
+
+        self.vmentry().map_err(|e| e.to_str())?;
+        self.vmexit_handler()?;
 
         Ok(())
     }

@@ -43,7 +43,7 @@ global_asm!(
 "push rbx", // push *guest_regs
 "push rdi", // push *VCpu
 "lea rdi, [rsp + 8]", // rdi = rsp + 8 = *guest_regs
-"call set_host_stack",
+"call intel_set_host_stack",
 "pop rdi", // rdi = *VCpu
 "test byte ptr [rdi + {launch_done_offset}], 1", // flag = launch_done ? 1 : 0
 /*

@@ -41,4 +41,37 @@ impl InstructionError {
 
         InstructionError::try_from(err).map_err(|_| "Unknown instruction error")
     }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            InstructionError::NOT_AVAILABLE => "Instruction not available",
+            InstructionError::VMCALL_IN_VMXROOT => "VMCALL in VMX root operation",
+            InstructionError::VMCLEAR_INVALID_PHYS => "Invalid physical address for VMCLEAR",
+            InstructionError::VMCLEAR_VMXONPTR => "VMCLEAR with VMXON pointer",
+            InstructionError::VMLAUNCH_NONCLEAR_VMCS => "VMLAUNCH with non-cleared VMCS",
+            InstructionError::VMRESUME_NONLAUNCHED_VMCS => "VMRESUME with non-launched VMCS",
+            InstructionError::VMRESUME_AFTER_VMXOFF => "VMRESUME after VMXOFF",
+            InstructionError::VMENTRY_INVALID_CTRL => "Invalid control fields for VMENTRY",
+            InstructionError::VMENTRY_INVALID_HOST_STATE => "Invalid host state for VMENTRY",
+            InstructionError::VMPTRLD_INVALID_PHYS => "Invalid physical address for VMPTRLD",
+            InstructionError::VMPTRLD_VMXONP => "VMPTRLD with VMXON pointer",
+            InstructionError::VMPTRLD_INCORRECT_REV => "Incorrect revision identifier for VMPTRLD",
+            InstructionError::VMRW_UNSUPPORTED_COMPONENT => "Unsupported component in VMRW",
+            InstructionError::VMW_RO_COMPONENT => "Read-only component in VMWRITE",
+            InstructionError::VMXON_IN_VMXROOT => "VMXON in VMX root operation",
+            InstructionError::VMENTRY_INVALID_EXEC_CTRL => "Invalid execution controls for VMENTRY",
+            InstructionError::VMENTRY_NONLAUNCHED_EXEC_CTRL => {
+                "Non-launched execution controls for VMENTRY"
+            }
+            InstructionError::VMENTRY_EXEC_VMCSPTR => "Execution control VMCS pointer for VMENTRY",
+            InstructionError::VMCALL_NONCLEAR_VMCS => "VMCALL with non-cleared VMCS",
+            InstructionError::VMCALL_INVALID_EXITCTL => "Invalid exit control fields for VMCALL",
+            InstructionError::VMCALL_INCORRECT_MSGREV => "Incorrect message revision for VMCALL",
+            InstructionError::VMXOFF_DUALMONITOR => "VMXOFF in dual-monitor mode",
+            InstructionError::VMCALL_INVALID_SMM => "Invalid SMM state for VMCALL",
+            InstructionError::VMENTRY_INVALID_EXECCTRL => "Invalid execution controls for VMENTRY",
+            InstructionError::VMENTRY_EVENTS_BLOCKED => "Events blocked during VMENTRY",
+            InstructionError::INVALID_INVEPT => "Invalid INVEPT operation",
+        }
+    }
 }

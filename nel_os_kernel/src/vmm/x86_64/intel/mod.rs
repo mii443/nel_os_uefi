@@ -1,4 +1,4 @@
-mod asm;
+pub mod asm;
 mod controls;
 mod register;
 pub mod vcpu;
