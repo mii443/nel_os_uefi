@@ -158,7 +158,7 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     info!("Interrupts enabled");
 
     let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
-    vcpu.run();
+    vcpu.run().unwrap();
 
     info!("VCpu initialized");
 

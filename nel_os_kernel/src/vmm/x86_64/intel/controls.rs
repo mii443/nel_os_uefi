@@ -18,7 +18,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     let mut pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
     pin_exec_ctrl.set_external_interrupt_exiting(false);
 
-    pin_exec_ctrl.write();
+    pin_exec_ctrl.write()?;
 
     let mut raw_primary_exec_ctrl =
         u32::from(vmcs::controls::PrimaryProcessorBasedVmExecutionControls::read()?);
@@ -40,7 +40,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     primary_exec_ctrl.set_unconditional_io(false);
     primary_exec_ctrl.set_use_io_bitmap(false); // TODO: true
 
-    primary_exec_ctrl.write();
+    primary_exec_ctrl.write()?;
 
     let mut raw_secondary_exec_ctrl =
         u32::from(vmcs::controls::SecondaryProcessorBasedVmExecutionControls::read()?);
@@ -59,7 +59,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     secondary_exec_ctrl.set_unrestricted_guest(false); //TODO: true
     secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
 
-    secondary_exec_ctrl.write();
+    secondary_exec_ctrl.write()?;
 
     vmwrite(0x6000, u64::MAX)?;
     vmwrite(0x6002, u64::MAX)?;
@@ -84,7 +84,7 @@ pub fn setup_entry_controls() -> Result<(), &'static str> {
     entry_ctrl.set_load_ia32_efer(true);
     entry_ctrl.set_load_ia32_pat(true);
 
-    entry_ctrl.write();
+    entry_ctrl.write()?;
 
     Ok(())
 }
@@ -108,7 +108,7 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
     exit_ctrl.set_load_ia32_efer(true);
     exit_ctrl.set_load_ia32_pat(true);
 
-    exit_ctrl.write();
+    exit_ctrl.write()?;
 
     vmwrite(0x4004, 1u64 << 6)?; // EXCEPTION_BITMAP
 

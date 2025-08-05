@@ -25,7 +25,7 @@ impl IntelVCpu {
     fn activate(&mut self) -> Result<(), &'static str> {
         let revision_id = common::read_msr(0x480) as u32;
         self.vmcs.write_revision_id(revision_id);
-        self.vmcs.reset();
+        self.vmcs.reset()?;
         controls::setup_exec_controls()?;
         controls::setup_entry_controls()?;
         controls::setup_exit_controls()?;
