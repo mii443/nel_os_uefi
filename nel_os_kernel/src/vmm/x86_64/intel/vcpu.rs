@@ -4,6 +4,7 @@ use raw_cpuid::cpuid;
 use x86_64::{
     registers::control::Cr4Flags,
     structures::paging::{FrameAllocator, Size4KiB},
+    VirtAddr,
 };
 
 use crate::{
@@ -24,6 +25,9 @@ use crate::{
         VCpu,
     },
 };
+
+const TEMP_STACK_SIZE: usize = 4096;
+static mut TEMP_STACK: [u8; TEMP_STACK_SIZE + 0x10] = [0; TEMP_STACK_SIZE + 0x10];
 
 #[repr(C)]
 pub struct IntelVCpu {
@@ -64,7 +68,14 @@ impl IntelVCpu {
             unsafe { cr4() }.bits() as u64 | Cr4Flags::OSXSAVE.bits(),
         )?;
 
-        // TODO: set RIP to VMExit handler and stack
+        vmwrite(
+            vmcs::host::RIP,
+            crate::vmm::x86_64::intel::asm::asm_vmexit_handler as u64,
+        )?;
+        vmwrite(
+            vmcs::host::RSP,
+            VirtAddr::from_ptr(&raw mut TEMP_STACK).as_u64() + TEMP_STACK_SIZE as u64,
+        )?;
 
         vmwrite(vmcs::host::ES_SELECTOR, es().bits() as u64)?;
         vmwrite(vmcs::host::CS_SELECTOR, cs().bits() as u64)?;
