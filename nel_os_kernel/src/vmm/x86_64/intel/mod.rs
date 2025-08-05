@@ -1,4 +1,5 @@
 mod controls;
+mod register;
 pub mod vcpu;
 mod vmcs;
 mod vmxon;

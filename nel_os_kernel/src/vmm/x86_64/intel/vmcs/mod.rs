@@ -3,6 +3,7 @@
 pub mod controls;
 pub mod err;
 pub mod exit_reason;
+pub mod segment;
 
 use core::arch::asm;
 

@@ -1,3 +1,5 @@
+use core::arch::naked_asm;
+
 use raw_cpuid::cpuid;
 use x86_64::{
     registers::control::Cr4Flags,
@@ -9,19 +11,35 @@ use crate::{
     vmm::{
         x86_64::{
             common::{self, read_msr},
-            intel::{controls, vmcs, vmwrite, vmxon},
+            intel::{
+                controls,
+                register::GuestRegisters,
+                vmcs::{
+                    self,
+                    segment::{DescriptorType, Granularity, SegmentRights},
+                },
+                vmread, vmwrite, vmxon,
+            },
         },
         VCpu,
     },
 };
 
+#[repr(C)]
 pub struct IntelVCpu {
+    pub launch_done: bool,
+    pub guest_registers: GuestRegisters,
     activated: bool,
     vmxon: vmxon::Vmxon,
     vmcs: vmcs::Vmcs,
 }
 
 impl IntelVCpu {
+    #[unsafe(naked)]
+    unsafe extern "C" fn test_guest_code() -> ! {
+        naked_asm!("2: hlt; jmp 2b");
+    }
+
     fn activate(&mut self) -> Result<(), &'static str> {
         let revision_id = common::read_msr(0x480) as u32;
         self.vmcs.write_revision_id(revision_id);
@@ -30,6 +48,7 @@ impl IntelVCpu {
         controls::setup_entry_controls()?;
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
+        Self::setup_guest_state()?;
 
         Ok(())
     }
@@ -73,6 +92,119 @@ impl IntelVCpu {
 
         Ok(())
     }
+
+    fn setup_guest_state() -> Result<(), &'static str> {
+        use x86::{controlregs::*, vmx::vmcs};
+        let cr0 = (Cr0::empty()
+            | Cr0::CR0_PROTECTED_MODE
+            | Cr0::CR0_NUMERIC_ERROR
+            | Cr0::CR0_EXTENSION_TYPE)
+            & !Cr0::CR0_ENABLE_PAGING;
+        vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
+        vmwrite(vmcs::guest::CR3, 0)?;
+        vmwrite(
+            vmcs::guest::CR4,
+            (vmread(vmcs::guest::CR4)? | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits())
+                & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
+        )?;
+
+        vmwrite(vmcs::guest::CS_BASE, 0)?;
+        vmwrite(vmcs::guest::SS_BASE, 0)?;
+        vmwrite(vmcs::guest::DS_BASE, 0)?;
+        vmwrite(vmcs::guest::ES_BASE, 0)?;
+        vmwrite(vmcs::guest::TR_BASE, 0)?;
+        vmwrite(vmcs::guest::GDTR_BASE, 0)?;
+        vmwrite(vmcs::guest::IDTR_BASE, 0)?;
+        vmwrite(vmcs::guest::LDTR_BASE, 0xDEAD00)?;
+
+        vmwrite(vmcs::guest::CS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::SS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::DS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::ES_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::FS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::GS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::TR_LIMIT, 0)?;
+        vmwrite(vmcs::guest::GDTR_LIMIT, 0)?;
+        vmwrite(vmcs::guest::IDTR_LIMIT, 0)?;
+        vmwrite(vmcs::guest::LDTR_LIMIT, 0)?;
+
+        let cs_right = SegmentRights::default()
+            .with_rw(true)
+            .with_dc(false)
+            .with_executable(true)
+            .with_desc_type(DescriptorType::Code)
+            .with_dpl(0)
+            .with_granularity(Granularity::KByte)
+            .with_long(false)
+            .with_db(true);
+
+        let ds_right = SegmentRights::default()
+            .with_rw(true)
+            .with_dc(false)
+            .with_executable(false)
+            .with_desc_type(DescriptorType::Code)
+            .with_dpl(0)
+            .with_granularity(Granularity::KByte)
+            .with_long(false)
+            .with_db(true);
+
+        let tr_right = SegmentRights::default()
+            .with_rw(true)
+            .with_dc(false)
+            .with_executable(true)
+            .with_desc_type(DescriptorType::System)
+            .with_dpl(0)
+            .with_granularity(Granularity::Byte)
+            .with_long(false)
+            .with_db(false);
+
+        let ldtr_right = SegmentRights::default()
+            .with_accessed(false)
+            .with_rw(true)
+            .with_dc(false)
+            .with_executable(false)
+            .with_desc_type(DescriptorType::System)
+            .with_dpl(0)
+            .with_granularity(Granularity::Byte)
+            .with_long(false)
+            .with_db(false);
+
+        vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, u32::from(cs_right) as u64)?;
+        vmwrite(vmcs::guest::SS_ACCESS_RIGHTS, u32::from(ds_right) as u64)?;
+        vmwrite(vmcs::guest::DS_ACCESS_RIGHTS, u32::from(ds_right) as u64)?;
+        vmwrite(vmcs::guest::ES_ACCESS_RIGHTS, u32::from(ds_right) as u64)?;
+        vmwrite(vmcs::guest::FS_ACCESS_RIGHTS, u32::from(ds_right) as u64)?;
+        vmwrite(vmcs::guest::GS_ACCESS_RIGHTS, u32::from(ds_right) as u64)?;
+        vmwrite(vmcs::guest::TR_ACCESS_RIGHTS, u32::from(tr_right) as u64)?;
+        vmwrite(
+            vmcs::guest::LDTR_ACCESS_RIGHTS,
+            u32::from(ldtr_right) as u64,
+        )?;
+
+        vmwrite(vmcs::guest::CS_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::SS_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::DS_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::ES_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::FS_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::GS_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::TR_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::LDTR_SELECTOR, 0)?;
+        vmwrite(vmcs::guest::FS_BASE, 0)?;
+        vmwrite(vmcs::guest::GS_BASE, 0)?;
+
+        vmwrite(vmcs::guest::IA32_EFER_FULL, 0)?;
+        vmwrite(vmcs::guest::IA32_EFER_HIGH, 0)?;
+        vmwrite(vmcs::guest::RFLAGS, 0x2)?;
+        vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
+
+        vmwrite(vmcs::guest::RIP, Self::test_guest_code as u64)?; // TODO: Set linux kernel base
+                                                                  // TODO: RSI
+
+        vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
+        vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
+
+        Ok(())
+    }
 }
 
 impl VCpu for IntelVCpu {
@@ -110,6 +242,8 @@ impl VCpu for IntelVCpu {
         let vmcs = vmcs::Vmcs::new(frame_allocator)?;
 
         Ok(IntelVCpu {
+            launch_done: false,
+            guest_registers: GuestRegisters::default(),
             activated: false,
             vmxon,
             vmcs,
