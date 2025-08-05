@@ -1,3 +1,4 @@
+mod controls;
 mod vmcs;
 mod vmxon;
 
@@ -15,12 +16,30 @@ use crate::{
 };
 
 pub struct IntelVCpu {
+    activated: bool,
     vmxon: vmxon::Vmxon,
+    vmcs: vmcs::Vmcs,
+}
+
+impl IntelVCpu {
+    fn activate(&mut self) -> Result<(), &'static str> {
+        self.vmcs.reset();
+        controls::setup_exec_controls()?;
+
+        Ok(())
+    }
 }
 
 impl VCpu for IntelVCpu {
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), &'static str> {
         info!("VCpu on Intel");
+
+        if !self.activated {
+            self.activate()?;
+            self.activated = true;
+        }
+
+        Ok(())
     }
 
     fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
@@ -43,7 +62,13 @@ impl VCpu for IntelVCpu {
 
         vmxon.activate()?;
 
-        Ok(IntelVCpu { vmxon })
+        let vmcs = vmcs::Vmcs::new(frame_allocator)?;
+
+        Ok(IntelVCpu {
+            activated: false,
+            vmxon,
+            vmcs,
+        })
     }
 
     fn is_supported() -> bool

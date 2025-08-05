@@ -15,7 +15,7 @@ pub trait VCpu {
     fn is_supported() -> bool
     where
         Self: Sized;
-    fn run(&mut self);
+    fn run(&mut self) -> Result<(), &'static str>;
 }
 
 pub fn get_vcpu(
