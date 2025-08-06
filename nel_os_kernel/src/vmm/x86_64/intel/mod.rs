@@ -1,5 +1,6 @@
 pub mod asm;
 mod controls;
+mod ept;
 mod register;
 pub mod vcpu;
 mod vmcs;
