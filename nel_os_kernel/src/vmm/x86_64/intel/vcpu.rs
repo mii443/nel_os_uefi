@@ -312,24 +312,226 @@ impl IntelVCpu {
         //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
         //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
 
-        info!("Guest State Check (Extended):");
-        info!("  CR0: {:#x}", vmread(vmcs::guest::CR0)?);
-        info!("  CR3: {:#x}", vmread(vmcs::guest::CR3)?);
-        info!("  CR4: {:#x}", vmread(vmcs::guest::CR4)?);
-        info!("  EFER: {:#x}", vmread(vmcs::guest::IA32_EFER_FULL)?);
+        Ok(())
+    }
+
+    fn dump_vmcs_settings(&self) -> Result<(), &'static str> {
+        info!("=== VMCS Control Fields ===");
+
+        // Pin-based controls
+        let pin_ctrl = vmread(x86::vmx::vmcs::control::PINBASED_EXEC_CONTROLS)?;
+        info!("Pin-based VM-execution controls: {:#x}", pin_ctrl);
+
+        // Primary processor-based controls
+        let primary_ctrl = vmread(x86::vmx::vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS)?;
         info!(
-            "  CS: sel={:#x}, base={:#x}, limit={:#x}, ar={:#x}",
-            vmread(vmcs::guest::CS_SELECTOR)?,
-            vmread(vmcs::guest::CS_BASE)?,
-            vmread(vmcs::guest::CS_LIMIT)?,
-            vmread(vmcs::guest::CS_ACCESS_RIGHTS)?
+            "Primary processor-based VM-execution controls: {:#x}",
+            primary_ctrl
+        );
+
+        // Secondary processor-based controls
+        let secondary_ctrl = vmread(x86::vmx::vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS)?;
+        info!(
+            "Secondary processor-based VM-execution controls: {:#x}",
+            secondary_ctrl
+        );
+
+        // Entry controls
+        let entry_ctrl = vmread(x86::vmx::vmcs::control::VMENTRY_CONTROLS)?;
+        info!("VM-entry controls: {:#x}", entry_ctrl);
+
+        // Exit controls
+        let exit_ctrl = vmread(x86::vmx::vmcs::control::VMEXIT_CONTROLS)?;
+        info!("VM-exit controls: {:#x}", exit_ctrl);
+
+        // EPT pointer
+        let eptp = vmread(x86::vmx::vmcs::control::EPTP_FULL)?;
+        info!("EPT pointer: {:#x}", eptp);
+
+        info!("=== Guest State ===");
+
+        // Control registers
+        info!("Guest CR0: {:#x}", vmread(x86::vmx::vmcs::guest::CR0)?);
+        info!("Guest CR3: {:#x}", vmread(x86::vmx::vmcs::guest::CR3)?);
+        info!("Guest CR4: {:#x}", vmread(x86::vmx::vmcs::guest::CR4)?);
+
+        // Instruction pointer and stack
+        info!("Guest RIP: {:#x}", vmread(x86::vmx::vmcs::guest::RIP)?);
+        info!("Guest RSP: {:#x}", vmread(x86::vmx::vmcs::guest::RSP)?);
+        info!(
+            "Guest RFLAGS: {:#x}",
+            vmread(x86::vmx::vmcs::guest::RFLAGS)?
+        );
+
+        // Segment registers - CS
+        info!(
+            "Guest CS selector: {:#x}",
+            vmread(x86::vmx::vmcs::guest::CS_SELECTOR)?
         );
         info!(
-            "  TR: sel={:#x}, base={:#x}, limit={:#x}, ar={:#x}",
-            vmread(vmcs::guest::TR_SELECTOR)?,
-            vmread(vmcs::guest::TR_BASE)?,
-            vmread(vmcs::guest::TR_LIMIT)?,
-            vmread(vmcs::guest::TR_ACCESS_RIGHTS)?
+            "Guest CS base: {:#x}",
+            vmread(x86::vmx::vmcs::guest::CS_BASE)?
+        );
+        info!(
+            "Guest CS limit: {:#x}",
+            vmread(x86::vmx::vmcs::guest::CS_LIMIT)?
+        );
+        info!(
+            "Guest CS access rights: {:#x}",
+            vmread(x86::vmx::vmcs::guest::CS_ACCESS_RIGHTS)?
+        );
+
+        // Segment registers - SS
+        info!(
+            "Guest SS selector: {:#x}",
+            vmread(x86::vmx::vmcs::guest::SS_SELECTOR)?
+        );
+        info!(
+            "Guest SS base: {:#x}",
+            vmread(x86::vmx::vmcs::guest::SS_BASE)?
+        );
+        info!(
+            "Guest SS limit: {:#x}",
+            vmread(x86::vmx::vmcs::guest::SS_LIMIT)?
+        );
+        info!(
+            "Guest SS access rights: {:#x}",
+            vmread(x86::vmx::vmcs::guest::SS_ACCESS_RIGHTS)?
+        );
+
+        // TR
+        info!(
+            "Guest TR selector: {:#x}",
+            vmread(x86::vmx::vmcs::guest::TR_SELECTOR)?
+        );
+        info!(
+            "Guest TR base: {:#x}",
+            vmread(x86::vmx::vmcs::guest::TR_BASE)?
+        );
+        info!(
+            "Guest TR limit: {:#x}",
+            vmread(x86::vmx::vmcs::guest::TR_LIMIT)?
+        );
+        info!(
+            "Guest TR access rights: {:#x}",
+            vmread(x86::vmx::vmcs::guest::TR_ACCESS_RIGHTS)?
+        );
+
+        // LDTR
+        info!(
+            "Guest LDTR selector: {:#x}",
+            vmread(x86::vmx::vmcs::guest::LDTR_SELECTOR)?
+        );
+        info!(
+            "Guest LDTR base: {:#x}",
+            vmread(x86::vmx::vmcs::guest::LDTR_BASE)?
+        );
+        info!(
+            "Guest LDTR limit: {:#x}",
+            vmread(x86::vmx::vmcs::guest::LDTR_LIMIT)?
+        );
+        info!(
+            "Guest LDTR access rights: {:#x}",
+            vmread(x86::vmx::vmcs::guest::LDTR_ACCESS_RIGHTS)?
+        );
+
+        // GDTR/IDTR
+        info!(
+            "Guest GDTR base: {:#x}",
+            vmread(x86::vmx::vmcs::guest::GDTR_BASE)?
+        );
+        info!(
+            "Guest GDTR limit: {:#x}",
+            vmread(x86::vmx::vmcs::guest::GDTR_LIMIT)?
+        );
+        info!(
+            "Guest IDTR base: {:#x}",
+            vmread(x86::vmx::vmcs::guest::IDTR_BASE)?
+        );
+        info!(
+            "Guest IDTR limit: {:#x}",
+            vmread(x86::vmx::vmcs::guest::IDTR_LIMIT)?
+        );
+
+        // MSRs
+        info!(
+            "Guest IA32_EFER: {:#x}",
+            vmread(x86::vmx::vmcs::guest::IA32_EFER_FULL)?
+        );
+
+        // Link pointer
+        info!(
+            "Guest VMCS link pointer: {:#x}",
+            vmread(x86::vmx::vmcs::guest::LINK_PTR_FULL)?
+        );
+
+        info!("=== Host State ===");
+
+        // Control registers
+        info!("Host CR0: {:#x}", vmread(x86::vmx::vmcs::host::CR0)?);
+        info!("Host CR3: {:#x}", vmread(x86::vmx::vmcs::host::CR3)?);
+        info!("Host CR4: {:#x}", vmread(x86::vmx::vmcs::host::CR4)?);
+
+        // Instruction pointer and stack
+        info!("Host RIP: {:#x}", vmread(x86::vmx::vmcs::host::RIP)?);
+        info!("Host RSP: {:#x}", vmread(x86::vmx::vmcs::host::RSP)?);
+
+        // Segment selectors
+        info!(
+            "Host CS selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::CS_SELECTOR)?
+        );
+        info!(
+            "Host SS selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::SS_SELECTOR)?
+        );
+        info!(
+            "Host DS selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::DS_SELECTOR)?
+        );
+        info!(
+            "Host ES selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::ES_SELECTOR)?
+        );
+        info!(
+            "Host FS selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::FS_SELECTOR)?
+        );
+        info!(
+            "Host GS selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::GS_SELECTOR)?
+        );
+        info!(
+            "Host TR selector: {:#x}",
+            vmread(x86::vmx::vmcs::host::TR_SELECTOR)?
+        );
+
+        // Base addresses
+        info!(
+            "Host FS base: {:#x}",
+            vmread(x86::vmx::vmcs::host::FS_BASE)?
+        );
+        info!(
+            "Host GS base: {:#x}",
+            vmread(x86::vmx::vmcs::host::GS_BASE)?
+        );
+        info!(
+            "Host TR base: {:#x}",
+            vmread(x86::vmx::vmcs::host::TR_BASE)?
+        );
+        info!(
+            "Host GDTR base: {:#x}",
+            vmread(x86::vmx::vmcs::host::GDTR_BASE)?
+        );
+        info!(
+            "Host IDTR base: {:#x}",
+            vmread(x86::vmx::vmcs::host::IDTR_BASE)?
+        );
+
+        // MSRs
+        info!(
+            "Host IA32_EFER: {:#x}",
+            vmread(x86::vmx::vmcs::host::IA32_EFER_FULL)?
         );
 
         Ok(())
@@ -343,6 +545,7 @@ impl VCpu for IntelVCpu {
     ) -> Result<(), &'static str> {
         if !self.activated {
             self.activate(frame_allocator)?;
+            self.dump_vmcs_settings()?;
             self.activated = true;
         }
 
