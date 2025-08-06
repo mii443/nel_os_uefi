@@ -9,7 +9,10 @@ use crate::{
 pub struct AMDVCpu;
 
 impl VCpu for AMDVCpu {
-    fn run(&mut self) -> Result<(), &'static str> {
+    fn run(
+        &mut self,
+        _frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
         info!("VCpu on AMD");
 
         Ok(())

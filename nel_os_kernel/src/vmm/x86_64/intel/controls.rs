@@ -34,15 +34,15 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     let mut primary_exec_ctrl =
         vmcs::controls::PrimaryProcessorBasedVmExecutionControls::from(raw_primary_exec_ctrl);
     primary_exec_ctrl.set_hlt(true);
-    primary_exec_ctrl.set_activate_secondary_controls(false);
+    primary_exec_ctrl.set_activate_secondary_controls(true);
 
     primary_exec_ctrl.write()?;
 
-    /*let mut raw_secondary_exec_ctrl =
+    let mut raw_secondary_exec_ctrl =
         u32::from(vmcs::controls::SecondaryProcessorBasedVmExecutionControls::read()?);
 
     let reserved_bits = if basic_msr & (1 << 55) != 0 {
-        common::read_msr(0x48b)
+        common::read_msr(x86::msr::IA32_VMX_PROCBASED_CTLS2)
     } else {
         0
     };
@@ -51,14 +51,11 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
 
     let mut secondary_exec_ctrl =
         vmcs::controls::SecondaryProcessorBasedVmExecutionControls::from(raw_secondary_exec_ctrl);
-    secondary_exec_ctrl.set_ept(false); // TODO: true
-    secondary_exec_ctrl.set_unrestricted_guest(false); //TODO: true
-    secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
+    secondary_exec_ctrl.set_ept(true); // TODO: true
+    secondary_exec_ctrl.set_unrestricted_guest(true); //TODO: true
+                                                      //secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
 
     secondary_exec_ctrl.write()?;
-
-    vmwrite(0x6000, 0)?;
-    vmwrite(0x6002, 0)?;*/
 
     Ok(())
 }
@@ -76,7 +73,7 @@ pub fn setup_entry_controls() -> Result<(), &'static str> {
     raw_entry_ctrl &= (reserved_bits >> 32) as u32;
 
     let mut entry_ctrl = vmcs::controls::EntryControls::from(raw_entry_ctrl);
-    entry_ctrl.set_ia32e_mode_guest(true);
+    entry_ctrl.set_ia32e_mode_guest(false);
     /*entry_ctrl.set_load_ia32_efer(true);
     entry_ctrl.set_load_ia32_pat(true);*/
 

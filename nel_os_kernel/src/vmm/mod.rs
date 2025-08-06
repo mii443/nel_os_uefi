@@ -15,7 +15,10 @@ pub trait VCpu {
     fn is_supported() -> bool
     where
         Self: Sized;
-    fn run(&mut self) -> Result<(), &'static str>;
+    fn run(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str>;
 }
 
 pub fn get_vcpu(

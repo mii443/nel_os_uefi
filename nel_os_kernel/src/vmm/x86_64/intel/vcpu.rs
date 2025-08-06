@@ -3,7 +3,7 @@ use core::arch::naked_asm;
 use raw_cpuid::cpuid;
 use x86_64::{
     registers::control::Cr4Flags,
-    structures::paging::{FrameAllocator, Size4KiB},
+    structures::paging::{frame, FrameAllocator, Size4KiB},
     VirtAddr,
 };
 
@@ -13,7 +13,7 @@ use crate::{
         x86_64::{
             common::{self, read_msr},
             intel::{
-                controls,
+                controls, ept,
                 register::GuestRegisters,
                 vmcs::{
                     self,
@@ -38,6 +38,8 @@ pub struct IntelVCpu {
     activated: bool,
     vmxon: vmxon::Vmxon,
     vmcs: vmcs::Vmcs,
+    ept: ept::EPT,
+    eptp: ept::EPTP,
 }
 
 impl IntelVCpu {
@@ -84,6 +86,7 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
+        info!("VMEntry");
         let success = {
             let result: u16;
             unsafe {
@@ -91,6 +94,7 @@ impl IntelVCpu {
             };
             result == 0
         };
+        info!("VMEntry result: {}", success);
 
         if !self.launch_done && success {
             self.launch_done = true;
@@ -106,7 +110,10 @@ impl IntelVCpu {
         Ok(())
     }
 
-    fn activate(&mut self) -> Result<(), &'static str> {
+    fn activate(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
         let revision_id = common::read_msr(0x480) as u32;
         self.vmcs.write_revision_id(revision_id);
         self.vmcs.reset()?;
@@ -115,6 +122,36 @@ impl IntelVCpu {
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
         Self::setup_guest_state()?;
+
+        self.init_guest_memory(frame_allocator)?;
+
+        Ok(())
+    }
+
+    fn init_guest_memory(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        let mut pages = 1000;
+        let mut gpa = 0;
+
+        while pages > 0 {
+            let frame = frame_allocator.allocate_frame().ok_or("No free frames")?;
+            let hpa = frame.start_address().as_u64();
+
+            self.ept.map_2m(gpa, hpa, frame_allocator)?;
+            gpa += (4 * 1024) << 9;
+            pages -= 1;
+        }
+
+        let guest_ptr = Self::test_guest_code as u64;
+        let guest_addr = self.ept.get_phys_addr(0).unwrap();
+        unsafe {
+            core::ptr::copy_nonoverlapping(guest_ptr as *const u8, guest_addr as *mut u8, 200);
+        }
+
+        let eptp = ept::EPTP::init(&self.ept.root_table);
+        vmwrite(x86::vmx::vmcs::control::EPTP_FULL, u64::from(eptp))?;
 
         Ok(())
     }
@@ -168,11 +205,9 @@ impl IntelVCpu {
 
     fn setup_guest_state() -> Result<(), &'static str> {
         use x86::{controlregs::*, vmx::vmcs};
-        let cr0 = unsafe { cr0() }/*(Cr0::empty()
+        let cr0 = Cr0::empty()
             | Cr0::CR0_PROTECTED_MODE
-            | Cr0::CR0_NUMERIC_ERROR
-            | Cr0::CR0_EXTENSION_TYPE)
-            & !Cr0::CR0_ENABLE_PAGING*/;
+            | Cr0::CR0_NUMERIC_ERROR & !Cr0::CR0_ENABLE_PAGING;
         vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
         vmwrite(vmcs::guest::CR3, unsafe { cr3() })?;
         vmwrite(
@@ -189,12 +224,12 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::IDTR_BASE, 0)?;
         vmwrite(vmcs::guest::LDTR_BASE, 0xDEAD00)?;
 
-        vmwrite(vmcs::guest::CS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::SS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::DS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::ES_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::FS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::GS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::CS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::SS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::DS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::ES_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::FS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::GS_LIMIT, 0xffff)?;
         vmwrite(vmcs::guest::TR_LIMIT, 0)?;
         vmwrite(vmcs::guest::GDTR_LIMIT, 0)?;
         vmwrite(vmcs::guest::IDTR_LIMIT, 0)?;
@@ -271,8 +306,8 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::RFLAGS, 0x2)?;
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
 
-        vmwrite(vmcs::guest::RIP, Self::test_guest_code as u64)?; // TODO: Set linux kernel base
-                                                                  // TODO: RSI
+        vmwrite(vmcs::guest::RIP, 0)?; // TODO: Set linux kernel base
+                                       // TODO: RSI
 
         //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
         //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
@@ -302,9 +337,12 @@ impl IntelVCpu {
 }
 
 impl VCpu for IntelVCpu {
-    fn run(&mut self) -> Result<(), &'static str> {
+    fn run(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
         if !self.activated {
-            self.activate()?;
+            self.activate(frame_allocator)?;
             self.activated = true;
         }
 
@@ -336,12 +374,17 @@ impl VCpu for IntelVCpu {
 
         let vmcs = vmcs::Vmcs::new(frame_allocator)?;
 
+        let ept = ept::EPT::new(frame_allocator)?;
+        let eptp = ept::EPTP::init(&ept.root_table);
+
         Ok(IntelVCpu {
             launch_done: false,
             guest_registers: GuestRegisters::default(),
             activated: false,
             vmxon,
             vmcs,
+            ept,
+            eptp,
         })
     }
 
