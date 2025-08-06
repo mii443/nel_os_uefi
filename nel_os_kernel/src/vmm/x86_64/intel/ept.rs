@@ -1,6 +1,6 @@
 use modular_bitfield::{
     bitfield,
-    prelude::{B3, B53},
+    prelude::{B3, B53, B56},
 };
 use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
@@ -278,6 +278,34 @@ impl EPT {
 
     fn frame_to_table_ptr(frame: &PhysFrame) -> &'static mut [EntryBase; 512] {
         let table_ptr = frame.start_address().as_u64();
+
+        unsafe { &mut *(table_ptr as *mut [EntryBase; 512]) }
+    }
+}
+
+#[bitfield]
+#[repr(u64)]
+#[derive(Debug)]
+pub struct EPTP {
+    pub typ: B3,
+    pub level: B3,
+    pub dirty_accessed: bool,
+    pub enforce_access_rights: bool,
+    pub phys: B56,
+}
+
+impl EPTP {
+    pub fn init(lv4_table: &PhysFrame) -> Self {
+        EPTP::new()
+            .with_typ(6)
+            .with_level(3)
+            .with_dirty_accessed(true)
+            .with_enforce_access_rights(false)
+            .with_phys(lv4_table.start_address().as_u64() >> 12)
+    }
+
+    pub fn get_lv4_table(&self) -> &mut [EntryBase; 512] {
+        let table_ptr = self.phys() << 12;
 
         unsafe { &mut *(table_ptr as *mut [EntryBase; 512]) }
     }
