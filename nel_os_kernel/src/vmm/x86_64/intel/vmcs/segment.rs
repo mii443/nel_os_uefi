@@ -30,7 +30,7 @@ pub struct SegmentRights {
     pub db: bool,
     #[bits = 1]
     pub granularity: Granularity,
-    pub usable: bool,
+    pub unusable: bool,
     reserved2: B15,
 }
 
@@ -41,6 +41,6 @@ impl Default for SegmentRights {
             .with_present(true)
             .with_avl(false)
             .with_long(false)
-            .with_usable(false)
+            .with_unusable(false)
     }
 }

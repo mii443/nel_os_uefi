@@ -127,7 +127,7 @@ impl IntelVCpu {
         vmwrite(vmcs::host::CR3, unsafe { cr3() })?;
         vmwrite(
             vmcs::host::CR4,
-            unsafe { cr4() }.bits() as u64 | Cr4Flags::OSXSAVE.bits(),
+            unsafe { cr4() }.bits() as u64, /* | Cr4Flags::OSXSAVE.bits()*/
         )?;
 
         vmwrite(
@@ -168,18 +168,16 @@ impl IntelVCpu {
 
     fn setup_guest_state() -> Result<(), &'static str> {
         use x86::{controlregs::*, vmx::vmcs};
-        let cr0 = (Cr0::empty()
+        let cr0 = unsafe { cr0() }/*(Cr0::empty()
             | Cr0::CR0_PROTECTED_MODE
             | Cr0::CR0_NUMERIC_ERROR
             | Cr0::CR0_EXTENSION_TYPE)
-            & !Cr0::CR0_ENABLE_PAGING;
+            & !Cr0::CR0_ENABLE_PAGING*/;
         vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
-        vmwrite(vmcs::guest::CR3, 0)?;
+        vmwrite(vmcs::guest::CR3, unsafe { cr3() })?;
         vmwrite(
             vmcs::guest::CR4,
-            vmread(vmcs::guest::CR4)?
-                | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()
-                    & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
+            unsafe { cr4() }.bits() as u64, /*vmread(vmcs::guest::CR4)? & !Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()*/
         )?;
 
         vmwrite(vmcs::guest::CS_BASE, 0)?;
@@ -209,8 +207,8 @@ impl IntelVCpu {
             .with_desc_type(DescriptorType::Code)
             .with_dpl(0)
             .with_granularity(Granularity::KByte)
-            .with_long(false)
-            .with_db(true);
+            .with_long(true)
+            .with_db(false);
 
         let ds_right = SegmentRights::default()
             .with_rw(true)
@@ -255,7 +253,10 @@ impl IntelVCpu {
             u32::from(ldtr_right) as u64,
         )?;
 
-        vmwrite(vmcs::guest::CS_SELECTOR, 0)?;
+        vmwrite(
+            vmcs::guest::CS_SELECTOR,
+            x86::segmentation::cs().bits() as u64,
+        )?;
         vmwrite(vmcs::guest::SS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::DS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::ES_SELECTOR, 0)?;
@@ -266,8 +267,7 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::FS_BASE, 0)?;
         vmwrite(vmcs::guest::GS_BASE, 0)?;
 
-        vmwrite(vmcs::guest::IA32_EFER_FULL, 0)?;
-        vmwrite(vmcs::guest::IA32_EFER_HIGH, 0)?;
+        vmwrite(vmcs::guest::IA32_EFER_FULL, read_msr(x86::msr::IA32_EFER))?;
         vmwrite(vmcs::guest::RFLAGS, 0x2)?;
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
 
@@ -276,6 +276,26 @@ impl IntelVCpu {
 
         //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
         //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
+
+        info!("Guest State Check (Extended):");
+        info!("  CR0: {:#x}", vmread(vmcs::guest::CR0)?);
+        info!("  CR3: {:#x}", vmread(vmcs::guest::CR3)?);
+        info!("  CR4: {:#x}", vmread(vmcs::guest::CR4)?);
+        info!("  EFER: {:#x}", vmread(vmcs::guest::IA32_EFER_FULL)?);
+        info!(
+            "  CS: sel={:#x}, base={:#x}, limit={:#x}, ar={:#x}",
+            vmread(vmcs::guest::CS_SELECTOR)?,
+            vmread(vmcs::guest::CS_BASE)?,
+            vmread(vmcs::guest::CS_LIMIT)?,
+            vmread(vmcs::guest::CS_ACCESS_RIGHTS)?
+        );
+        info!(
+            "  TR: sel={:#x}, base={:#x}, limit={:#x}, ar={:#x}",
+            vmread(vmcs::guest::TR_SELECTOR)?,
+            vmread(vmcs::guest::TR_BASE)?,
+            vmread(vmcs::guest::TR_LIMIT)?,
+            vmread(vmcs::guest::TR_ACCESS_RIGHTS)?
+        );
 
         Ok(())
     }

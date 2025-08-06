@@ -16,7 +16,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     raw_pin_exec_ctrl &= (reserved_bits >> 32) as u32;
 
     let mut pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
-    pin_exec_ctrl.set_external_interrupt_exiting(false);
+    //pin_exec_ctrl.set_external_interrupt_exiting(false);
 
     pin_exec_ctrl.write()?;
 
@@ -34,15 +34,11 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     let mut primary_exec_ctrl =
         vmcs::controls::PrimaryProcessorBasedVmExecutionControls::from(raw_primary_exec_ctrl);
     primary_exec_ctrl.set_hlt(true);
-    primary_exec_ctrl.set_activate_secondary_controls(true);
-    primary_exec_ctrl.set_use_tpr_shadow(false);
-    primary_exec_ctrl.set_use_msr_bitmap(false);
-    primary_exec_ctrl.set_unconditional_io(false);
-    primary_exec_ctrl.set_use_io_bitmap(false); // TODO: true
+    primary_exec_ctrl.set_activate_secondary_controls(false);
 
     primary_exec_ctrl.write()?;
 
-    let mut raw_secondary_exec_ctrl =
+    /*let mut raw_secondary_exec_ctrl =
         u32::from(vmcs::controls::SecondaryProcessorBasedVmExecutionControls::read()?);
 
     let reserved_bits = if basic_msr & (1 << 55) != 0 {
@@ -61,8 +57,8 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
 
     secondary_exec_ctrl.write()?;
 
-    vmwrite(0x6000, u64::MAX)?;
-    vmwrite(0x6002, u64::MAX)?;
+    vmwrite(0x6000, 0)?;
+    vmwrite(0x6002, 0)?;*/
 
     Ok(())
 }
@@ -80,9 +76,9 @@ pub fn setup_entry_controls() -> Result<(), &'static str> {
     raw_entry_ctrl &= (reserved_bits >> 32) as u32;
 
     let mut entry_ctrl = vmcs::controls::EntryControls::from(raw_entry_ctrl);
-    entry_ctrl.set_ia32e_mode_guest(false);
-    entry_ctrl.set_load_ia32_efer(true);
-    entry_ctrl.set_load_ia32_pat(true);
+    entry_ctrl.set_ia32e_mode_guest(true);
+    /*entry_ctrl.set_load_ia32_efer(true);
+    entry_ctrl.set_load_ia32_pat(true);*/
 
     entry_ctrl.write()?;
 
@@ -103,14 +99,14 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
 
     let mut exit_ctrl = vmcs::controls::PrimaryExitControls::from(raw_exit_ctrl);
     exit_ctrl.set_host_addr_space_size(true);
-    exit_ctrl.set_save_ia32_efer(true);
-    exit_ctrl.set_save_ia32_pat(true);
+    /*exit_ctrl.set_save_ia32_efer(true);
+    exit_ctrl.set_save_ia32_pat(true);*/
     exit_ctrl.set_load_ia32_efer(true);
-    exit_ctrl.set_load_ia32_pat(true);
+    //exit_ctrl.set_load_ia32_pat(true);
 
     exit_ctrl.write()?;
 
-    vmwrite(0x4004, 1u64 << 6)?; // EXCEPTION_BITMAP
+    //vmwrite(0x4004, 1u64 << 6)?; // EXCEPTION_BITMAP
 
     Ok(())
 }
