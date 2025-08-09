@@ -76,6 +76,11 @@ impl IntelVCpu {
                 VmxExitReason::HLT => {
                     info!("VM hlt");
                 }
+                VmxExitReason::EPT_VIOLATION => {
+                    let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
+                    info!("EPT Violation at guest address: {:#x}", guest_address);
+                    return Err("EPT Violation");
+                }
                 _ => {
                     info!("VM exit reason: {:?}", exit_reason);
                 }
@@ -152,6 +157,13 @@ impl IntelVCpu {
 
         let eptp = ept::EPTP::init(&self.ept.root_table);
         vmwrite(x86::vmx::vmcs::control::EPTP_FULL, u64::from(eptp))?;
+
+        info!(
+            "GPA 0x0 -> HPA {:#x}",
+            self.ept
+                .get_phys_addr(0)
+                .ok_or("Failed to get physical address")?
+        );
 
         Ok(())
     }

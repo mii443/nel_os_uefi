@@ -159,7 +159,11 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
     loop {
-        info!("{:?}", vcpu.run(&mut bitmap_table));
+        let result = vcpu.run(&mut bitmap_table);
+        if let Err(e) = result {
+            error!("VCPU run failed: {}", e);
+            break;
+        }
     }
 
     hlt_loop();

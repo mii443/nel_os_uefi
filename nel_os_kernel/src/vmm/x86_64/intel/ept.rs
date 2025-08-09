@@ -1,6 +1,6 @@
 use modular_bitfield::{
     bitfield,
-    prelude::{B3, B4, B52, B53},
+    prelude::{B1, B3, B4, B52, B53},
 };
 use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
@@ -325,7 +325,8 @@ pub struct EntryBase {
     pub accessed: bool,
     pub dirty: bool,
     pub exec_user: bool,
-    pub phys: B53,
+    reserved: B1,
+    pub phys: B52,
 }
 
 impl EntryBase {

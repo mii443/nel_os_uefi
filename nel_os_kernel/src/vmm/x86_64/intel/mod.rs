@@ -4,6 +4,7 @@ mod ept;
 mod register;
 pub mod vcpu;
 mod vmcs;
+mod vmexit;
 mod vmxon;
 
 use core::arch::asm;
