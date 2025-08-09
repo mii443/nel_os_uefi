@@ -105,7 +105,7 @@ impl EPT {
         &mut self,
         gpa: u64,
         hpa: u64,
-        allocator: &mut impl FrameAllocator<Size4KiB>,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
         let lv4_index = (gpa >> 39) & 0x1FF;
         let lv3_index = (gpa >> 30) & 0x1FF;

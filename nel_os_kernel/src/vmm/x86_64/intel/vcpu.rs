@@ -144,8 +144,8 @@ impl IntelVCpu {
             let frame = frame_allocator.allocate_frame().ok_or("No free frames")?;
             let hpa = frame.start_address().as_u64();
 
-            self.ept.map_2m(gpa, hpa, frame_allocator)?;
-            gpa += (4 * 1024) << 9;
+            self.ept.map_4k(gpa, hpa, frame_allocator)?;
+            gpa += 0x1000;
             pages -= 1;
         }
 
