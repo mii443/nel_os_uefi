@@ -42,23 +42,51 @@ fn get_fs() -> Directory {
     fs.open_volume().unwrap()
 }
 
-fn read_kernel(name: &CStr16) -> Box<[u8]> {
+fn read_file(name: &CStr16) -> Box<[u8]> {
     let mut root = get_fs();
-    let kernel_file_info = root
+    let file_info = root
         .open(name, FileMode::Read, FileAttribute::empty())
         .unwrap();
-    let mut kernel_file = kernel_file_info.into_regular_file().unwrap();
+    let mut file = file_info.into_regular_file().unwrap();
 
-    let file_size = kernel_file
-        .get_boxed_info::<FileInfo>()
-        .unwrap()
-        .file_size();
+    let file_size = file.get_boxed_info::<FileInfo>().unwrap().file_size();
     let mut buf = vec![0; file_size as usize];
 
-    let read_size = kernel_file.read(&mut buf).unwrap();
-    println!("kernel size: {}", read_size);
+    let read_size = file.read(&mut buf).unwrap();
+    println!("file {} size: {}", name, read_size);
 
     buf.into_boxed_slice()
+}
+
+fn load_file_to_laoder_data(name: &CStr16) -> (u64, u64) {
+    let mut root = get_fs();
+    let file_info = root
+        .open(name, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open file");
+    let mut file = file_info
+        .into_regular_file()
+        .expect("Failed to convert to regular file");
+
+    let file_size = file
+        .get_boxed_info::<FileInfo>()
+        .expect("Failed to get file info")
+        .file_size();
+
+    let page_ptr = unsafe {
+        uefi::boot::allocate_pages(
+            AllocateType::AnyPages,
+            MemoryType::LOADER_DATA,
+            file_size.div_ceil(4096) as usize,
+        )
+        .expect("Failed to allocate pages")
+        .as_mut()
+    };
+
+    let buf = unsafe { slice::from_raw_parts_mut(page_ptr, file_size as usize) };
+    let read_size = file.read(buf).expect("Failed to read file");
+    println!("file {} size: {}", name, read_size);
+
+    (page_ptr as *mut u8 as u64, file_size)
 }
 
 fn load_elf(bin: Box<[u8]>) -> u64 {
@@ -143,7 +171,10 @@ fn main() -> Status {
 
     println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    let kernel = read_kernel(cstr16!("nel_os_kernel.elf"));
+    let kernel = read_file(cstr16!("nel_os_kernel.elf"));
+
+    let (bzimage_addr, bzimage_size) = load_file_to_laoder_data(cstr16!("bzImage"));
+    let (rootfs_addr, rootfs_size) = load_file_to_laoder_data(cstr16!("rootfs-n.cpio.gz"));
 
     let entry_point = load_elf(kernel);
 
@@ -195,6 +226,10 @@ fn main() -> Status {
         usable_memory,
         frame_buffer,
         rsdp,
+        bzimage_addr,
+        bzimage_size,
+        rootfs_addr,
+        rootfs_size,
     });
 
     hlt_loop();

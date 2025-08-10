@@ -22,6 +22,7 @@ use core::panic::PanicInfo;
 use core::ptr::addr_of;
 
 use ::acpi::AcpiTables;
+use spin::Once;
 use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtAddr};
 
 use crate::{
@@ -31,6 +32,11 @@ use crate::{
     interrupt::apic,
     memory::{allocator, memory::BitmapMemoryTable, paging},
 };
+
+pub static BZIMAGE_ADDR: Once<u64> = Once::new();
+pub static BZIMAGE_SIZE: Once<u64> = Once::new();
+pub static ROOTFS_ADDR: Once<u64> = Once::new();
+pub static ROOTFS_SIZE: Once<u64> = Once::new();
 
 #[repr(C, align(16))]
 struct AlignedStack {
@@ -159,7 +165,14 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     serial::disable_screen_output();
 
+    BZIMAGE_ADDR.call_once(|| boot_info.bzimage_addr);
+    BZIMAGE_SIZE.call_once(|| boot_info.bzimage_size);
+    ROOTFS_ADDR.call_once(|| boot_info.rootfs_addr);
+    ROOTFS_SIZE.call_once(|| boot_info.rootfs_size);
+
     let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
+
+    info!("Running guest VM...");
     loop {
         let result = vcpu.run(&mut bitmap_table);
         if let Err(e) = result {

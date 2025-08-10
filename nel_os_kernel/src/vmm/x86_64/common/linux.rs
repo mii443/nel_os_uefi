@@ -1,12 +1,16 @@
 use core::ptr::read_unaligned;
 
-use crate::vmm::VCpu;
+use crate::{vmm::VCpu, BZIMAGE_ADDR, BZIMAGE_SIZE};
 
 pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
-    let kernel = BZIMAGE;
+    let kernel_addr = BZIMAGE_ADDR.get().unwrap();
+    let kernel_size = BZIMAGE_SIZE.get().unwrap();
+
+    let kernel =
+        unsafe { core::slice::from_raw_parts(*kernel_addr as *const u8, *kernel_size as usize) };
 
     let guest_mem_size = vcpu.get_guest_memory_size();
-    let mut bp = BootParams::from_bytes(kernel).unwrap();
+    let mut bp = BootParams::from_bytes(kernel)?;
     bp.e820_entries = 0;
 
     bp.hdr.type_of_loader = 0xFF;
@@ -67,9 +71,6 @@ fn load_image(vcpu: &mut dyn VCpu, image: &[u8], addr: usize) -> Result<(), &'st
 
     Ok(())
 }
-
-pub const BZIMAGE: &[u8] = include_bytes!("../../../../bzImage");
-pub const INITRD: &[u8] = include_bytes!("../../../../rootfs-n.cpio.gz");
 
 pub const LAYOUT_BOOTPARAM: u64 = 0x0001_0000;
 pub const LAYOUT_CMDLINE: u64 = 0x0002_0000;
@@ -209,7 +210,7 @@ impl SetupHeader {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() < Self::HEADER_OFFSET + size_of::<Self>() {
-            return Err("バイト配列が小さすぎます");
+            return Err("Binary data is too short to contain a valid SetupHeader");
         }
 
         let mut hdr = unsafe {
@@ -335,7 +336,7 @@ impl E820Entry {
             3 => Ok(E820Type::Acpi),
             4 => Ok(E820Type::Nvs),
             5 => Ok(E820Type::Unusable),
-            _ => Err("不明なE820タイプ"),
+            _ => Err("Invalid E820 type"),
         }
     }
 

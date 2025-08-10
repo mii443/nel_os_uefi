@@ -124,9 +124,11 @@ impl IntelVCpu {
         controls::setup_entry_controls()?;
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
-        Self::setup_guest_state()?;
+        self.setup_guest_state()?;
 
         self.init_guest_memory(frame_allocator)?;
+
+        common::linux::load_kernel(self)?;
 
         Ok(())
     }
@@ -135,7 +137,7 @@ impl IntelVCpu {
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
-        let mut pages = 1000;
+        let mut pages = self.guest_memory_size / 0x1000;
         let mut gpa = 0;
 
         while pages > 0 {
@@ -147,21 +149,8 @@ impl IntelVCpu {
             pages -= 1;
         }
 
-        let guest_ptr = Self::test_guest_code as u64;
-        let guest_addr = self.ept.get_phys_addr(0).unwrap();
-        unsafe {
-            core::ptr::copy_nonoverlapping(guest_ptr as *const u8, guest_addr as *mut u8, 200);
-        }
-
         let eptp = ept::EPTP::init(&self.ept.root_table);
         vmwrite(x86::vmx::vmcs::control::EPTP_FULL, u64::from(eptp))?;
-
-        info!(
-            "GPA 0x0 -> HPA {:#x}",
-            self.ept
-                .get_phys_addr(0)
-                .ok_or("Failed to get physical address")?
-        );
 
         Ok(())
     }
@@ -213,7 +202,7 @@ impl IntelVCpu {
         Ok(())
     }
 
-    fn setup_guest_state() -> Result<(), &'static str> {
+    fn setup_guest_state(&mut self) -> Result<(), &'static str> {
         use x86::{controlregs::*, vmx::vmcs};
         let cr0 = Cr0::empty()
             | Cr0::CR0_PROTECTED_MODE
@@ -316,8 +305,8 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::RFLAGS, 0x2)?;
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
 
-        vmwrite(vmcs::guest::RIP, 0)?; // TODO: Set linux kernel base
-                                       // TODO: RSI
+        vmwrite(vmcs::guest::RIP, common::linux::LAYOUT_KERNEL_BASE as u64)?;
+        self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM as u64;
 
         //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
         //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
