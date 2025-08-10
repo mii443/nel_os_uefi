@@ -1,3 +1,5 @@
+pub mod linux;
+
 use core::arch::asm;
 
 pub fn read_msr(msr: u32) -> u64 {

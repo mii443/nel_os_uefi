@@ -2,8 +2,7 @@ use core::arch::naked_asm;
 
 use raw_cpuid::cpuid;
 use x86_64::{
-    registers::control::Cr4Flags,
-    structures::paging::{frame, FrameAllocator, Size4KiB},
+    structures::paging::{FrameAllocator, Size4KiB},
     VirtAddr,
 };
 
@@ -74,7 +73,7 @@ impl IntelVCpu {
 
             match exit_reason {
                 VmxExitReason::HLT => {
-                    info!("VM hlt");
+                    //info!("VM hlt");
                 }
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
@@ -91,7 +90,6 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
-        info!("VMEntry");
         let success = {
             let result: u16;
             unsafe {
@@ -99,7 +97,6 @@ impl IntelVCpu {
             };
             result == 0
         };
-        info!("VMEntry result: {}", success);
 
         if !self.launch_done && success {
             self.launch_done = true;

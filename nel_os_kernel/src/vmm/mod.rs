@@ -12,13 +12,18 @@ pub trait VCpu {
     fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
     where
         Self: Sized;
+
     fn is_supported() -> bool
     where
         Self: Sized;
+
     fn run(
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str>;
+
+    fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str>;
+    fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str>;
 }
 
 pub fn get_vcpu(

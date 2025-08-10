@@ -1,3 +1,5 @@
+use core::sync::atomic::AtomicBool;
+
 use alloc::format;
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -13,6 +15,16 @@ lazy_static! {
     };
 }
 
+static OUTPUT_TO_SCREEN: AtomicBool = AtomicBool::new(true);
+
+pub fn disable_screen_output() {
+    OUTPUT_TO_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn enable_screen_output() {
+    OUTPUT_TO_SCREEN.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     use x86_64::instructions::interrupts;
@@ -23,6 +35,9 @@ pub fn _print(args: ::core::fmt::Arguments) {
             .write_fmt(args)
             .expect("Printing to serial failed");
 
+        if !OUTPUT_TO_SCREEN.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let mut fb = FRAME_BUFFER.lock();
         let fb = fb.as_mut();
 

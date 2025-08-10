@@ -157,6 +157,8 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     info!("Interrupts enabled");
 
+    serial::disable_screen_output();
+
     let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
     loop {
         let result = vcpu.run(&mut bitmap_table);
