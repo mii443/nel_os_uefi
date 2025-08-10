@@ -2,6 +2,7 @@ use core::arch::naked_asm;
 
 use raw_cpuid::cpuid;
 use x86_64::{
+    registers::control::Cr4Flags,
     structures::paging::{FrameAllocator, Size4KiB},
     VirtAddr,
 };
@@ -71,6 +72,7 @@ impl IntelVCpu {
                     info!("    Reason: unknown ({})", reason);
                 }
             }
+            return Err("VMEntry failure");
         } else {
             let basic_reason = (exit_reason_raw & 0xFFFF) as u16;
             let exit_reason: VmxExitReason = basic_reason.try_into().unwrap();
@@ -155,11 +157,12 @@ impl IntelVCpu {
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
         self.setup_guest_state()?;
-        msr::register_msrs(self).map_err(|_| "MSR error")?;
 
         self.init_guest_memory(frame_allocator)?;
 
         common::linux::load_kernel(self)?;
+
+        msr::register_msrs(self).map_err(|_| "MSR error")?;
 
         Ok(())
     }
@@ -242,7 +245,7 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::CR3, unsafe { cr3() })?;
         vmwrite(
             vmcs::guest::CR4,
-            unsafe { cr4() }.bits() as u64, /*vmread(vmcs::guest::CR4)? & !Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()*/
+            vmread(vmcs::guest::CR4)? | !Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits(),
         )?;
 
         vmwrite(vmcs::guest::CS_BASE, 0)?;

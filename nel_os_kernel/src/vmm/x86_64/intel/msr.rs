@@ -3,7 +3,8 @@ use core::u64;
 use alloc::vec;
 use alloc::vec::Vec;
 use x86::vmx::vmcs;
-use x86_64::PhysAddr;
+use x86_64::structures::paging::OffsetPageTable;
+use x86_64::{PhysAddr, VirtAddr};
 
 use crate::info;
 use crate::vmm::x86_64::common::read_msr;
@@ -64,6 +65,9 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
             read_msr(x86::msr::IA32_KERNEL_GSBASE),
         )
         .unwrap();
+    vcpu.host_msr
+        .set(x86::msr::MSR_C5_PMON_BOX_CTRL, 0)
+        .unwrap();
 
     vcpu.guest_msr.set(x86::msr::IA32_TSC_AUX, 0).unwrap();
     vcpu.guest_msr.set(x86::msr::IA32_STAR, 0).unwrap();
@@ -71,9 +75,12 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     vcpu.guest_msr.set(x86::msr::IA32_CSTAR, 0).unwrap();
     vcpu.guest_msr.set(x86::msr::IA32_FMASK, 0).unwrap();
     vcpu.guest_msr.set(x86::msr::IA32_KERNEL_GSBASE, 0).unwrap();
-    vcpu.guest_msr.set(0x1b, 0).unwrap();
+    vcpu.guest_msr
+        .set(x86::msr::MSR_C5_PMON_BOX_CTRL, 0)
+        .unwrap();
+    /*vcpu.guest_msr.set(0x1b, 0).unwrap();
     vcpu.guest_msr.set(0xc0010007, 0).unwrap();
-    vcpu.guest_msr.set(0xc0010117, 0).unwrap();
+    vcpu.guest_msr.set(0xc0010117, 0).unwrap();*/
 
     vmwrite(
         vmcs::control::VMEXIT_MSR_LOAD_ADDR_FULL,
@@ -90,6 +97,7 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
         vcpu.guest_msr.phys().as_u64(),
     )
     .unwrap();
+
     Ok(())
 }
 
@@ -169,7 +177,7 @@ impl ShadowMsr {
     }
 
     pub fn phys(&self) -> PhysAddr {
-        PhysAddr::new((&self.ents as *const Vec<SavedMsr>) as u64)
+        PhysAddr::new(VirtAddr::from_ptr(&self.ents).as_u64())
     }
 
     pub fn concat(r1: u64, r2: u64) -> u64 {
