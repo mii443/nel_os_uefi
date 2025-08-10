@@ -12,7 +12,7 @@ use crate::{
         x86_64::{
             common::{self, read_msr},
             intel::{
-                controls, ept,
+                controls, cpuid, ept,
                 register::GuestRegisters,
                 vmcs::{
                     self,
@@ -76,6 +76,11 @@ impl IntelVCpu {
                 VmxExitReason::HLT => {
                     //info!("VM hlt");
                 }
+                VmxExitReason::CPUID => {
+                    info!("VM exit reason: CPUID");
+                    cpuid::handle_cpuid_vmexit(self);
+                    self.step_next_inst()?;
+                }
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
                     info!("EPT Violation at guest address: {:#x}", guest_address);
@@ -83,10 +88,21 @@ impl IntelVCpu {
                 }
                 _ => {
                     info!("VM exit reason: {:?}", exit_reason);
+                    return Err("Unhandled VM exit reason");
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn step_next_inst(&mut self) -> Result<(), &'static str> {
+        use x86::vmx::vmcs;
+        let rip = vmread(vmcs::guest::RIP)?;
+        vmwrite(
+            vmcs::guest::RIP,
+            rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN)?,
+        )?;
         Ok(())
     }
 
