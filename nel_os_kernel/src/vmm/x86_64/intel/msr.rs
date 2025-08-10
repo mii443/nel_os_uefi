@@ -169,7 +169,7 @@ impl ShadowMsr {
     }
 
     pub fn phys(&self) -> PhysAddr {
-        PhysAddr::new(self.ents.as_ptr() as u64)
+        PhysAddr::new((&self.ents as *const Vec<SavedMsr>) as u64)
     }
 
     pub fn concat(r1: u64, r2: u64) -> u64 {

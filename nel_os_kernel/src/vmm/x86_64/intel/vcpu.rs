@@ -119,7 +119,7 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
-        msr::update_msrs(self).unwrap();
+        //msr::update_msrs(self).unwrap();
 
         let success = {
             let result: u16;
