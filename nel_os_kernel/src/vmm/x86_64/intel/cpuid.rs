@@ -55,7 +55,7 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
         },
         VmxLeaf::EXTENDED_FEATURE => match regs.rcx {
             0 => {
-                let mut ebx = ExtFeatureEbx0::new()
+                let ebx = ExtFeatureEbx0::new()
                     .with_fsgsbase(false)
                     .with_smep(true)
                     .with_invpcid(false)
@@ -120,7 +120,6 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
                 .with_sse2(true);
 
             let mut version_and_feature_info = cpuid!(0x1, 0);
-            let feature = cpuid!(0x0, 0);
             version_and_feature_info.ecx &= !(1 << 17);
 
             regs.rax = version_and_feature_info.eax as u64;

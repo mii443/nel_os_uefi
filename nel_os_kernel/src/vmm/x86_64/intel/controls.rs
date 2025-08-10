@@ -35,6 +35,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
         vmcs::controls::PrimaryProcessorBasedVmExecutionControls::from(raw_primary_exec_ctrl);
     primary_exec_ctrl.set_hlt(true);
     primary_exec_ctrl.set_activate_secondary_controls(true);
+    primary_exec_ctrl.set_use_msr_bitmap(false);
 
     primary_exec_ctrl.write()?;
 
@@ -51,9 +52,9 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
 
     let mut secondary_exec_ctrl =
         vmcs::controls::SecondaryProcessorBasedVmExecutionControls::from(raw_secondary_exec_ctrl);
-    secondary_exec_ctrl.set_ept(true); // TODO: true
-    secondary_exec_ctrl.set_unrestricted_guest(true); //TODO: true
-                                                      //secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
+    secondary_exec_ctrl.set_ept(true);
+    secondary_exec_ctrl.set_unrestricted_guest(true);
+    //secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
 
     secondary_exec_ctrl.write()?;
 
@@ -74,8 +75,8 @@ pub fn setup_entry_controls() -> Result<(), &'static str> {
 
     let mut entry_ctrl = vmcs::controls::EntryControls::from(raw_entry_ctrl);
     entry_ctrl.set_ia32e_mode_guest(false);
-    /*entry_ctrl.set_load_ia32_efer(true);
-    entry_ctrl.set_load_ia32_pat(true);*/
+    entry_ctrl.set_load_ia32_efer(true);
+    entry_ctrl.set_load_ia32_pat(true);
 
     entry_ctrl.write()?;
 
@@ -96,10 +97,10 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
 
     let mut exit_ctrl = vmcs::controls::PrimaryExitControls::from(raw_exit_ctrl);
     exit_ctrl.set_host_addr_space_size(true);
-    /*exit_ctrl.set_save_ia32_efer(true);
-    exit_ctrl.set_save_ia32_pat(true);*/
+    exit_ctrl.set_save_ia32_efer(true);
+    exit_ctrl.set_save_ia32_pat(true);
     exit_ctrl.set_load_ia32_efer(true);
-    //exit_ctrl.set_load_ia32_pat(true);
+    exit_ctrl.set_load_ia32_pat(true);
 
     exit_ctrl.write()?;
 

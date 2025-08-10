@@ -13,6 +13,7 @@ use crate::{
             common::{self, read_msr},
             intel::{
                 controls, cpuid, ept,
+                msr::{self, ShadowMsr},
                 register::GuestRegisters,
                 vmcs::{
                     self,
@@ -40,6 +41,8 @@ pub struct IntelVCpu {
     ept: ept::EPT,
     eptp: ept::EPTP,
     guest_memory_size: u64,
+    pub host_msr: ShadowMsr,
+    pub guest_msr: ShadowMsr,
 }
 
 impl IntelVCpu {
@@ -74,11 +77,20 @@ impl IntelVCpu {
 
             match exit_reason {
                 VmxExitReason::HLT => {
-                    //info!("VM hlt");
+                    info!("VM hlt");
+                    self.step_next_inst()?;
                 }
                 VmxExitReason::CPUID => {
                     info!("VM exit reason: CPUID");
                     cpuid::handle_cpuid_vmexit(self);
+                    self.step_next_inst()?;
+                }
+                VmxExitReason::RDMSR => {
+                    msr::ShadowMsr::handle_read_msr_vmexit(self);
+                    self.step_next_inst()?;
+                }
+                VmxExitReason::WRMSR => {
+                    msr::ShadowMsr::handle_wrmsr_vmexit(self);
                     self.step_next_inst()?;
                 }
                 VmxExitReason::EPT_VIOLATION => {
@@ -107,6 +119,8 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
+        msr::update_msrs(self).unwrap();
+
         let success = {
             let result: u16;
             unsafe {
@@ -141,6 +155,7 @@ impl IntelVCpu {
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
         self.setup_guest_state()?;
+        msr::register_msrs(self).map_err(|_| "MSR error")?;
 
         self.init_guest_memory(frame_allocator)?;
 
@@ -623,6 +638,8 @@ impl VCpu for IntelVCpu {
             ept,
             eptp,
             guest_memory_size: 1024 * 1024 * 256, // 256 MiB
+            host_msr: ShadowMsr::new(),
+            guest_msr: ShadowMsr::new(),
         })
     }
 
