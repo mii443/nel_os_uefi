@@ -1,14 +1,16 @@
 use core::ptr::read_unaligned;
 
-use crate::{vmm::VCpu, BZIMAGE_ADDR, BZIMAGE_SIZE};
+use crate::{info, vmm::VCpu, BZIMAGE_ADDR, BZIMAGE_SIZE};
 
 pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
+    info!("Loading kernel into guest memory");
     let kernel_addr = BZIMAGE_ADDR.get().unwrap();
     let kernel_size = BZIMAGE_SIZE.get().unwrap();
 
     let kernel =
         unsafe { core::slice::from_raw_parts(*kernel_addr as *const u8, *kernel_size as usize) };
 
+    info!("Creating boot parameters");
     let guest_mem_size = vcpu.get_guest_memory_size();
     let mut bp = BootParams::from_bytes(kernel)?;
     bp.e820_entries = 0;
@@ -29,6 +31,7 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
         E820Type::Ram,
     );
 
+    info!("Creating command line");
     let cmdline_max_size = if bp.hdr.cmdline_size < 256 {
         bp.hdr.cmdline_size
     } else {
@@ -44,6 +47,7 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
         vcpu.write_memory(cmdline_start + i as u64, byte)?;
     }
 
+    info!("Loading boot parameters into guest memory");
     let bp_bytes = unsafe {
         core::slice::from_raw_parts(
             &bp as *const BootParams as *const u8,
@@ -52,6 +56,7 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     };
     load_image(vcpu, bp_bytes, LAYOUT_BOOTPARAM as usize)?;
 
+    info!("Loading kernel image into guest memory");
     let code_offset = bp.hdr.get_protected_code_offset();
     let code_size = kernel.len() - code_offset;
     load_image(
@@ -64,6 +69,11 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
 }
 
 fn load_image(vcpu: &mut dyn VCpu, image: &[u8], addr: usize) -> Result<(), &'static str> {
+    info!(
+        "Loading image at address {:#x}, size: {} bytes",
+        addr,
+        image.len()
+    );
     for (i, &byte) in image.iter().enumerate() {
         let gpa = addr + i;
         vcpu.write_memory(gpa as u64, byte)?;

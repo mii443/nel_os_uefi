@@ -223,12 +223,12 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::IDTR_BASE, 0)?;
         vmwrite(vmcs::guest::LDTR_BASE, 0xDEAD00)?;
 
-        vmwrite(vmcs::guest::CS_LIMIT, 0xffff)?;
-        vmwrite(vmcs::guest::SS_LIMIT, 0xffff)?;
-        vmwrite(vmcs::guest::DS_LIMIT, 0xffff)?;
-        vmwrite(vmcs::guest::ES_LIMIT, 0xffff)?;
-        vmwrite(vmcs::guest::FS_LIMIT, 0xffff)?;
-        vmwrite(vmcs::guest::GS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::CS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::SS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::DS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::ES_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::FS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::GS_LIMIT, u32::MAX as u64)?;
         vmwrite(vmcs::guest::TR_LIMIT, 0)?;
         vmwrite(vmcs::guest::GDTR_LIMIT, 0)?;
         vmwrite(vmcs::guest::IDTR_LIMIT, 0)?;
@@ -241,8 +241,8 @@ impl IntelVCpu {
             .with_desc_type(DescriptorType::Code)
             .with_dpl(0)
             .with_granularity(Granularity::KByte)
-            .with_long(true)
-            .with_db(false);
+            .with_long(false)
+            .with_db(true);
 
         let ds_right = SegmentRights::default()
             .with_rw(true)
@@ -287,10 +287,7 @@ impl IntelVCpu {
             u32::from(ldtr_right) as u64,
         )?;
 
-        vmwrite(
-            vmcs::guest::CS_SELECTOR,
-            x86::segmentation::cs().bits() as u64,
-        )?;
+        vmwrite(vmcs::guest::CS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::SS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::DS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::ES_SELECTOR, 0)?;
@@ -301,12 +298,13 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::FS_BASE, 0)?;
         vmwrite(vmcs::guest::GS_BASE, 0)?;
 
-        vmwrite(vmcs::guest::IA32_EFER_FULL, read_msr(x86::msr::IA32_EFER))?;
+        vmwrite(vmcs::guest::IA32_EFER_FULL, 0)?;
+        vmwrite(vmcs::guest::IA32_EFER_HIGH, 0)?;
         vmwrite(vmcs::guest::RFLAGS, 0x2)?;
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
 
-        vmwrite(vmcs::guest::RIP, common::linux::LAYOUT_KERNEL_BASE as u64)?;
-        self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM as u64;
+        vmwrite(vmcs::guest::RIP, common::linux::LAYOUT_KERNEL_BASE)?;
+        self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM;
 
         //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
         //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
@@ -608,7 +606,7 @@ impl VCpu for IntelVCpu {
             vmcs,
             ept,
             eptp,
-            guest_memory_size: 1024 * 1024 * 1024, // 1 GiB
+            guest_memory_size: 1024 * 1024 * 256, // 256 MiB
         })
     }
 
