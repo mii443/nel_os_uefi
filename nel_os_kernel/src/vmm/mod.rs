@@ -23,7 +23,15 @@ pub trait VCpu {
     ) -> Result<(), &'static str>;
 
     fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str>;
+    fn write_memory_ranged(
+        &mut self,
+        addr_start: u64,
+        addr_end: u64,
+        data: u8,
+    ) -> Result<(), &'static str>;
     fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str>;
+
+    fn get_guest_memory_size(&self) -> u64;
 }
 
 pub fn get_vcpu(

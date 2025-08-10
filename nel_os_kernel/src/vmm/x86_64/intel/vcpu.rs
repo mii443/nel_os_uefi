@@ -39,6 +39,7 @@ pub struct IntelVCpu {
     vmcs: vmcs::Vmcs,
     ept: ept::EPT,
     eptp: ept::EPTP,
+    guest_memory_size: u64,
 }
 
 impl IntelVCpu {
@@ -564,6 +565,27 @@ impl VCpu for IntelVCpu {
         Ok(())
     }
 
+    fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str> {
+        self.ept.set(addr, data)
+    }
+
+    fn write_memory_ranged(
+        &mut self,
+        addr_start: u64,
+        addr_end: u64,
+        data: u8,
+    ) -> Result<(), &'static str> {
+        self.ept.set_range(addr_start, addr_end, data)
+    }
+
+    fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str> {
+        self.ept.get(addr)
+    }
+
+    fn get_guest_memory_size(&self) -> u64 {
+        self.guest_memory_size
+    }
+
     fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
     where
         Self: Sized,
@@ -597,6 +619,7 @@ impl VCpu for IntelVCpu {
             vmcs,
             ept,
             eptp,
+            guest_memory_size: 1024 * 1024 * 1024, // 1 GiB
         })
     }
 

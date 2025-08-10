@@ -1,7 +1,75 @@
 use core::ptr::read_unaligned;
 
-pub const BZIMAGE: &'static [u8] = include_bytes!("../../../../bzImage");
-pub const INITRD: &'static [u8] = include_bytes!("../../../../rootfs-n.cpio.gz");
+use crate::vmm::VCpu;
+
+pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
+    let kernel = BZIMAGE;
+
+    let guest_mem_size = vcpu.get_guest_memory_size();
+    let mut bp = BootParams::from_bytes(kernel).unwrap();
+    bp.e820_entries = 0;
+
+    bp.hdr.type_of_loader = 0xFF;
+    bp.hdr.ext_loader_ver = 0;
+    bp.hdr.loadflags.set_loaded_high(true);
+    bp.hdr.loadflags.set_can_use_heap(true);
+    bp.hdr.heap_end_ptr = (LAYOUT_BOOTPARAM - 0x200) as u16;
+    bp.hdr.loadflags.set_keep_segments(true);
+    bp.hdr.cmd_line_ptr = LAYOUT_CMDLINE as u32;
+    bp.hdr.vid_mode = 0xFFFF;
+
+    bp.add_e820_entry(0, LAYOUT_KERNEL_BASE, E820Type::Ram);
+    bp.add_e820_entry(
+        LAYOUT_KERNEL_BASE,
+        guest_mem_size - LAYOUT_KERNEL_BASE,
+        E820Type::Ram,
+    );
+
+    let cmdline_max_size = if bp.hdr.cmdline_size < 256 {
+        bp.hdr.cmdline_size
+    } else {
+        256
+    };
+
+    let cmdline_start = LAYOUT_CMDLINE as u64;
+    let cmdline_end = cmdline_start + cmdline_max_size as u64;
+    vcpu.write_memory_ranged(cmdline_start, cmdline_end, 0)?;
+    let cmdline_val = "console=ttyS0 earlyprintk=serial nokaslr";
+    let cmdline_bytes = cmdline_val.as_bytes();
+    for (i, &byte) in cmdline_bytes.iter().enumerate() {
+        vcpu.write_memory(cmdline_start + i as u64, byte)?;
+    }
+
+    let bp_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &bp as *const BootParams as *const u8,
+            core::mem::size_of::<BootParams>(),
+        )
+    };
+    load_image(vcpu, bp_bytes, LAYOUT_BOOTPARAM as usize)?;
+
+    let code_offset = bp.hdr.get_protected_code_offset();
+    let code_size = kernel.len() - code_offset;
+    load_image(
+        vcpu,
+        &kernel[code_offset..code_offset + code_size],
+        LAYOUT_KERNEL_BASE as usize,
+    )?;
+
+    Ok(())
+}
+
+fn load_image(vcpu: &mut dyn VCpu, image: &[u8], addr: usize) -> Result<(), &'static str> {
+    for (i, &byte) in image.iter().enumerate() {
+        let gpa = addr + i;
+        vcpu.write_memory(gpa as u64, byte)?;
+    }
+
+    Ok(())
+}
+
+pub const BZIMAGE: &[u8] = include_bytes!("../../../../bzImage");
+pub const INITRD: &[u8] = include_bytes!("../../../../rootfs-n.cpio.gz");
 
 pub const LAYOUT_BOOTPARAM: u64 = 0x0001_0000;
 pub const LAYOUT_CMDLINE: u64 = 0x0002_0000;

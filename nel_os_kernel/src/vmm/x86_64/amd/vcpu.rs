@@ -18,6 +18,27 @@ impl VCpu for AMDVCpu {
         Ok(())
     }
 
+    fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str> {
+        unimplemented!("AMDVCpu::write_memory is not implemented yet");
+    }
+
+    fn write_memory_ranged(
+        &mut self,
+        addr_start: u64,
+        addr_end: u64,
+        data: u8,
+    ) -> Result<(), &'static str> {
+        unimplemented!("AMDVCpu::write_memory_ranged is not implemented yet");
+    }
+
+    fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str> {
+        unimplemented!("AMDVCpu::read_memory is not implemented yet");
+    }
+
+    fn get_guest_memory_size(&self) -> u64 {
+        unimplemented!("AMDVCpu::get_guest_memory_size is not implemented yet")
+    }
+
     fn new(_frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
     where
         Self: Sized,
