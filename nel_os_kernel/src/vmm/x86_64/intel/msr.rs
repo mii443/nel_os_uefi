@@ -65,9 +65,6 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
             read_msr(x86::msr::IA32_KERNEL_GSBASE),
         )
         .unwrap();
-    vcpu.host_msr
-        .set(x86::msr::MSR_C5_PMON_BOX_CTRL, 0)
-        .unwrap();
 
     vcpu.guest_msr.set(x86::msr::IA32_TSC_AUX, 0).unwrap();
     vcpu.guest_msr.set(x86::msr::IA32_STAR, 0).unwrap();
@@ -75,9 +72,6 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     vcpu.guest_msr.set(x86::msr::IA32_CSTAR, 0).unwrap();
     vcpu.guest_msr.set(x86::msr::IA32_FMASK, 0).unwrap();
     vcpu.guest_msr.set(x86::msr::IA32_KERNEL_GSBASE, 0).unwrap();
-    vcpu.guest_msr
-        .set(x86::msr::MSR_C5_PMON_BOX_CTRL, 0)
-        .unwrap();
     /*vcpu.guest_msr.set(0x1b, 0).unwrap();
     vcpu.guest_msr.set(0xc0010007, 0).unwrap();
     vcpu.guest_msr.set(0xc0010117, 0).unwrap();*/
@@ -115,6 +109,7 @@ pub fn update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     for index in indices_to_update {
         info!("{}", index);
         let value = read_msr(index);
+        info!("Setting MSR {:#x} to {:#x}", index, value);
         vcpu.host_msr.set_by_index(index, value).unwrap();
     }
 

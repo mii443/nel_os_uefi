@@ -121,7 +121,7 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
-        //msr::update_msrs(self).unwrap();
+        msr::update_msrs(self).unwrap();
 
         let success = {
             let result: u16;
@@ -245,7 +245,7 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::CR3, unsafe { cr3() })?;
         vmwrite(
             vmcs::guest::CR4,
-            vmread(vmcs::guest::CR4)? | !Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits(),
+            vmread(vmcs::guest::CR4)? & !Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits(),
         )?;
 
         vmwrite(vmcs::guest::CS_BASE, 0)?;
