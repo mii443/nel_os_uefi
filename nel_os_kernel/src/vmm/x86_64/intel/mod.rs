@@ -1,4 +1,5 @@
 pub mod asm;
+mod auditor;
 mod controls;
 mod cpuid;
 mod ept;

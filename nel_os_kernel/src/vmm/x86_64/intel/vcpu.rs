@@ -13,7 +13,7 @@ use crate::{
         x86_64::{
             common::{self, read_msr},
             intel::{
-                controls, cpuid, ept,
+                auditor, controls, cpuid, ept,
                 msr::{self, ShadowMsr},
                 register::GuestRegisters,
                 vmcs::{
@@ -122,6 +122,8 @@ impl IntelVCpu {
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
         msr::update_msrs(self).unwrap();
+
+        auditor::controls::check_vmcs_control_fields().unwrap();
 
         let success = {
             let result: u16;
