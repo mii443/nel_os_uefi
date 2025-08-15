@@ -1,9 +1,33 @@
-name: Build iso
+name: Build ISO
 run-name: ${{ gitea.actor }} on ${{ gitea.event_name }}
 on: [push]
 
 jobs:
-  Explore-Gitea-Actions:
+  build-iso:
+    name: Build ISO
     runs-on: ubuntu-latest
     steps:
-      - run: echo "${{ gitea.event_name }}"
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: cargo check (nel_os_bootloader)
+        working-directory: nel_os_bootloader
+        run: cargo check
+
+      - name: cargo check (nel_os_common)
+        working-directory: nel_os_common
+        run: cargo check
+
+      - name: cargo check (nel_os_kernel)
+        working-directory: nel_os_kernel
+        run: cargo check
+
+      - name: cargo build --release (nel_os_kernel)
+        working-directory: nel_os_kernel
+        run: cargo build --release
+
+      - name: create-iso.sh
+        working-directory: nel_os_bootloader
+        run: bash ./create-iso.sh ../nel_os_kernel/target/x86_64-nel_os/release/nel_os_kernel.elf
