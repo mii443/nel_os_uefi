@@ -1,0 +1,9 @@
+name: Build iso
+run-name: ${{ gitea.actor }} on ${{ gitea.event_name }}
+on: [push]
+
+jobs:
+  Explore-Gitea-Actions:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ gitea.event_name }}"

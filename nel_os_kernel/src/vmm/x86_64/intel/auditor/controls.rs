@@ -18,6 +18,39 @@ pub fn check_vmcs_control_fields() -> Result<(), &'static str> {
         check_secondary_proc_based_exec_ctrl(vmx_true_ctrl)?;
     }
 
+    check_cr3_target()?;
+
+    check_io_bitmap()?;
+
+    Ok(())
+}
+
+fn is_valid_page_aligned_phys_addr(addr: u64) -> bool {
+    (addr & (!((1 << 40) - 1) | 0xfff)) == 0
+}
+
+fn check_cr3_target() -> Result<(), &'static str> {
+    let vmcs_cr3_target_count = vmread(vmcs::control::CR3_TARGET_COUNT)?;
+
+    if vmcs_cr3_target_count > 4 {
+        return Err("VMCS CR3-target count field is greater than 4");
+    }
+
+    Ok(())
+}
+
+fn check_io_bitmap() -> Result<(), &'static str> {
+    let vmcs_io_bitmap_a = vmread(vmcs::control::IO_BITMAP_A_ADDR_FULL)?;
+    let vmcs_io_bitmap_b = vmread(vmcs::control::IO_BITMAP_B_ADDR_FULL)?;
+
+    if !is_valid_page_aligned_phys_addr(vmcs_io_bitmap_a) {
+        return Err("VMCS IO bitmap A address is not a valid page-aligned physical address");
+    }
+
+    if !is_valid_page_aligned_phys_addr(vmcs_io_bitmap_b) {
+        return Err("VMCS IO bitmap B address is not a valid page-aligned physical address");
+    }
+
     Ok(())
 }
 
