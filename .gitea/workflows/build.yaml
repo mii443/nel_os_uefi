@@ -4,13 +4,16 @@ on: [push]
 
 jobs:
   build-iso:
-    name: Build ISO
+    name: Build ISO (nightly)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust (nightly)
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
 
       - name: cargo check (nel_os_bootloader)
         working-directory: nel_os_bootloader
@@ -31,3 +34,4 @@ jobs:
       - name: create-iso.sh
         working-directory: nel_os_bootloader
         run: bash ./create-iso.sh ../nel_os_kernel/target/x86_64-nel_os/release/nel_os_kernel.elf
+
