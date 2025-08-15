@@ -19,6 +19,11 @@ jobs:
       - name: Verify rustc version
         run: rustc -V
 
+      - name: Install ISO build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mtools xorriso
+
       - name: cargo check (nel_os_bootloader)
         working-directory: nel_os_bootloader
         run: cargo check
