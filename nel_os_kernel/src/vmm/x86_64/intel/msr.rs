@@ -1,9 +1,6 @@
-use core::u64;
-
 use alloc::vec;
 use alloc::vec::Vec;
 use x86::vmx::vmcs;
-use x86_64::structures::paging::OffsetPageTable;
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::info;

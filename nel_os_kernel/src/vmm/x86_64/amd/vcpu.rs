@@ -18,20 +18,20 @@ impl VCpu for AMDVCpu {
         Ok(())
     }
 
-    fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str> {
+    fn write_memory(&mut self, _addr: u64, _data: u8) -> Result<(), &'static str> {
         unimplemented!("AMDVCpu::write_memory is not implemented yet");
     }
 
     fn write_memory_ranged(
         &mut self,
-        addr_start: u64,
-        addr_end: u64,
-        data: u8,
+        _addr_start: u64,
+        _addr_end: u64,
+        _data: u8,
     ) -> Result<(), &'static str> {
         unimplemented!("AMDVCpu::write_memory_ranged is not implemented yet");
     }
 
-    fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str> {
+    fn read_memory(&mut self, _addr: u64) -> Result<u8, &'static str> {
         unimplemented!("AMDVCpu::read_memory is not implemented yet");
     }
 

@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use modular_bitfield::{bitfield, prelude::*};
 
 #[derive(Specifier, Debug, Clone, Copy)]
@@ -24,14 +26,14 @@ pub struct SegmentRights {
     pub desc_type: DescriptorType,
     pub dpl: B2,
     pub present: bool,
-    reserved: B4,
+    _reserved: B4,
     pub avl: bool,
     pub long: bool,
     pub db: bool,
     #[bits = 1]
     pub granularity: Granularity,
     pub unusable: bool,
-    reserved2: B15,
+    _reserved2: B15,
 }
 
 impl Default for SegmentRights {

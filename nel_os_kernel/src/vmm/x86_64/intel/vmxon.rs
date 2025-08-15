@@ -6,7 +6,7 @@ use x86_64::{
 };
 
 use crate::{
-    error, info,
+    error,
     vmm::x86_64::{
         common::{read_msr, write_msr},
         intel::vmx_capture_status,

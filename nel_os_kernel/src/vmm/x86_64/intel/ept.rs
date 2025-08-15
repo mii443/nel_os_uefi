@@ -1,6 +1,8 @@
+#![allow(non_snake_case)]
+
 use modular_bitfield::{
     bitfield,
-    prelude::{B1, B3, B4, B52, B53},
+    prelude::{B1, B3, B4, B52},
 };
 use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
@@ -37,6 +39,7 @@ impl EPT {
         }
     }
 
+    #[allow(dead_code)]
     pub fn map_2m(
         &mut self,
         gpa: u64,
@@ -291,7 +294,7 @@ pub struct EPTP {
     pub level: B3,
     pub dirty_accessed: bool,
     pub enforce_access_rights: bool,
-    reserved: B4,
+    _reserved: B4,
     pub phys: B52,
 }
 
@@ -325,7 +328,7 @@ pub struct EntryBase {
     pub accessed: bool,
     pub dirty: bool,
     pub exec_user: bool,
-    reserved: B1,
+    _reserved: B1,
     pub phys: B52,
 }
 

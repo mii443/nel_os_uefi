@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
 use modular_bitfield::bitfield;
 use raw_cpuid::cpuid;
 

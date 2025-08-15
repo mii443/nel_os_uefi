@@ -1,5 +1,3 @@
-use core::arch::naked_asm;
-
 use raw_cpuid::cpuid;
 use x86_64::{
     registers::control::Cr4Flags,
@@ -47,11 +45,6 @@ pub struct IntelVCpu {
 }
 
 impl IntelVCpu {
-    #[unsafe(naked)]
-    unsafe extern "C" fn test_guest_code() -> ! {
-        naked_asm!("2: hlt; jmp 2b");
-    }
-
     #[unsafe(no_mangle)]
     unsafe extern "C" fn intel_set_host_stack(rsp: u64) {
         vmwrite(x86::vmx::vmcs::host::RSP, rsp).unwrap();

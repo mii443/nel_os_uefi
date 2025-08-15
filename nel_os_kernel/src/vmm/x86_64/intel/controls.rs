@@ -1,7 +1,4 @@
-use crate::vmm::x86_64::{
-    common,
-    intel::{vmcs, vmwrite},
-};
+use crate::vmm::x86_64::{common, intel::vmcs};
 
 pub fn setup_exec_controls() -> Result<(), &'static str> {
     let basic_msr = common::read_msr(0x480);
@@ -15,7 +12,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     raw_pin_exec_ctrl |= (reserved_bits & 0xFFFFFFFF) as u32;
     raw_pin_exec_ctrl &= (reserved_bits >> 32) as u32;
 
-    let mut pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
+    let pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
     //pin_exec_ctrl.set_external_interrupt_exiting(false);
 
     pin_exec_ctrl.write()?;
