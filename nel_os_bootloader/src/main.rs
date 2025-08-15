@@ -11,11 +11,11 @@ use nel_os_common::{gop, memory};
 use uefi::{
     allocator::Allocator,
     boot::{AllocateType, MemoryType, ScopedProtocol},
-    mem::memory_map::{MemoryMap, MemoryMapOwned},
+    mem::memory_map::MemoryMap,
     prelude::*,
     println,
     proto::{
-        console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput, PixelFormat},
+        console::gop::{GraphicsOutput, PixelFormat},
         media::{
             file::{Directory, File, FileAttribute, FileInfo, FileMode},
             fs::SimpleFileSystem,
