@@ -1,10 +1,11 @@
-name: Build ISO
-run-name: ${{ gitea.actor }} on ${{ gitea.event_name }}
-on: [push]
+name: Release ISO
+on:
+  push:
+    tags:
+      - 'v*'
 
 jobs:
-  build-iso:
-    name: Build ISO (nightly-2025-04-27)
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,18 +25,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mtools xorriso
 
-      - name: cargo check (nel_os_bootloader)
-        working-directory: nel_os_bootloader
-        run: cargo check
-
-      - name: cargo check (nel_os_common)
-        working-directory: nel_os_common
-        run: cargo check
-
-      - name: cargo check (nel_os_kernel)
-        working-directory: nel_os_kernel
-        run: cargo check
-
       - name: cargo build --release (nel_os_bootloader)
         working-directory: nel_os_bootloader
         run: cargo build --release
@@ -44,9 +33,16 @@ jobs:
         working-directory: nel_os_bootloader
         run: bash ./create-iso.sh ./target/x86_64-unknown-uefi/release/nel_os_bootloader.elf
 
-      - name: Upload ISO artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Gitea Release & Upload ISO
+        uses: akkuman/gitea-release-action@v1
+        env:
+          NODE_OPTIONS: '--experimental-fetch'
         with:
-          name: nel_os.iso
-          path: nel_os_bootloader/nel_os.iso
-          if-no-files-found: error
+          server_url: ${{ github.server_url }}
+          repository: ${{ github.repository }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            nel_os_bootloader/nel_os.iso
+          token: ${{ secrets.TOKEN }}
+

@@ -1,0 +1,33 @@
+name: Check
+run-name: ${{ gitea.actor }} on ${{ gitea.event_name }}
+on: [push]
+
+jobs:
+  build-iso:
+    name: Build ISO (nightly-2025-04-27)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust (1.88.0-nightly 2025-04-27)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2025-04-27
+          override: true
+          components: rust-src
+
+      - name: Verify rustc version
+        run: rustc -V
+
+      - name: cargo check (nel_os_bootloader)
+        working-directory: nel_os_bootloader
+        run: cargo check
+
+      - name: cargo check (nel_os_common)
+        working-directory: nel_os_common
+        run: cargo check
+
+      - name: cargo check (nel_os_kernel)
+        working-directory: nel_os_kernel
+        run: cargo check
+
