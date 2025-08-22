@@ -1,0 +1,20 @@
+# ---- 画面/入力 ----
+display_library: sdl2
+vga: extension=cirrus
+pci: enabled=1, chipset=i440fx, slot1=pcivga
+vgaromimage: file=$BXSHARE/VGABIOS-lgpl-latest-cirrus.bin
+
+romimage: file="./OVMF-pure-efi.fd", address=0x0, options=none
+
+# ---- メモリ/CPU ----
+memory: guest=256
+cpu: count=1, model=corei7_sandy_bridge_2600k, reset_on_triple_fault=1
+
+# ---- ストレージ（UEFI ESP を作った “本物のディスク” ）----
+ata0: enabled=1
+ata0-master: type=disk, mode=flat, path="./myOSimage.img", status=inserted
+boot: disk
+
+# ---- ログ ----
+log: bochs.out
+

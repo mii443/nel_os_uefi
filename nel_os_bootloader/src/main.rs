@@ -131,9 +131,20 @@ fn load_elf(bin: Box<[u8]>) -> u64 {
     elf.entry
 }
 
-fn get_frame_buffer() -> gop::FrameBuffer {
-    let gop_handle = uefi::boot::get_handle_for_protocol::<GraphicsOutput>().unwrap();
-    let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
+fn get_frame_buffer() -> Option<gop::FrameBuffer> {
+    let gop_handle = if let Ok(gop_handle) = uefi::boot::get_handle_for_protocol::<GraphicsOutput>()
+    {
+        gop_handle
+    } else {
+        println!("GraphicsOutput protocol not found");
+        return None;
+    };
+    let mut gop = if let Ok(gop) = boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
+        gop
+    } else {
+        println!("Failed to open GraphicsOutput protocol");
+        return None;
+    };
 
     let info = gop.current_mode_info();
     let (width, height) = info.resolution();
@@ -141,7 +152,7 @@ fn get_frame_buffer() -> gop::FrameBuffer {
     let stride = info.stride();
     let pixel_format = info.pixel_format();
 
-    gop::FrameBuffer {
+    Some(gop::FrameBuffer {
         frame_buffer,
         width,
         height,
@@ -151,15 +162,15 @@ fn get_frame_buffer() -> gop::FrameBuffer {
             PixelFormat::Bgr => gop::PixelFormat::Bgr,
             format => panic!("Unsupported pixel_format: {:?}", format),
         },
-    }
+    })
 }
 
-fn get_rsdp() -> u64 {
+fn get_rsdp() -> Option<u64> {
     uefi::system::with_config_table(move |c| {
         c.iter()
             .find(|config| config.guid == uefi::table::cfg::ACPI_GUID)
             .map(|config| config.address as u64)
-            .expect("Failed to find RSDP in config table")
+            .or(None)
     })
 }
 

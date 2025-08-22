@@ -82,6 +82,8 @@ fn hlt_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
+    serial::disable_screen_output();
+
     interrupt::gdt::init();
     interrupt::idt::init_idt();
 
@@ -126,10 +128,15 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     allocator::init_heap(&mut mapper, &mut bitmap_table).unwrap();
 
-    let frame_buffer = FrameBuffer::from_raw_buffer(&boot_info.frame_buffer, (64, 64, 64));
-    frame_buffer.clear();
+    if boot_info.frame_buffer.is_some() {
+        let frame_buffer =
+            FrameBuffer::from_raw_buffer(&boot_info.frame_buffer.as_ref().unwrap(), (64, 64, 64));
+        frame_buffer.clear();
 
-    FRAME_BUFFER.lock().replace(frame_buffer);
+        FRAME_BUFFER.lock().replace(frame_buffer);
+    } else {
+        error!("No frame buffer found");
+    }
 
     println!("");
     info!("Kernel initialized successfully");
@@ -150,20 +157,20 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
         usable_frame as f64 * 4. / 1024. / 1024.
     );
 
-    info!("RSDP: {:#x}", boot_info.rsdp);
+    if let Some(rsdp) = boot_info.rsdp {
+        info!("RSDP: {:#x}", rsdp);
 
-    let acpi_tables =
-        unsafe { AcpiTables::from_rsdp(KernelAcpiHandler, boot_info.rsdp as usize) }.unwrap();
-    let platform_info = acpi_tables.platform_info().unwrap();
+        let acpi_tables =
+            unsafe { AcpiTables::from_rsdp(KernelAcpiHandler, rsdp as usize) }.unwrap();
+        let platform_info = acpi_tables.platform_info().unwrap();
 
-    apic::init_local_apic(platform_info);
-    info!("Local APIC initialized",);
+        apic::init_local_apic(platform_info);
+        info!("Local APIC initialized",);
 
-    x86_64::instructions::interrupts::enable();
+        x86_64::instructions::interrupts::enable();
 
-    info!("Interrupts enabled");
-
-    serial::disable_screen_output();
+        info!("Interrupts enabled");
+    }
 
     BZIMAGE_ADDR.call_once(|| boot_info.bzimage_addr);
     BZIMAGE_SIZE.call_once(|| boot_info.bzimage_size);
