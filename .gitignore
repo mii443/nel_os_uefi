@@ -2,5 +2,6 @@ nel_os_bootloader/target
 nel_os_kernel/target
 nel_os_common/target
 nel_os_bootloader/fat.img
+nel_os_bootloader/myOSimage.img
 nel_os_bootloader/iso/
 nel_os_bootloader/nel_os.iso
