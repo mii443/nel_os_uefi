@@ -1,4 +1,7 @@
-use crate::vmm::x86_64::{common, intel::vmcs};
+use crate::vmm::x86_64::{
+    common,
+    intel::{vmcs, vmwrite},
+};
 
 pub fn setup_exec_controls() -> Result<(), &'static str> {
     let basic_msr = common::read_msr(0x480);
@@ -12,8 +15,8 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     raw_pin_exec_ctrl |= (reserved_bits & 0xFFFFFFFF) as u32;
     raw_pin_exec_ctrl &= (reserved_bits >> 32) as u32;
 
-    let pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
-    //pin_exec_ctrl.set_external_interrupt_exiting(false);
+    let mut pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
+    pin_exec_ctrl.set_external_interrupt_exiting(false);
 
     pin_exec_ctrl.write()?;
 
@@ -54,6 +57,9 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     //secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
 
     secondary_exec_ctrl.write()?;
+
+    vmwrite(x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK, u64::MAX)?;
+    vmwrite(x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK, u64::MAX)?;
 
     Ok(())
 }
@@ -101,7 +107,13 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
 
     exit_ctrl.write()?;
 
-    //vmwrite(0x4004, 1u64 << 6)?; // EXCEPTION_BITMAP
+    /*vmwrite(
+        0x4004,
+        1u64 << x86::irq::DOUBLE_FAULT_VECTOR
+            | 1u64 << x86::irq::GENERAL_PROTECTION_FAULT_VECTOR
+            | 1u64 << x86::irq::PAGE_FAULT_VECTOR
+            | 1u64 << x86::irq::X87_FPU_VECTOR,
+    )?;*/
 
     Ok(())
 }

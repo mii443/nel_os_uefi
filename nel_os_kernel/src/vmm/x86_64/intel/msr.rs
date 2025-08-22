@@ -101,8 +101,6 @@ pub fn update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
         .map(|entry| entry.index)
         .collect();
 
-    info!("1");
-
     for index in indices_to_update {
         info!("{}", index);
         let value = read_msr(index);
@@ -110,25 +108,21 @@ pub fn update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
         vcpu.host_msr.set_by_index(index, value).unwrap();
     }
 
-    info!("2");
     vmwrite(
         vmcs::control::VMEXIT_MSR_LOAD_COUNT,
         vcpu.host_msr.saved_ents().len() as u64,
     )
     .unwrap();
-    info!("3");
     vmwrite(
         vmcs::control::VMEXIT_MSR_STORE_COUNT,
         vcpu.guest_msr.saved_ents().len() as u64,
     )
     .unwrap();
-    info!("4");
     vmwrite(
         vmcs::control::VMENTRY_MSR_LOAD_COUNT,
         vcpu.guest_msr.saved_ents().len() as u64,
     )
     .unwrap();
-    info!("5");
     Ok(())
 }
 

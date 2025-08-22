@@ -93,6 +93,32 @@ impl IntelVCpu {
                     info!("EPT Violation at guest address: {:#x}", guest_address);
                     return Err("EPT Violation");
                 }
+                VmxExitReason::TRIPLE_FAULT => {
+                    info!("Triple fault detected");
+                    return Err("Triple fault");
+                }
+                VmxExitReason::EXCEPTION => {
+                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO)?;
+                    let vector = (vmexit_intr_info & 0xFF) as u8;
+                    let error_code = (vmexit_intr_info >> 8) & 0b111;
+                    let error_code_valid = (vmexit_intr_info >> 11) & 0b1 != 0;
+
+                    let idt_vectoring_info = vmread(vmcs::ro::IDT_VECTORING_INFO)?;
+                    info!("idt valid: {}", idt_vectoring_info >> 31 & 0b1 != 0);
+
+                    let rip = vmread(vmcs::guest::RIP)?;
+                    let hpa = self.ept.get_phys_addr(rip).unwrap();
+
+                    if error_code_valid {
+                        info!(
+                            "VM exit due to exception: vector {}, error code {}, at RIP {:#x} (hpa: {:#x})",
+                            vector, error_code, rip, hpa
+                        );
+                    } else {
+                        info!("VM exit due to exception: vector {}", vector);
+                    }
+                    return Err("VM exit due to exception");
+                }
                 _ => {
                     info!("VM exit reason: {:?}", exit_reason);
                     return Err("Unhandled VM exit reason");
@@ -114,8 +140,6 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
-        msr::update_msrs(self).unwrap();
-
         auditor::controls::check_vmcs_control_fields().unwrap();
 
         let success = {
@@ -233,14 +257,18 @@ impl IntelVCpu {
 
     fn setup_guest_state(&mut self) -> Result<(), &'static str> {
         use x86::{controlregs::*, vmx::vmcs};
-        let cr0 = Cr0::empty()
+        let cr0 = (Cr0::empty()
             | Cr0::CR0_PROTECTED_MODE
-            | Cr0::CR0_NUMERIC_ERROR & !Cr0::CR0_ENABLE_PAGING;
+            | Cr0::CR0_NUMERIC_ERROR
+            | Cr0::CR0_EXTENSION_TYPE)
+            & !Cr0::CR0_ENABLE_PAGING;
         vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
-        vmwrite(vmcs::guest::CR3, unsafe { cr3() })?;
+        vmwrite(vmcs::guest::CR3, 0)?;
         vmwrite(
             vmcs::guest::CR4,
-            vmread(vmcs::guest::CR4)? & !Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits(),
+            vmread(vmcs::guest::CR4)?
+                | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()
+                    & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
         )?;
 
         vmwrite(vmcs::guest::CS_BASE, 0)?;
