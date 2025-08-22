@@ -42,6 +42,7 @@ pub struct IntelVCpu {
     guest_memory_size: u64,
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
+    pub ia32e_enabled: bool,
 }
 
 impl IntelVCpu {
@@ -666,6 +667,7 @@ impl VCpu for IntelVCpu {
             guest_memory_size: 1024 * 1024 * 256, // 256 MiB
             host_msr: ShadowMsr::new(),
             guest_msr: ShadowMsr::new(),
+            ia32e_enabled: false,
         })
     }
 
