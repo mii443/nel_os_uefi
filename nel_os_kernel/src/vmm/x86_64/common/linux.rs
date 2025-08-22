@@ -10,6 +10,12 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     let kernel =
         unsafe { core::slice::from_raw_parts(*kernel_addr as *const u8, *kernel_size as usize) };
 
+    let initrd_addr = crate::ROOTFS_ADDR.get().unwrap();
+    let initrd_size = crate::ROOTFS_SIZE.get().unwrap();
+
+    let initrd =
+        unsafe { core::slice::from_raw_parts(*initrd_addr as *const u8, *initrd_size as usize) };
+
     info!("Creating boot parameters");
     let guest_mem_size = vcpu.get_guest_memory_size();
     let mut bp = BootParams::from_bytes(kernel)?;
@@ -23,6 +29,8 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     bp.hdr.loadflags.set_keep_segments(true);
     bp.hdr.cmd_line_ptr = LAYOUT_CMDLINE as u32;
     bp.hdr.vid_mode = 0xFFFF;
+    bp.hdr.ramdisk_image = LAYOUT_INITRD as u32;
+    bp.hdr.ramdisk_size = initrd.len() as u32;
 
     bp.add_e820_entry(0, LAYOUT_KERNEL_BASE, E820Type::Ram);
     bp.add_e820_entry(
@@ -64,6 +72,9 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
         &kernel[code_offset..code_offset + code_size],
         LAYOUT_KERNEL_BASE as usize,
     )?;
+
+    info!("Loading initrd image into guest memory");
+    load_image(vcpu, initrd, LAYOUT_INITRD as usize)?;
 
     Ok(())
 }

@@ -155,6 +155,35 @@ impl PIC {
         Ok(false)
     }
 
+    pub fn inject_exception(
+        &mut self,
+        vector: u32,
+        error_code: Option<u32>,
+    ) -> Result<(), &'static str> {
+        let has_error_code = match vector {
+            8 | 10..=14 | 17 | 21 => true,
+            _ => false,
+        };
+
+        let interrupt_info = EntryIntrInfo::new()
+            .with_vector(vector as u8)
+            .with_typ(3)
+            .with_ec_available(has_error_code)
+            .with_valid(true);
+
+        vmwrite(
+            vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            u32::from(interrupt_info) as u64,
+        )?;
+
+        if has_error_code {
+            let ec = error_code.unwrap_or(0);
+            vmwrite(vmx::vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, ec as u64)?;
+        }
+
+        Ok(())
+    }
+
     fn handle_io_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
             0x0CF8..=0x0CFF => regs.rax = 0,

@@ -5,3 +5,4 @@ nel_os_bootloader/fat.img
 nel_os_bootloader/myOSimage.img
 nel_os_bootloader/iso/
 nel_os_bootloader/nel_os.iso
+nel_os_bootloader/vmlinux

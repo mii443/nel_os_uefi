@@ -1,6 +1,10 @@
-use core::arch::asm;
+use core::arch::{
+    asm,
+    x86_64::{_xgetbv, _xsetbv},
+};
 
 use raw_cpuid::cpuid;
+use x86::controlregs::cr4;
 use x86_64::{
     registers::control::Cr4Flags,
     structures::paging::{FrameAllocator, Size4KiB},
@@ -14,6 +18,7 @@ use crate::{
             common::{self, read_msr},
             intel::{
                 auditor, controls, cpuid, ept,
+                fpu::{self, XCR0},
                 io::{vmm_interrupt_subscriber, IOBitmap},
                 msr::{self, ShadowMsr},
                 qual::{QualCr, QualIo},
@@ -50,6 +55,8 @@ pub struct IntelVCpu {
     pic: super::io::PIC,
     io_bitmap: IOBitmap,
     pub pending_irq: u16,
+    pub host_xcr0: u64,
+    pub guest_xcr0: XCR0,
 }
 
 impl IntelVCpu {
@@ -118,6 +125,15 @@ impl IntelVCpu {
 
                     self.step_next_inst()?;
                 }
+                VmxExitReason::XSETBV => {
+                    fpu::set_xcr(
+                        self,
+                        self.guest_registers.rcx as u32,
+                        self.guest_registers.rax,
+                    )?;
+
+                    self.step_next_inst()?;
+                }
                 VmxExitReason::IO_INSTRUCTION => {
                     let qual = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
                     let qual_io = QualIo::from(qual);
@@ -147,30 +163,123 @@ impl IntelVCpu {
                     return Err("Triple fault");
                 }
                 VmxExitReason::EXCEPTION => {
-                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO)?;
-                    let vector = (vmexit_intr_info & 0xFF) as u8;
-                    let error_code = (vmexit_intr_info >> 8) & 0b111;
-                    let error_code_valid = (vmexit_intr_info >> 11) & 0b1 != 0;
+                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO).unwrap();
+                    let vector = (vmexit_intr_info & 0xFF) as u32;
+                    let has_error_code = (vmexit_intr_info & (1 << 11)) != 0;
 
-                    let idt_vectoring_info = vmread(vmcs::ro::IDT_VECTORING_INFO)?;
-                    info!("idt valid: {}", idt_vectoring_info >> 31 & 0b1 != 0);
-
-                    let rip = vmread(vmcs::guest::RIP)?;
-                    let hpa = self.ept.get_phys_addr(rip).unwrap();
-
-                    if error_code_valid {
-                        info!(
-                            "VM exit due to exception: vector {}, error code {}, at RIP {:#x} (hpa: {:#x})",
-                            vector, error_code, rip, hpa
-                        );
+                    let error_code = if has_error_code {
+                        Some(vmread(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE).unwrap() as u32)
                     } else {
-                        info!("VM exit due to exception: vector {}", vector);
+                        None
+                    };
+
+                    let rip = vmread(vmcs::guest::RIP).unwrap();
+
+                    let mut instruction_bytes = [0u8; 16];
+                    let mut valid_bytes = 0;
+
+                    match self.translate_guest_address(rip) {
+                        Ok(guest_phys_addr) => {
+                            for i in 0..16 {
+                                match self.ept.get(guest_phys_addr + i) {
+                                    Ok(byte) => {
+                                        instruction_bytes[i as usize] = byte;
+                                        valid_bytes = i + 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            info!(
+                                "Failed to get physical address for RIP: {:#x}, {:?}",
+                                rip, e
+                            );
+                            return Err("Failed to get physical address for RIP");
+                        }
                     }
-                    return Err("VM exit due to exception");
+
+                    if valid_bytes > 0 {
+                        match instruction_bytes[0] {
+                            0x0F => {
+                                if valid_bytes > 1 {
+                                    match instruction_bytes[1] {
+                                        0x01 => match instruction_bytes[2] {
+                                            0xCA => {
+                                                let rflags = vmread(vmcs::guest::RFLAGS).unwrap();
+                                                vmwrite(vmcs::guest::RFLAGS, rflags & !(1 << 18))
+                                                    .unwrap();
+                                                self.step_next_inst().unwrap();
+                                            }
+                                            0xCB => {
+                                                let rflags = vmread(vmcs::guest::RFLAGS).unwrap();
+                                                vmwrite(vmcs::guest::RFLAGS, rflags | (1 << 18))
+                                                    .unwrap();
+                                                self.step_next_inst().unwrap();
+                                            }
+                                            _ => {
+                                                self.pic
+                                                    .inject_exception(vector, error_code)
+                                                    .unwrap();
+                                            }
+                                        },
+                                        _ => {
+                                            self.pic.inject_exception(vector, error_code).unwrap();
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.pic.inject_exception(vector, error_code).unwrap();
+                            }
+                        }
+                    }
                 }
                 _ => {
                     info!("VM exit reason: {:?}", exit_reason);
                     return Err("Unhandled VM exit reason");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_guest_xcr0(&mut self) -> Result<(), &'static str> {
+        let host_cr4 = unsafe { cr4() };
+        if (host_cr4.bits() & Cr4Flags::OSXSAVE.bits() as usize) == 0 {
+            return Ok(());
+        }
+
+        if self.host_xcr0 == 0 {
+            self.host_xcr0 = unsafe { _xgetbv(0) };
+        }
+
+        let guest_cr4 = vmread(x86::vmx::vmcs::guest::CR4)?;
+
+        if guest_cr4 & Cr4Flags::OSXSAVE.bits() != 0 && u64::from(self.guest_xcr0) != self.host_xcr0
+        {
+            unsafe {
+                _xsetbv(0, u64::from(self.guest_xcr0));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_host_xcr0(&mut self) -> Result<(), &'static str> {
+        let host_cr4 = unsafe { cr4() };
+        if (host_cr4.bits() & Cr4Flags::OSXSAVE.bits() as usize) == 0 {
+            return Ok(());
+        }
+
+        let guest_cr4 = vmread(x86::vmx::vmcs::guest::CR4)?;
+
+        if guest_cr4 & Cr4Flags::OSXSAVE.bits() != 0 {
+            let current_xcr0 = unsafe { _xgetbv(0) };
+            if current_xcr0 != self.host_xcr0 {
+                unsafe {
+                    _xsetbv(0, self.host_xcr0);
                 }
             }
         }
@@ -193,9 +302,13 @@ impl IntelVCpu {
 
         let success = {
             let result: u16;
+
+            self.load_guest_xcr0().unwrap();
             unsafe {
                 result = crate::vmm::x86_64::intel::asm::asm_vm_entry(self as *mut _);
             };
+            self.load_host_xcr0().unwrap();
+
             result == 0
         };
 
@@ -422,6 +535,77 @@ impl IntelVCpu {
         //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
 
         Ok(())
+    }
+
+    fn translate_guest_address(&mut self, vaddr: u64) -> Result<u64, &'static str> {
+        let cr3 = vmread(x86::vmx::vmcs::guest::CR3).map_err(|_| "Failed to read guest CR3")?;
+        let pml4_base = cr3 & !0xFFF; // Clear lower 12 bits to get page table base
+
+        let efer = vmread(x86::vmx::vmcs::guest::IA32_EFER_FULL).unwrap_or(0);
+        let is_long_mode = (efer & (1 << 8)) != 0; // LME bit
+
+        if !is_long_mode {
+            return Ok(vaddr & 0xFFFFFFFF);
+        }
+
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as u64;
+        let pdpt_idx = ((vaddr >> 30) & 0x1FF) as u64;
+        let pd_idx = ((vaddr >> 21) & 0x1FF) as u64;
+        let pt_idx = ((vaddr >> 12) & 0x1FF) as u64;
+        let page_offset = (vaddr & 0xFFF) as u64;
+
+        let pml4_entry_addr = pml4_base + (pml4_idx * 8);
+        let pml4_entry = self.read_guest_phys_u64(pml4_entry_addr)?;
+        if (pml4_entry & 1) == 0 {
+            return Err("PML4 entry not present");
+        }
+        let pdpt_base = pml4_entry & 0x000FFFFFFFFFF000;
+
+        let pdpt_entry_addr = pdpt_base + (pdpt_idx * 8);
+        let pdpt_entry = self.read_guest_phys_u64(pdpt_entry_addr)?;
+        if (pdpt_entry & 1) == 0 {
+            return Err("PDPT entry not present");
+        }
+
+        if (pdpt_entry & (1 << 7)) != 0 {
+            let page_base = pdpt_entry & 0x000FFFFFC0000000;
+            return Ok(page_base | (vaddr & 0x3FFFFFFF));
+        }
+        let pd_base = pdpt_entry & 0x000FFFFFFFFFF000;
+
+        let pd_entry_addr = pd_base + (pd_idx * 8);
+        let pd_entry = self.read_guest_phys_u64(pd_entry_addr)?;
+        if (pd_entry & 1) == 0 {
+            return Err("PD entry not present");
+        }
+
+        if (pd_entry & (1 << 7)) != 0 {
+            let page_base = pd_entry & 0x000FFFFFFFE00000;
+            return Ok(page_base | (vaddr & 0x1FFFFF));
+        }
+        let pt_base = pd_entry & 0x000FFFFFFFFFF000;
+
+        let pt_entry_addr = pt_base + (pt_idx * 8);
+        let pt_entry = self.read_guest_phys_u64(pt_entry_addr)?;
+        if (pt_entry & 1) == 0 {
+            return Err("PT entry not present");
+        }
+        let page_base = pt_entry & 0x000FFFFFFFFFF000;
+
+        Ok(page_base | page_offset)
+    }
+
+    fn read_guest_phys_u64(&mut self, gpa: u64) -> Result<u64, &'static str> {
+        let mut result_bytes = [0u8; 8];
+
+        for i in 0..8 {
+            match self.ept.get(gpa + i) {
+                Ok(byte) => result_bytes[i as usize] = byte,
+                Err(_) => return Err("Failed to read from EPT"),
+            }
+        }
+
+        Ok(u64::from_le_bytes(result_bytes))
     }
 
     fn dump_vmcs_settings(&self) -> Result<(), &'static str> {
@@ -725,6 +909,8 @@ impl VCpu for IntelVCpu {
             pic: super::io::PIC::new(),
             io_bitmap: IOBitmap::new(frame_allocator),
             pending_irq: 0,
+            host_xcr0: 0,
+            guest_xcr0: XCR0::new(),
         })
     }
 

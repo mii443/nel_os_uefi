@@ -109,13 +109,7 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
 
     exit_ctrl.write()?;
 
-    /*vmwrite(
-        0x4004,
-        1u64 << x86::irq::DOUBLE_FAULT_VECTOR
-            | 1u64 << x86::irq::GENERAL_PROTECTION_FAULT_VECTOR
-            | 1u64 << x86::irq::PAGE_FAULT_VECTOR
-            | 1u64 << x86::irq::X87_FPU_VECTOR,
-    )?;*/
+    vmwrite(0x4004, 1u64 << x86::irq::INVALID_OPCODE_VECTOR)?;
 
     Ok(())
 }
