@@ -4,6 +4,7 @@ mod controls;
 mod cpuid;
 mod cr;
 mod ept;
+mod io;
 mod msr;
 mod qual;
 mod register;
