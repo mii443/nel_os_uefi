@@ -6,7 +6,7 @@ EFI_BINARY="$1"
 ./create-iso.sh "$EFI_BINARY"
 
 qemu-system-x86_64 -enable-kvm \
-    -m 4G \
+    -m 512M \
     -serial mon:stdio \
 	-nographic \
     -no-reboot \

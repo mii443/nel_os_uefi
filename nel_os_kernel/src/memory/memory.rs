@@ -1,12 +1,22 @@
 use core::slice;
 
 use nel_os_common::memory::{self, UsableMemory};
+use spin::Once;
 use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
     PhysAddr,
 };
 
-use crate::constant::{BITS_PER_ENTRY, ENTRY_COUNT, PAGE_SIZE};
+use crate::{
+    constant::{BITS_PER_ENTRY, PAGE_SIZE},
+    info,
+};
+
+pub static MAX_MEMORY: Once<usize> = Once::new();
+
+pub fn get_entry_count() -> usize {
+    MAX_MEMORY.get().unwrap_or(&0) / PAGE_SIZE / BITS_PER_ENTRY
+}
 
 pub struct BitmapMemoryTable {
     pub used_map: &'static mut [usize],
@@ -21,16 +31,17 @@ impl BitmapMemoryTable {
             max_addr = max_addr.max(range.end);
         }
 
-        let bitmap_size = ENTRY_COUNT * core::mem::size_of::<usize>();
+        let entry_count = get_entry_count();
+        let bitmap_size = entry_count * core::mem::size_of::<usize>();
 
         let bitmap_addr = ((max_addr as usize).saturating_sub(bitmap_size)) & !(PAGE_SIZE - 1);
 
         let used_map = unsafe {
             let ptr = bitmap_addr as *mut usize;
-            slice::from_raw_parts_mut(ptr, ENTRY_COUNT)
+            slice::from_raw_parts_mut(ptr, entry_count)
         };
 
-        (0..ENTRY_COUNT).for_each(|i| {
+        (0..entry_count).for_each(|i| {
             used_map[i] = 0;
         });
 
@@ -50,8 +61,8 @@ impl BitmapMemoryTable {
             table.set_frame(bitmap_start_frame + i, false);
         }
 
-        for i in 0..ENTRY_COUNT {
-            let index = ENTRY_COUNT - i - 1;
+        for i in 0..entry_count {
+            let index = entry_count - i - 1;
             if table.used_map[index] != 0 {
                 let offset = 63 - table.used_map[index].leading_zeros();
                 table.end = index * BITS_PER_ENTRY + (BITS_PER_ENTRY - offset as usize);

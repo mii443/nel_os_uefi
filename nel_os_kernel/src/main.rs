@@ -98,10 +98,13 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     let ranges = boot_info.usable_memory.ranges();
     let mut count = 0;
+    let mut max_range = 0;
     for range in ranges {
         count += range.end - range.start;
+        max_range = max_range.max(range.end);
     }
     info!("Usable memory: {}MiB", count / 1024 / 1024);
+    memory::memory::MAX_MEMORY.call_once(|| max_range as usize * 2);
 
     let mut bitmap_table = BitmapMemoryTable::init(&boot_info.usable_memory);
     info!(
