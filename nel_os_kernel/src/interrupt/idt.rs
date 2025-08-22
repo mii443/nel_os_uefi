@@ -5,6 +5,7 @@ use crate::{
     interrupt::{
         apic::{EOI, LAPIC},
         gdt,
+        subscriber::InterruptContext,
     },
     time, warn,
 };
@@ -40,6 +41,17 @@ pub fn init_idt() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    let context = InterruptContext {
+        vector: 3,
+        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
+        code_segment: stack_frame.code_segment.0 as u64,
+        cpu_flags: stack_frame.cpu_flags.bits(),
+        stack_pointer: stack_frame.stack_pointer.as_u64(),
+        stack_segment: stack_frame.stack_segment.0 as u64,
+    };
+
+    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
+
     warn!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
@@ -47,6 +59,17 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
+    let context = InterruptContext {
+        vector: 8,
+        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
+        code_segment: stack_frame.code_segment.0 as u64,
+        cpu_flags: stack_frame.cpu_flags.bits(),
+        stack_pointer: stack_frame.stack_pointer.as_u64(),
+        stack_segment: stack_frame.stack_segment.0 as u64,
+    };
+
+    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
+
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
@@ -56,6 +79,17 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
+    let context = InterruptContext {
+        vector: 14,
+        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
+        code_segment: stack_frame.code_segment.0 as u64,
+        cpu_flags: stack_frame.cpu_flags.bits(),
+        stack_pointer: stack_frame.stack_pointer.as_u64(),
+        stack_segment: stack_frame.stack_segment.0 as u64,
+    };
+
+    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
+
     panic!(
         "EXCEPTION: PAGE FAULT\n{:#?}\nAccessed address: {:#x}",
         stack_frame,
@@ -63,7 +97,18 @@ extern "x86-interrupt" fn page_fault_handler(
     );
 }
 
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
+    let context = InterruptContext {
+        vector: IRQ_TIMER as u8,
+        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
+        code_segment: stack_frame.code_segment.0 as u64,
+        cpu_flags: stack_frame.cpu_flags.bits(),
+        stack_pointer: stack_frame.stack_pointer.as_u64(),
+        stack_segment: stack_frame.stack_segment.0 as u64,
+    };
+
+    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
+
     time::tick();
     LAPIC.get().unwrap().write(EOI, 0);
 }
