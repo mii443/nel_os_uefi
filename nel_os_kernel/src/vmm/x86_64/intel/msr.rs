@@ -92,7 +92,7 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     Ok(())
 }
 
-pub fn update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
+pub fn _update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     info!("updating MSRs");
     let indices_to_update: alloc::vec::Vec<u32> = vcpu
         .host_msr

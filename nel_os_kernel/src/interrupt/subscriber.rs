@@ -47,7 +47,7 @@ pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
 
     for slot in subscribers.iter_mut() {
         if let Some(subscriber) = slot {
-            if subscriber.callback == callback {
+            if core::ptr::fn_addr_eq(subscriber.callback, callback) {
                 *slot = None;
                 return Ok(());
             }

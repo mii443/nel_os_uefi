@@ -10,11 +10,11 @@ use crate::vmm::x86_64::{
 };
 
 pub fn handle_cr_access(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static str> {
-    match AccessType::try_from(qual.access_type()).unwrap() {
+    match qual.access_type() {
         AccessType::MovTo => match qual.index() {
             0 | 4 => {
-                passthrough_write(vcpu, qual);
-                update_ia32e(vcpu);
+                passthrough_write(vcpu, qual)?;
+                update_ia32e(vcpu)?;
             }
             _ => panic!("Unsupported CR index: {}", qual.index()),
         },
@@ -33,7 +33,7 @@ fn passthrough_read(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static 
         _ => panic!("Unsupported CR index: {}", qual.index()),
     };
 
-    set_value(vcpu, qual, value);
+    set_value(vcpu, qual, value)?;
 
     Ok(())
 }
@@ -66,7 +66,7 @@ pub fn update_ia32e(vcpu: &mut IntelVCpu) -> Result<(), &'static str> {
 
     let mut entry_ctrl = super::vmcs::controls::EntryControls::read()?;
     entry_ctrl.set_ia32e_mode_guest(ia32e_enabled);
-    entry_ctrl.write();
+    entry_ctrl.write()?;
 
     let mut efer = vmread(x86::vmx::vmcs::guest::IA32_EFER_FULL)?;
 

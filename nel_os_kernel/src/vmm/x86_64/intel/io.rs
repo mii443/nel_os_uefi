@@ -7,14 +7,7 @@ use crate::{
     vmm::x86_64::intel::{register::GuestRegisters, vmwrite},
 };
 
-#[derive(Default)]
-pub struct Serial {
-    pub ier: u8,
-    pub mcr: u8,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-
 pub enum InitPhase {
     Uninitialized,
     Phase1,
@@ -23,7 +16,7 @@ pub enum InitPhase {
     Initialized,
 }
 
-enum ReadSel {
+pub enum ReadSel {
     IRR,
     ISR,
 }
