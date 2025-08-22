@@ -7,10 +7,7 @@ use x86_64::{
     PhysAddr,
 };
 
-use crate::{
-    constant::{BITS_PER_ENTRY, PAGE_SIZE},
-    info,
-};
+use crate::constant::{BITS_PER_ENTRY, PAGE_SIZE};
 
 pub static MAX_MEMORY: Once<usize> = Once::new();
 

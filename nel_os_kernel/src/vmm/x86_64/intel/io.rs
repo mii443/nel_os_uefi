@@ -1,11 +1,27 @@
-use x86::vmx::vmcs;
+use x86::vmx::{self, vmcs};
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
 use super::qual::QualIo;
 use crate::{
     info,
-    vmm::x86_64::intel::{register::GuestRegisters, vmwrite},
+    interrupt::subscriber::InterruptContext,
+    vmm::x86_64::intel::{
+        register::GuestRegisters, vmcs::controls::EntryIntrInfo, vmread, vmwrite,
+    },
 };
+
+pub fn vmm_interrupt_subscriber(vcpu_ptr: *mut core::ffi::c_void, context: &InterruptContext) {
+    if vcpu_ptr.is_null() {
+        return;
+    }
+
+    let vcpu = unsafe { &mut *(vcpu_ptr as *mut super::vcpu::IntelVCpu) };
+
+    if 0x20 <= context.vector && context.vector <= 0x20 + 16 {
+        let irq = context.vector - 0x20;
+        vcpu.pending_irq |= 1 << irq;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitPhase {
@@ -66,7 +82,80 @@ impl PIC {
         }
     }
 
-    pub fn handle_io_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
+    pub fn inject_external_interrupt(
+        &mut self,
+        pending_irq: &mut u16,
+    ) -> Result<bool, &'static str> {
+        let pending = *pending_irq;
+
+        if pending == 0 {
+            return Ok(false);
+        }
+
+        if self.primary_phase != InitPhase::Initialized {
+            return Ok(false);
+        }
+
+        let eflags = vmread(vmx::vmcs::guest::RFLAGS)?;
+        if eflags >> 9 & 1 == 0 {
+            return Ok(false);
+        }
+
+        let interruptibility = vmread(vmx::vmcs::guest::INTERRUPTIBILITY_STATE)?;
+        if interruptibility & 0x3 != 0 {
+            return Ok(false);
+        }
+
+        let is_secondary_masked = (self.primary_mask >> 2) & 1 != 0;
+
+        for i in 0..16 {
+            if is_secondary_masked && i >= 8 {
+                continue;
+            }
+
+            let irq_bit = 1 << i;
+            if pending & irq_bit == 0 {
+                continue;
+            }
+
+            let delta = if i < 8 { i } else { i - 8 };
+            let is_masked = if i < 8 {
+                (self.primary_mask >> delta) & 1 != 0
+            } else {
+                let is_irq_masked = (self.secondary_mask >> delta) & 1 != 0;
+                is_secondary_masked || is_irq_masked
+            };
+
+            if is_masked {
+                continue;
+            }
+
+            let interrupt_info = EntryIntrInfo::new()
+                .with_vector(
+                    delta as u8
+                        + if i < 8 {
+                            self.primary_base
+                        } else {
+                            self.secondary_base
+                        },
+                )
+                .with_typ(0)
+                .with_ec_available(false)
+                .with_valid(true);
+
+            vmwrite(
+                vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+                u32::from(interrupt_info) as u64,
+            )?;
+
+            *pending_irq &= !irq_bit;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn handle_io_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
             0x0CF8..=0x0CFF => regs.rax = 0,
             0xC000..=0xCFFF => {} //ignore
@@ -77,7 +166,7 @@ impl PIC {
         }
     }
 
-    pub fn handle_io_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
+    fn handle_io_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
             0x0CF8..=0x0CFF => {} //ignore
             0xC000..=0xCFFF => {} //ignore
@@ -88,7 +177,7 @@ impl PIC {
         }
     }
 
-    pub fn handle_pic_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
+    fn handle_pic_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
             0x20 => {
                 let v = match self.primary_read_sel {
@@ -120,7 +209,7 @@ impl PIC {
         }
     }
 
-    pub fn handle_pic_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
+    fn handle_pic_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         let pic = self;
         let dx = regs.rax as u8;
         match qual.port() {

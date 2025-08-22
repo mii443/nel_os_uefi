@@ -16,7 +16,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     raw_pin_exec_ctrl &= (reserved_bits >> 32) as u32;
 
     let mut pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
-    pin_exec_ctrl.set_external_interrupt_exiting(false);
+    pin_exec_ctrl.set_external_interrupt_exiting(true);
 
     pin_exec_ctrl.write()?;
 

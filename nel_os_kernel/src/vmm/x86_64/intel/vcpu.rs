@@ -1,3 +1,5 @@
+use core::arch::asm;
+
 use raw_cpuid::cpuid;
 use x86_64::{
     registers::control::Cr4Flags,
@@ -6,13 +8,13 @@ use x86_64::{
 };
 
 use crate::{
-    info,
+    info, interrupt,
     vmm::{
         x86_64::{
             common::{self, read_msr},
             intel::{
                 auditor, controls, cpuid, ept,
-                io::IOBitmap,
+                io::{vmm_interrupt_subscriber, IOBitmap},
                 msr::{self, ShadowMsr},
                 qual::{QualCr, QualIo},
                 register::GuestRegisters,
@@ -47,6 +49,7 @@ pub struct IntelVCpu {
     pub ia32e_enabled: bool,
     pic: super::io::PIC,
     io_bitmap: IOBitmap,
+    pub pending_irq: u16,
 }
 
 impl IntelVCpu {
@@ -77,7 +80,22 @@ impl IntelVCpu {
 
             match exit_reason {
                 VmxExitReason::HLT => {
-                    info!("VM hlt");
+                    let injected = self
+                        .pic
+                        .inject_external_interrupt(&mut self.pending_irq)
+                        .unwrap_or(false);
+
+                    if !injected {
+                        unsafe {
+                            asm!("sti");
+                            asm!("nop");
+                            asm!("cli");
+                        }
+                    }
+
+                    vmwrite(vmcs::guest::ACTIVITY_STATE, 0)?;
+                    vmwrite(vmcs::guest::INTERRUPTIBILITY_STATE, 0)?;
+
                     self.step_next_inst()?;
                 }
                 VmxExitReason::CPUID => {
@@ -107,6 +125,17 @@ impl IntelVCpu {
                     self.pic.handle_io(&mut self.guest_registers, qual_io);
 
                     self.step_next_inst()?;
+                }
+                VmxExitReason::EXTERNAL_INTERRUPT => {
+                    vmwrite(vmcs::ro::VMEXIT_INTERRUPTION_INFO, 0)?;
+
+                    unsafe {
+                        asm!("sti");
+                        asm!("nop");
+                        asm!("cli");
+                    }
+
+                    self.pic.inject_external_interrupt(&mut self.pending_irq)?;
                 }
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
@@ -197,6 +226,11 @@ impl IntelVCpu {
         Self::setup_host_state()?;
         self.setup_guest_state()?;
         self.io_bitmap.setup()?;
+
+        interrupt::subscriber::subscribe(
+            vmm_interrupt_subscriber,
+            self as &mut IntelVCpu as *mut IntelVCpu as *mut core::ffi::c_void,
+        )?;
 
         self.init_guest_memory(frame_allocator)?;
 
@@ -690,6 +724,7 @@ impl VCpu for IntelVCpu {
             ia32e_enabled: false,
             pic: super::io::PIC::new(),
             io_bitmap: IOBitmap::new(frame_allocator),
+            pending_irq: 0,
         })
     }
 

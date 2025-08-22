@@ -208,3 +208,14 @@ impl PrimaryExitControls {
         vmcs::VmcsControl32::PRIMARY_VM_EXIT_CONTROLS.write(u32::from(*self))
     }
 }
+
+#[bitfield]
+#[repr(u32)]
+#[derive(Debug, Clone, Copy)]
+pub struct EntryIntrInfo {
+    pub vector: B8,
+    pub typ: B3,
+    pub ec_available: bool,
+    _reserved: B19,
+    pub valid: bool,
+}
