@@ -13,6 +13,7 @@ use crate::{
             intel::{
                 auditor, controls, cpuid, ept,
                 msr::{self, ShadowMsr},
+                qual::QualCr,
                 register::GuestRegisters,
                 vmcs::{
                     self,
@@ -77,7 +78,6 @@ impl IntelVCpu {
                     self.step_next_inst()?;
                 }
                 VmxExitReason::CPUID => {
-                    info!("VM exit reason: CPUID");
                     cpuid::handle_cpuid_vmexit(self);
                     self.step_next_inst()?;
                 }
@@ -87,6 +87,14 @@ impl IntelVCpu {
                 }
                 VmxExitReason::WRMSR => {
                     msr::ShadowMsr::handle_wrmsr_vmexit(self);
+                    self.step_next_inst()?;
+                }
+                VmxExitReason::CONTROL_REGISTER_ACCESSES => {
+                    let qual = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
+                    let qual = QualCr::from(qual);
+
+                    super::cr::handle_cr_access(self, &qual)?;
+
                     self.step_next_inst()?;
                 }
                 VmxExitReason::EPT_VIOLATION => {
