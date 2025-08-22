@@ -12,8 +12,9 @@ use crate::{
             common::{self, read_msr},
             intel::{
                 auditor, controls, cpuid, ept,
+                io::IOBitmap,
                 msr::{self, ShadowMsr},
-                qual::QualCr,
+                qual::{QualCr, QualIo},
                 register::GuestRegisters,
                 vmcs::{
                     self,
@@ -44,6 +45,8 @@ pub struct IntelVCpu {
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
     pub ia32e_enabled: bool,
+    pic: super::io::PIC,
+    io_bitmap: IOBitmap,
 }
 
 impl IntelVCpu {
@@ -94,6 +97,14 @@ impl IntelVCpu {
                     let qual = QualCr::from(qual);
 
                     super::cr::handle_cr_access(self, &qual)?;
+
+                    self.step_next_inst()?;
+                }
+                VmxExitReason::IO_INSTRUCTION => {
+                    let qual = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
+                    let qual_io = QualIo::from(qual);
+
+                    self.pic.handle_io(&mut self.guest_registers, qual_io);
 
                     self.step_next_inst()?;
                 }
@@ -185,6 +196,7 @@ impl IntelVCpu {
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
         self.setup_guest_state()?;
+        self.io_bitmap.setup()?;
 
         self.init_guest_memory(frame_allocator)?;
 
@@ -676,6 +688,8 @@ impl VCpu for IntelVCpu {
             host_msr: ShadowMsr::new(),
             guest_msr: ShadowMsr::new(),
             ia32e_enabled: false,
+            pic: super::io::PIC::new(),
+            io_bitmap: IOBitmap::new(frame_allocator),
         })
     }
 

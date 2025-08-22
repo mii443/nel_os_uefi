@@ -36,6 +36,8 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     primary_exec_ctrl.set_hlt(true);
     primary_exec_ctrl.set_activate_secondary_controls(true);
     primary_exec_ctrl.set_use_msr_bitmap(false);
+    primary_exec_ctrl.set_unconditional_io(false);
+    primary_exec_ctrl.set_use_io_bitmap(true);
 
     primary_exec_ctrl.write()?;
 
