@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use modular_bitfield::{bitfield, prelude::B44};
 
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
@@ -26,7 +28,6 @@ pub struct XCR0 {
     pub xtilecfg: bool,
     pub xtiledata: bool,
     pub apx: bool,
-    #[skip]
     _reserved: B44,
 }
 

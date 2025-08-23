@@ -6,7 +6,7 @@ use core::arch::{
 use raw_cpuid::cpuid;
 use x86::controlregs::cr4;
 use x86_64::{
-    registers::control::Cr4Flags,
+    registers::control::{Cr4, Cr4Flags},
     structures::paging::{FrameAllocator, Size4KiB},
     VirtAddr,
 };
@@ -233,10 +233,11 @@ impl IntelVCpu {
                                 self.pic.inject_exception(vector, error_code).unwrap();
                             }
                         }
+                    } else {
+                        self.pic.inject_exception(vector, error_code).unwrap();
                     }
                 }
                 _ => {
-                    info!("VM exit reason: {:?}", exit_reason);
                     return Err("Unhandled VM exit reason");
                 }
             }
@@ -257,7 +258,9 @@ impl IntelVCpu {
 
         let guest_cr4 = vmread(x86::vmx::vmcs::guest::CR4)?;
 
-        if guest_cr4 & Cr4Flags::OSXSAVE.bits() != 0 && u64::from(self.guest_xcr0) != self.host_xcr0
+        if guest_cr4 & Cr4Flags::OSXSAVE.bits() != 0
+            && u64::from(self.guest_xcr0) != self.host_xcr0
+            && u64::from(self.guest_xcr0) != 0
         {
             unsafe {
                 _xsetbv(0, u64::from(self.guest_xcr0));
@@ -351,6 +354,11 @@ impl IntelVCpu {
 
         msr::register_msrs(self).map_err(|_| "MSR error")?;
 
+        let cr4 = Cr4::read() | Cr4Flags::OSFXSR;
+        unsafe {
+            Cr4::write(cr4);
+        }
+
         Ok(())
     }
 
@@ -384,7 +392,7 @@ impl IntelVCpu {
         vmwrite(vmcs::host::CR3, unsafe { cr3() })?;
         vmwrite(
             vmcs::host::CR4,
-            unsafe { cr4() }.bits() as u64, /* | Cr4Flags::OSXSAVE.bits()*/
+            unsafe { cr4() }.bits() as u64 | Cr4Flags::OSXSAVE.bits(),
         )?;
 
         vmwrite(
@@ -531,8 +539,8 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::RIP, common::linux::LAYOUT_KERNEL_BASE)?;
         self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM;
 
-        //vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
-        //vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
+        vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
+        vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
 
         Ok(())
     }
@@ -542,7 +550,7 @@ impl IntelVCpu {
         let pml4_base = cr3 & !0xFFF; // Clear lower 12 bits to get page table base
 
         let efer = vmread(x86::vmx::vmcs::guest::IA32_EFER_FULL).unwrap_or(0);
-        let is_long_mode = (efer & (1 << 8)) != 0; // LME bit
+        let is_long_mode = (efer & (1 << 10)) != 0; // LMA bit
 
         if !is_long_mode {
             return Ok(vaddr & 0xFFFFFFFF);
