@@ -61,7 +61,6 @@ pub struct Pic {
     pub primary_read_sel: ReadSel,
     pub secondary_read_sel: ReadSel,
     pub serial: Serial,
-    pub serial_buffer: SerialBuffer,
 }
 
 impl Pic {
@@ -80,7 +79,6 @@ impl Pic {
             primary_read_sel: ReadSel::Irr,
             secondary_read_sel: ReadSel::Irr,
             serial: Serial::default(),
-            serial_buffer: SerialBuffer::default(),
         }
     }
 
@@ -202,7 +200,7 @@ impl Pic {
             0x20..=0x21 => self.handle_pic_in(regs, qual),
             0xA0..=0xA1 => self.handle_pic_in(regs, qual),
             0x0070..=0x0071 => regs.rax = 0,
-            0x03F..=0x03FF => self.handle_serial_in(regs, qual),
+            0x03F8..=0x03FF => self.handle_serial_in(regs, qual),
             _ => regs.rax = 0,
         }
     }
@@ -237,17 +235,7 @@ impl Pic {
 
     fn handle_serial_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x3F8 => {
-                let byte = regs.rax as u8;
-                if self.serial_buffer.end < self.serial_buffer.buffer.len() {
-                    self.serial_buffer.buffer[self.serial_buffer.end] = byte;
-                    self.serial_buffer.end += 1;
-                }
-
-                if byte == b'\n' || self.serial_buffer.end == self.serial_buffer.buffer.len() {
-                    self.serial_buffer.flush();
-                }
-            }
+            0x3F8 => serial::write_byte(regs.rax as u8),
             0x3F9 => self.serial.ier = regs.rax as u8,
             0x3FA => {}
             0x3FB => {}
@@ -382,6 +370,7 @@ impl IOBitmap {
         }
 
         self.set_io_ports(0x0040..=0x0047);
+        self.set_io_ports(0x02F8..=0x03EF);
 
         vmwrite(vmcs::control::IO_BITMAP_A_ADDR_FULL, bitmap_a_addr as u64)?;
         vmwrite(vmcs::control::IO_BITMAP_B_ADDR_FULL, bitmap_b_addr as u64)?;
@@ -415,33 +404,6 @@ impl IOBitmap {
     fn get_bitmap_b(&mut self) -> &mut [u8] {
         unsafe {
             core::slice::from_raw_parts_mut(self.bitmap_b.start_address().as_u64() as *mut u8, 4096)
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SerialBuffer {
-    pub buffer: [u8; 1024],
-    pub end: usize,
-}
-
-impl SerialBuffer {
-    pub fn flush(&mut self) {
-        if self.end == 0 {
-            return;
-        }
-
-        serial::write_bytes(&self.buffer[..self.end]);
-
-        self.end = 0;
-    }
-}
-
-impl Default for SerialBuffer {
-    fn default() -> Self {
-        Self {
-            buffer: [0; 1024],
-            end: 0,
         }
     }
 }

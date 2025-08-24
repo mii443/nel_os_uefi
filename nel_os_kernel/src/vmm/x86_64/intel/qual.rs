@@ -3,7 +3,7 @@
 use core::convert::TryFrom;
 use core::fmt::Debug;
 
-use modular_bitfield::prelude::{B1, B16, B32, B4, B8};
+use modular_bitfield::prelude::{B1, B16, B3, B32, B4, B9};
 use modular_bitfield::{bitfield, Specifier};
 
 #[repr(u8)]
@@ -113,12 +113,12 @@ pub struct QualCr {
 #[repr(u64)]
 #[derive(Debug, Clone, Copy)]
 pub struct QualIo {
-    pub size: B4,
+    pub size: B3,
     pub direction: B1,
     pub string: B1,
     pub rep: B1,
     pub operand_encoding: B1,
-    _reserved1: B8,
+    _reserved1: B9,
     pub port: B16,
     _reserved2: B32,
 }
