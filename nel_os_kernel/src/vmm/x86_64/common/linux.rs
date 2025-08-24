@@ -46,7 +46,7 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
         256
     };
 
-    let cmdline_start = LAYOUT_CMDLINE as u64;
+    let cmdline_start = LAYOUT_CMDLINE;
     let cmdline_end = cmdline_start + cmdline_max_size as u64;
     vcpu.write_memory_ranged(cmdline_start, cmdline_end, 0)?;
     let cmdline_val = "console=ttyS0 earlyprintk=serial nokaslr";
@@ -128,11 +128,17 @@ pub struct BootParams {
     pub _unimplemented: [u8; 0x330],
 }
 
+impl Default for BootParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BootParams {
     pub const E820MAX: usize = 128;
 
     pub fn new() -> Self {
-        let params = Self {
+        Self {
             _screen_info: [0; 0x40],
             _apm_bios_info: [0; 0x14],
             _pad2: [0; 4],
@@ -162,9 +168,7 @@ impl BootParams {
                 type_: E820Type::Ram as u32,
             }; Self::E820MAX],
             _unimplemented: [0; 0x330],
-        };
-
-        params
+        }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {

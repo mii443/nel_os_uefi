@@ -258,6 +258,7 @@ pub struct ExtFeatureEbx0 {
     pub avx512vl: bool,
 }
 
+#[allow(clippy::enum_clike_unportable_variant)]
 pub enum VmxLeaf {
     MAXIMUM_INPUT = 0x0,
     VERSION_AND_FEATURE_INFO = 0x1,
@@ -268,7 +269,7 @@ pub enum VmxLeaf {
     EXTENDED_FEATURE_2 = 0x80000002,
     EXTENDED_FEATURE_3 = 0x80000003,
     EXTENDED_FEATURE_4 = 0x80000004,
-    UNKNOWN = 0xFFFFFFFF,
+    Unknown = 0xFFFFFFFF,
 }
 
 impl VmxLeaf {
@@ -283,7 +284,7 @@ impl VmxLeaf {
             0x80000002 => VmxLeaf::EXTENDED_FEATURE_2,
             0x80000003 => VmxLeaf::EXTENDED_FEATURE_3,
             0x80000004 => VmxLeaf::EXTENDED_FEATURE_4,
-            _ => VmxLeaf::UNKNOWN,
+            _ => VmxLeaf::Unknown,
         }
     }
 }

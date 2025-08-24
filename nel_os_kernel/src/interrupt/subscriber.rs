@@ -60,9 +60,7 @@ pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
 pub fn dispatch_to_subscribers(context: &InterruptContext) {
     let subscribers = SUBSCRIBERS.lock();
 
-    for subscriber in subscribers.iter() {
-        if let Some(subscriber) = subscriber {
-            (subscriber.callback)(subscriber.context, context);
-        }
+    for subscriber in subscribers.iter().flatten() {
+        (subscriber.callback)(subscriber.context, context);
     }
 }

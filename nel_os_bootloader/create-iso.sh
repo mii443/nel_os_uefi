@@ -1,9 +1,16 @@
-#!/bin/sh -ex
+#!/bin/bash -ex
 
 EFI_BINARY="$1"
 
 cd ../nel_os_kernel
-cargo build --release -q
+if [[ "$EFI_BINARY" == "target/x86_64-unknown-uefi/release/"* ]]; then
+	cargo build --release -q
+elif [[ "$EFI_BINARY" == "target/x86_64-unknown-uefi/debug/"* ]]; then
+	cargo build -q
+else
+	echo "Error: EFI binary path must contain either '/target/x86_64-unknown-uefi/release/' or '/target/x86_64-unknown-uefi/debug/'"
+	exit 1
+fi
 cd ../nel_os_bootloader
 
 dd if=/dev/zero of=fat.img bs=1k count=32768

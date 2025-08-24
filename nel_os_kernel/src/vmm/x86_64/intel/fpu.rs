@@ -36,11 +36,11 @@ pub fn set_xcr(vcpu: &mut IntelVCpu, index: u32, xcr: u64) -> Result<(), &'stati
         return Err("Invalid XCR index");
     }
 
-    if !(xcr & 0b1 != 0) {
+    if xcr & 0b1 == 0 {
         return Err("X87 is not enabled");
     }
 
-    if (xcr & 0b100 != 0) && !(xcr & 0b10 != 0) {
+    if (xcr & 0b100 != 0) && (xcr & 0b10 == 0) {
         return Err("SSE is not enabled");
     }
 
@@ -49,7 +49,7 @@ pub fn set_xcr(vcpu: &mut IntelVCpu, index: u32, xcr: u64) -> Result<(), &'stati
     }
 
     if xcr & 0b11100000 != 0 {
-        if !(xcr & 0b100 != 0) {
+        if xcr & 0b100 == 0 {
             return Err("YMM bits are not enabled");
         }
 

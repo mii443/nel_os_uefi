@@ -44,20 +44,20 @@ pub fn check_vmcs_control_fields() -> Result<(), &'static str> {
 fn is_valid_ept_ptr(ept_ptr: u64) -> Result<(), &'static str> {
     let memory_type = ept_ptr & 0b111;
     if memory_type != 0 && memory_type != 6 {
-        return Err("VMCS EPT pointer memory type is not valid (must be 0 or 6)");
+        return Err("VMCS Ept pointer memory type is not valid (must be 0 or 6)");
     }
 
     let walk_length = (ept_ptr >> 3) & 0b111;
     if walk_length != 3 {
-        return Err("VMCS EPT pointer walk length is not valid (must be 3)");
+        return Err("VMCS Ept pointer walk length is not valid (must be 3)");
     }
 
     if ept_ptr & 0xf00 != 0 {
-        return Err("VMCS EPT pointer reserved bits are not zero");
+        return Err("VMCS Ept pointer reserved bits are not zero");
     }
 
     if !is_valid_phys_addr(ept_ptr) {
-        return Err("VMCS EPT pointer is not a valid physical address");
+        return Err("VMCS Ept pointer is not a valid physical address");
     }
 
     Ok(())
@@ -72,12 +72,12 @@ fn check_ept() -> Result<(), &'static str> {
     } else {
         if secondary_exec_ctrl.unrestricted_guest() {
             return Err(
-                "VMCS Secondary processor-based execution controls field: EPT is not set while unrestricted guest is set",
+                "VMCS Secondary processor-based execution controls field: Ept is not set while unrestricted guest is set",
             );
         }
         if secondary_exec_ctrl.mode_based_control_ept() {
             return Err(
-                "VMCS Secondary processor-based execution controls field: EPT is not set while mode-based control for EPT is set",
+                "VMCS Secondary processor-based execution controls field: Ept is not set while mode-based control for Ept is set",
             );
         }
     }
@@ -107,15 +107,13 @@ fn check_interrupt() -> Result<(), &'static str> {
         } else {
             // TODO
         }
-    } else {
-        if secondary_exec_ctrl.virtualize_x2apic_mode()
-            || secondary_exec_ctrl.apic_register_virtualization()
-            || secondary_exec_ctrl.virtual_interrupt_delivery()
-        {
-            return Err(
-                "VMCS Primary processor-based execution controls field: Use TPR shadow is not set while virtualize x2APIC mode, APIC register virtualization, or virtual interrupt delivery is set",
-            );
-        }
+    } else if secondary_exec_ctrl.virtualize_x2apic_mode()
+        || secondary_exec_ctrl.apic_register_virtualization()
+        || secondary_exec_ctrl.virtual_interrupt_delivery()
+    {
+        return Err(
+            "VMCS Primary processor-based execution controls field: Use TPR shadow is not set while virtualize x2APIC mode, APIC register virtualization, or virtual interrupt delivery is set",
+        );
     }
 
     // TODO
@@ -130,7 +128,7 @@ fn check_ept_violation_exception_info() -> Result<(), &'static str> {
         let exception_info = vmread(vmcs::control::VIRT_EXCEPTION_INFO_ADDR_FULL)?;
 
         if is_valid_page_aligned_phys_addr(exception_info) {
-            return Err("VMCS EPT violation exception info address is not a valid page-aligned physical address");
+            return Err("VMCS Ept violation exception info address is not a valid page-aligned physical address");
         }
     }
 

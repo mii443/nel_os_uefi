@@ -33,11 +33,11 @@ pub enum InitPhase {
 }
 
 pub enum ReadSel {
-    IRR,
-    ISR,
+    Irr,
+    Isr,
 }
 
-pub struct PIC {
+pub struct Pic {
     pub primary_mask: u8,
     pub secondary_mask: u8,
     pub primary_phase: InitPhase,
@@ -52,7 +52,7 @@ pub struct PIC {
     pub secondary_read_sel: ReadSel,
 }
 
-impl PIC {
+impl Pic {
     pub fn new() -> Self {
         Self {
             primary_mask: 0xFF,
@@ -65,8 +65,8 @@ impl PIC {
             primary_isr: 0,
             secondary_irr: 0,
             secondary_isr: 0,
-            primary_read_sel: ReadSel::IRR,
-            secondary_read_sel: ReadSel::IRR,
+            primary_read_sel: ReadSel::Irr,
+            secondary_read_sel: ReadSel::Irr,
         }
     }
 
@@ -160,10 +160,7 @@ impl PIC {
         vector: u32,
         error_code: Option<u32>,
     ) -> Result<(), &'static str> {
-        let has_error_code = match vector {
-            8 | 10..=14 | 17 | 21 => true,
-            _ => false,
-        };
+        let has_error_code = matches!(vector, 8 | 10..=14 | 17 | 21);
 
         let interrupt_info = EntryIntrInfo::new()
             .with_vector(vector as u8)
@@ -210,15 +207,15 @@ impl PIC {
         match qual.port() {
             0x20 => {
                 let v = match self.primary_read_sel {
-                    ReadSel::IRR => self.primary_irr,
-                    ReadSel::ISR => self.primary_isr,
+                    ReadSel::Irr => self.primary_irr,
+                    ReadSel::Isr => self.primary_isr,
                 };
                 regs.rax = v as u64;
             }
             0xA0 => {
                 let v = match self.secondary_read_sel {
-                    ReadSel::IRR => self.secondary_irr,
-                    ReadSel::ISR => self.secondary_isr,
+                    ReadSel::Irr => self.secondary_irr,
+                    ReadSel::Isr => self.secondary_isr,
                 };
                 regs.rax = v as u64;
             }
@@ -244,8 +241,8 @@ impl PIC {
         match qual.port() {
             0x20 => match dx {
                 0x11 => pic.primary_phase = InitPhase::Phase1,
-                0x0A => pic.primary_read_sel = ReadSel::ISR,
-                0x0B => pic.primary_read_sel = ReadSel::IRR,
+                0x0A => pic.primary_read_sel = ReadSel::Isr,
+                0x0B => pic.primary_read_sel = ReadSel::Irr,
                 0x20 => {
                     pic.primary_isr = 0;
                 }
@@ -253,7 +250,7 @@ impl PIC {
                     let irq = dx & 0x7;
                     pic.primary_isr &= !(1 << irq);
                 }
-                _ => panic!("Primary PIC command: {:#x}", dx),
+                _ => panic!("Primary Pic command: {:#x}", dx),
             },
             0x21 => match pic.primary_phase {
                 InitPhase::Uninitialized | InitPhase::Initialized => pic.primary_mask = dx,
@@ -265,14 +262,14 @@ impl PIC {
                     pic.primary_phase = InitPhase::Phase3;
                 }
                 InitPhase::Phase3 => {
-                    info!("Primary PIC Initialized");
+                    info!("Primary Pic Initialized");
                     pic.primary_phase = InitPhase::Initialized
                 }
             },
             0xA0 => match dx {
                 0x11 => pic.secondary_phase = InitPhase::Phase1,
-                0x0A => pic.secondary_read_sel = ReadSel::ISR,
-                0x0B => pic.secondary_read_sel = ReadSel::IRR,
+                0x0A => pic.secondary_read_sel = ReadSel::Isr,
+                0x0B => pic.secondary_read_sel = ReadSel::Irr,
                 0x20 => {
                     pic.secondary_isr = 0;
                 }
@@ -280,7 +277,7 @@ impl PIC {
                     let irq = dx & 0x7;
                     pic.secondary_isr &= !(1 << irq);
                 }
-                _ => panic!("Secondary PIC command: {:#x}", dx),
+                _ => panic!("Secondary Pic command: {:#x}", dx),
             },
             0xA1 => match pic.secondary_phase {
                 InitPhase::Uninitialized | InitPhase::Initialized => pic.secondary_mask = dx,
@@ -292,7 +289,7 @@ impl PIC {
                     pic.secondary_phase = InitPhase::Phase3;
                 }
                 InitPhase::Phase3 => {
-                    info!("Secondary PIC Initialized");
+                    info!("Secondary Pic Initialized");
                     pic.secondary_phase = InitPhase::Initialized
                 }
             },
@@ -353,13 +350,13 @@ impl IOBitmap {
         }
     }
 
-    fn get_bitmap_a(&self) -> &mut [u8] {
+    fn get_bitmap_a(&mut self) -> &mut [u8] {
         unsafe {
             core::slice::from_raw_parts_mut(self.bitmap_a.start_address().as_u64() as *mut u8, 4096)
         }
     }
 
-    fn get_bitmap_b(&self) -> &mut [u8] {
+    fn get_bitmap_b(&mut self) -> &mut [u8] {
         unsafe {
             core::slice::from_raw_parts_mut(self.bitmap_b.start_address().as_u64() as *mut u8, 4096)
         }

@@ -46,13 +46,13 @@ pub struct IntelVCpu {
     activated: bool,
     vmxon: vmxon::Vmxon,
     vmcs: vmcs::Vmcs,
-    ept: ept::EPT,
-    eptp: ept::EPTP,
+    ept: ept::Ept,
+    eptp: ept::Eptp,
     guest_memory_size: u64,
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
     pub ia32e_enabled: bool,
-    pic: super::io::PIC,
+    pic: super::io::Pic,
     io_bitmap: IOBitmap,
     pub pending_irq: u16,
     pub host_xcr0: u64,
@@ -155,8 +155,8 @@ impl IntelVCpu {
                 }
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
-                    info!("EPT Violation at guest address: {:#x}", guest_address);
-                    return Err("EPT Violation");
+                    info!("Ept Violation at guest address: {:#x}", guest_address);
+                    return Err("Ept Violation");
                 }
                 VmxExitReason::TRIPLE_FAULT => {
                     info!("Triple fault detected");
@@ -378,7 +378,7 @@ impl IntelVCpu {
             pages -= 1;
         }
 
-        let eptp = ept::EPTP::init(&self.ept.root_table);
+        let eptp = ept::Eptp::init(&self.ept.root_table);
         vmwrite(x86::vmx::vmcs::control::EPTP_FULL, u64::from(eptp))?;
 
         Ok(())
@@ -397,7 +397,7 @@ impl IntelVCpu {
 
         vmwrite(
             vmcs::host::RIP,
-            crate::vmm::x86_64::intel::asm::asm_vmexit_handler as u64,
+            crate::vmm::x86_64::intel::asm::asm_vmexit_handler as usize as u64,
         )?;
         vmwrite(
             vmcs::host::RSP,
@@ -556,11 +556,11 @@ impl IntelVCpu {
             return Ok(vaddr & 0xFFFFFFFF);
         }
 
-        let pml4_idx = ((vaddr >> 39) & 0x1FF) as u64;
-        let pdpt_idx = ((vaddr >> 30) & 0x1FF) as u64;
-        let pd_idx = ((vaddr >> 21) & 0x1FF) as u64;
-        let pt_idx = ((vaddr >> 12) & 0x1FF) as u64;
-        let page_offset = (vaddr & 0xFFF) as u64;
+        let pml4_idx = (vaddr >> 39) & 0x1FF;
+        let pdpt_idx = (vaddr >> 30) & 0x1FF;
+        let pd_idx = (vaddr >> 21) & 0x1FF;
+        let pt_idx = (vaddr >> 12) & 0x1FF;
+        let page_offset = vaddr & 0xFFF;
 
         let pml4_entry_addr = pml4_base + (pml4_idx * 8);
         let pml4_entry = self.read_guest_phys_u64(pml4_entry_addr)?;
@@ -609,7 +609,7 @@ impl IntelVCpu {
         for i in 0..8 {
             match self.ept.get(gpa + i) {
                 Ok(byte) => result_bytes[i as usize] = byte,
-                Err(_) => return Err("Failed to read from EPT"),
+                Err(_) => return Err("Failed to read from Ept"),
             }
         }
 
@@ -645,9 +645,9 @@ impl IntelVCpu {
         let exit_ctrl = vmread(x86::vmx::vmcs::control::VMEXIT_CONTROLS)?;
         info!("VM-exit controls: {:#x}", exit_ctrl);
 
-        // EPT pointer
+        // Ept pointer
         let eptp = vmread(x86::vmx::vmcs::control::EPTP_FULL)?;
-        info!("EPT pointer: {:#x}", eptp);
+        info!("Ept pointer: {:#x}", eptp);
 
         info!("=== Guest State ===");
 
@@ -899,8 +899,8 @@ impl VCpu for IntelVCpu {
 
         let vmcs = vmcs::Vmcs::new(frame_allocator)?;
 
-        let ept = ept::EPT::new(frame_allocator)?;
-        let eptp = ept::EPTP::init(&ept.root_table);
+        let ept = ept::Ept::new(frame_allocator)?;
+        let eptp = ept::Eptp::init(&ept.root_table);
 
         Ok(IntelVCpu {
             launch_done: false,
@@ -914,7 +914,7 @@ impl VCpu for IntelVCpu {
             host_msr: ShadowMsr::new(),
             guest_msr: ShadowMsr::new(),
             ia32e_enabled: false,
-            pic: super::io::PIC::new(),
+            pic: super::io::Pic::new(),
             io_bitmap: IOBitmap::new(frame_allocator),
             pending_irq: 0,
             host_xcr0: 0,

@@ -12,22 +12,12 @@ type MsrIndex = u32;
 
 const MAX_NUM_ENTS: usize = 512;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[repr(C, packed)]
 pub struct SavedMsr {
     pub index: MsrIndex,
     pub reserved: u32,
     pub data: u64,
-}
-
-impl Default for SavedMsr {
-    fn default() -> Self {
-        Self {
-            index: 0,
-            reserved: 0,
-            data: 0,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -124,6 +114,12 @@ pub fn _update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     )
     .unwrap();
     Ok(())
+}
+
+impl Default for ShadowMsr {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShadowMsr {

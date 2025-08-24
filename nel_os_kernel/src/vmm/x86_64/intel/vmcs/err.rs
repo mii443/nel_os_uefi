@@ -42,7 +42,7 @@ impl InstructionError {
         InstructionError::try_from(err).map_err(|_| "Unknown instruction error")
     }
 
-    pub fn to_str(&self) -> &'static str {
+    pub fn to_str(self) -> &'static str {
         match self {
             InstructionError::NOT_AVAILABLE => "Instruction not available",
             InstructionError::VMCALL_IN_VMXROOT => "VMCALL in VMX root operation",

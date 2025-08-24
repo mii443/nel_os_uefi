@@ -9,15 +9,15 @@ use x86_64::{
     PhysAddr,
 };
 
-pub struct EPT {
+pub struct Ept {
     pub root_table: PhysFrame,
 }
 
-impl EPT {
+impl Ept {
     pub fn new(allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str> {
         let root_table_frame = allocator
             .allocate_frame()
-            .ok_or("Failed to allocate EPT root table frame")?;
+            .ok_or("Failed to allocate Ept root table frame")?;
 
         Self::init_table(&root_table_frame);
 
@@ -289,7 +289,7 @@ impl EPT {
 #[bitfield]
 #[repr(u64)]
 #[derive(Debug)]
-pub struct EPTP {
+pub struct Eptp {
     pub typ: B3,
     pub level: B3,
     pub dirty_accessed: bool,
@@ -298,9 +298,9 @@ pub struct EPTP {
     pub phys: B52,
 }
 
-impl EPTP {
+impl Eptp {
     pub fn init(lv4_table: &PhysFrame) -> Self {
-        EPTP::new()
+        Eptp::new()
             .with_typ(6)
             .with_level(3)
             .with_dirty_accessed(true)
@@ -308,7 +308,7 @@ impl EPTP {
             .with_phys(lv4_table.start_address().as_u64() >> 12)
     }
 
-    pub fn get_lv4_table(&self) -> &mut [EntryBase; 512] {
+    pub fn get_lv4_table(&mut self) -> &mut [EntryBase; 512] {
         let table_ptr = self.phys() << 12;
 
         unsafe { &mut *(table_ptr as *mut [EntryBase; 512]) }

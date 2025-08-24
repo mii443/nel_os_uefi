@@ -30,7 +30,7 @@ use crate::{
     constant::{KERNEL_STACK_SIZE, PKG_VERSION},
     graphics::{FrameBuffer, FRAME_BUFFER},
     interrupt::apic,
-    memory::{allocator, memory::BitmapMemoryTable, paging},
+    memory::{allocator, bitmap::BitmapMemoryTable, paging},
 };
 
 pub static BZIMAGE_ADDR: Once<u64> = Once::new();
@@ -104,7 +104,7 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
         max_range = max_range.max(range.end);
     }
     info!("Usable memory: {}MiB", count / 1024 / 1024);
-    memory::memory::MAX_MEMORY.call_once(|| max_range as usize * 2);
+    memory::bitmap::MAX_MEMORY.call_once(|| max_range as usize * 2);
 
     let mut bitmap_table = BitmapMemoryTable::init(&boot_info.usable_memory);
     info!(
@@ -133,7 +133,7 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
 
     if boot_info.frame_buffer.is_some() {
         let frame_buffer =
-            FrameBuffer::from_raw_buffer(&boot_info.frame_buffer.as_ref().unwrap(), (64, 64, 64));
+            FrameBuffer::from_raw_buffer(boot_info.frame_buffer.as_ref().unwrap(), (64, 64, 64));
         frame_buffer.clear();
 
         FRAME_BUFFER.lock().replace(frame_buffer);

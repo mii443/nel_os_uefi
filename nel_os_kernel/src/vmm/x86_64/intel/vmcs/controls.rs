@@ -23,7 +23,7 @@ impl PinBasedVmExecutionControls {
     pub fn read() -> Result<Self, &'static str> {
         vmcs::VmcsControl32::PIN_BASED_VM_EXECUTION_CONTROLS
             .read()
-            .map(|value| PinBasedVmExecutionControls::from(value))
+            .map(PinBasedVmExecutionControls::from)
             .map_err(|_| "Failed to read Pin-Based VM Execution Controls")
     }
 
@@ -70,7 +70,7 @@ impl PrimaryProcessorBasedVmExecutionControls {
     pub fn read() -> Result<Self, &'static str> {
         vmcs::VmcsControl32::PRIMARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS
             .read()
-            .map(|value| PrimaryProcessorBasedVmExecutionControls::from(value))
+            .map(PrimaryProcessorBasedVmExecutionControls::from)
             .map_err(|_| "Failed to read Primary Processor-Based VM Execution Controls")
     }
 
@@ -121,7 +121,7 @@ impl SecondaryProcessorBasedVmExecutionControls {
     pub fn read() -> Result<Self, &'static str> {
         vmcs::VmcsControl32::SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS
             .read()
-            .map(|value| SecondaryProcessorBasedVmExecutionControls::from(value))
+            .map(SecondaryProcessorBasedVmExecutionControls::from)
             .map_err(|_| "Failed to read Secondary Processor-Based VM Execution Controls")
     }
 
@@ -158,7 +158,7 @@ impl EntryControls {
     pub fn read() -> Result<Self, &'static str> {
         vmcs::VmcsControl32::VM_ENTRY_CONTROLS
             .read()
-            .map(|value| EntryControls::from(value))
+            .map(EntryControls::from)
             .map_err(|_| "Failed to read VM Entry Controls")
     }
 
@@ -200,7 +200,7 @@ impl PrimaryExitControls {
     pub fn read() -> Result<Self, &'static str> {
         vmcs::VmcsControl32::PRIMARY_VM_EXIT_CONTROLS
             .read()
-            .map(|value| PrimaryExitControls::from(value))
+            .map(PrimaryExitControls::from)
             .map_err(|_| "Failed to read Primary VM Exit Controls")
     }
 
