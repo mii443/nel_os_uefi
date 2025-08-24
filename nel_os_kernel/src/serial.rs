@@ -56,6 +56,18 @@ pub fn write_byte(byte: u8) {
     });
 }
 
+#[inline(always)]
+pub fn write_bytes(bytes: &[u8]) {
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        let mut serial = SERIAL1.lock();
+        for &b in bytes {
+            serial.send(b);
+        }
+    });
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
