@@ -47,6 +47,15 @@ pub fn _print(args: ::core::fmt::Arguments) {
     });
 }
 
+#[inline(always)]
+pub fn write_byte(byte: u8) {
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        SERIAL1.lock().send(byte);
+    });
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {

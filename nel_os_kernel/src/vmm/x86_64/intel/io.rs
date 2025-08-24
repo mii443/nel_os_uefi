@@ -1,10 +1,14 @@
-use x86::vmx::{self, vmcs};
+use x86::{
+    io::inb,
+    vmx::{self, vmcs},
+};
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
 use super::qual::QualIo;
 use crate::{
     info,
     interrupt::subscriber::InterruptContext,
+    serial,
     vmm::x86_64::intel::{
         register::GuestRegisters, vmcs::controls::EntryIntrInfo, vmread, vmwrite,
     },
@@ -37,6 +41,12 @@ pub enum ReadSel {
     Isr,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Serial {
+    pub ier: u8,
+    pub mcr: u8,
+}
+
 pub struct Pic {
     pub primary_mask: u8,
     pub secondary_mask: u8,
@@ -50,6 +60,7 @@ pub struct Pic {
     pub secondary_isr: u8,
     pub primary_read_sel: ReadSel,
     pub secondary_read_sel: ReadSel,
+    pub serial: Serial,
 }
 
 impl Pic {
@@ -67,6 +78,7 @@ impl Pic {
             secondary_isr: 0,
             primary_read_sel: ReadSel::Irr,
             secondary_read_sel: ReadSel::Irr,
+            serial: Serial::default(),
         }
     }
 
@@ -188,6 +200,7 @@ impl Pic {
             0x20..=0x21 => self.handle_pic_in(regs, qual),
             0xA0..=0xA1 => self.handle_pic_in(regs, qual),
             0x0070..=0x0071 => regs.rax = 0,
+            0x03F..=0x03FF => self.handle_serial_in(regs, qual),
             _ => regs.rax = 0,
         }
     }
@@ -198,8 +211,40 @@ impl Pic {
             0xC000..=0xCFFF => {} //ignore
             0x20..=0x21 => self.handle_pic_out(regs, qual),
             0xA0..=0xA1 => self.handle_pic_out(regs, qual),
+            0x03F8..=0x03FF => self.handle_serial_out(regs, qual),
             0x0070..=0x0071 => {} //ignore
             _ => {}
+        }
+    }
+
+    fn handle_serial_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
+        match qual.port() {
+            0x3F8 => regs.rax = unsafe { inb(qual.port()).into() },
+            0x3F9 => regs.rax = self.serial.ier as u64,
+            0x3FA => regs.rax = unsafe { inb(qual.port()).into() },
+            0x3FB => regs.rax = 0,
+            0x3FC => regs.rax = self.serial.mcr as u64,
+            0x3FD => regs.rax = unsafe { inb(qual.port()).into() },
+            0x3FE => regs.rax = unsafe { inb(qual.port()).into() },
+            0x3FF => regs.rax = 0,
+            _ => {
+                panic!("Serial in: invalid port: {:#x}", qual.port());
+            }
+        }
+    }
+
+    fn handle_serial_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
+        match qual.port() {
+            0x3F8 => serial::write_byte(regs.rax as u8),
+            0x3F9 => self.serial.ier = regs.rax as u8,
+            0x3FA => {}
+            0x3FB => {}
+            0x3FC => self.serial.mcr = regs.rax as u8,
+            0x3FD => {}
+            0x3FF => {}
+            _ => {
+                panic!("Serial out: invalid port: {:#x}", qual.port());
+            }
         }
     }
 
@@ -324,7 +369,6 @@ impl IOBitmap {
             core::ptr::write_bytes(bitmap_b_addr as *mut u8, u8::MAX, 4096);
         }
 
-        self.set_io_ports(0x02F8..=0x03FF);
         self.set_io_ports(0x0040..=0x0047);
 
         vmwrite(vmcs::control::IO_BITMAP_A_ADDR_FULL, bitmap_a_addr as u64)?;
