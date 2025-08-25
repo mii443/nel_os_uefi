@@ -52,9 +52,8 @@ pub struct IntelVCpu {
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
     pub ia32e_enabled: bool,
-    pic: super::io::Pic,
+    pub pic: super::io::Pic,
     io_bitmap: IOBitmap,
-    pub pending_irq: u16,
     pub host_xcr0: u64,
     pub guest_xcr0: XCR0,
 }
@@ -87,10 +86,7 @@ impl IntelVCpu {
 
             match exit_reason {
                 VmxExitReason::HLT => {
-                    let injected = self
-                        .pic
-                        .inject_external_interrupt(&mut self.pending_irq)
-                        .unwrap_or(false);
+                    let injected = self.pic.inject_external_interrupt().unwrap_or(false);
 
                     if !injected {
                         unsafe {
@@ -151,7 +147,7 @@ impl IntelVCpu {
                         asm!("cli");
                     }
 
-                    self.pic.inject_external_interrupt(&mut self.pending_irq)?;
+                    self.pic.inject_external_interrupt()?;
                 }
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
@@ -916,7 +912,6 @@ impl VCpu for IntelVCpu {
             ia32e_enabled: false,
             pic: super::io::Pic::new(),
             io_bitmap: IOBitmap::new(frame_allocator),
-            pending_irq: 0,
             host_xcr0: 0,
             guest_xcr0: XCR0::new(),
         })

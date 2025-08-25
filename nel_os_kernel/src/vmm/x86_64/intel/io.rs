@@ -23,7 +23,7 @@ pub fn vmm_interrupt_subscriber(vcpu_ptr: *mut core::ffi::c_void, context: &Inte
 
     if 0x20 <= context.vector && context.vector <= 0x20 + 16 {
         let irq = context.vector - 0x20;
-        vcpu.pending_irq |= 1 << irq;
+        vcpu.pic.pending_irq |= 1 << irq;
     }
 }
 
@@ -61,6 +61,7 @@ pub struct Pic {
     pub primary_read_sel: ReadSel,
     pub secondary_read_sel: ReadSel,
     pub serial: Serial,
+    pub pending_irq: u16,
 }
 
 impl Pic {
@@ -79,6 +80,7 @@ impl Pic {
             primary_read_sel: ReadSel::Irr,
             secondary_read_sel: ReadSel::Irr,
             serial: Serial::default(),
+            pending_irq: 0,
         }
     }
 
@@ -94,11 +96,8 @@ impl Pic {
         }
     }
 
-    pub fn inject_external_interrupt(
-        &mut self,
-        pending_irq: &mut u16,
-    ) -> Result<bool, &'static str> {
-        let pending = *pending_irq;
+    pub fn inject_external_interrupt(&mut self) -> Result<bool, &'static str> {
+        let pending = self.pending_irq;
 
         if pending == 0 {
             return Ok(false);
@@ -160,7 +159,7 @@ impl Pic {
                 u32::from(interrupt_info) as u64,
             )?;
 
-            *pending_irq &= !irq_bit;
+            self.pending_irq &= !irq_bit;
             return Ok(true);
         }
 
@@ -234,9 +233,17 @@ impl Pic {
     }
 
     fn handle_serial_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
+        if matches!(qual.port(), 0x3F9 | 0x3FC) {
+            info!("Serial out: port={:#x}, value={:#x}", qual.port(), regs.rax);
+        }
         match qual.port() {
             0x3F8 => serial::write_byte(regs.rax as u8),
-            0x3F9 => self.serial.ier = regs.rax as u8,
+            0x3F9 => {
+                self.serial.ier = regs.rax as u8;
+                if regs.rax & 0x1 != 0 {
+                    self.pending_irq |= 4;
+                }
+            }
             0x3FA => {}
             0x3FB => {}
             0x3FC => self.serial.mcr = regs.rax as u8,
@@ -370,7 +377,7 @@ impl IOBitmap {
         }
 
         self.set_io_ports(0x0040..=0x0047);
-        self.set_io_ports(0x02F8..=0x03EF);
+        //self.set_io_ports(0x02F8..=0x03EF);
 
         vmwrite(vmcs::control::IO_BITMAP_A_ADDR_FULL, bitmap_a_addr as u64)?;
         vmwrite(vmcs::control::IO_BITMAP_B_ADDR_FULL, bitmap_b_addr as u64)?;
