@@ -220,12 +220,20 @@ impl Pic {
         match qual.port() {
             0x3F8 => regs.rax = unsafe { inb(qual.port()).into() },
             0x3F9 => regs.rax = self.serial.ier as u64,
-            0x3FA => regs.rax = unsafe { inb(qual.port()).into() },
-            0x3FB => regs.rax = 0,
-            0x3FC => regs.rax = self.serial.mcr as u64,
-            0x3FD => regs.rax = unsafe { inb(qual.port()).into() },
-            0x3FE => regs.rax = unsafe { inb(qual.port()).into() },
-            0x3FF => regs.rax = 0,
+            0x3FA => {} //regs.rax = 0, //  unsafe { inb(qual.port()).into() },
+            0x3FB => {} //regs.rax = 0,
+            0x3FC => {} //regs.rax = 0, //self.serial.mcr as u64,
+            0x3FD => {
+                if qual.size() == 1 {
+                    regs.rax = 0x60
+                }
+            }
+            0x3FE => {
+                if qual.size() == 1 {
+                    regs.rax = 0xb0
+                }
+            }
+            0x3FF => {} //regs.rax = 0,
             _ => {
                 panic!("Serial in: invalid port: {:#x}", qual.port());
             }
@@ -233,15 +241,12 @@ impl Pic {
     }
 
     fn handle_serial_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
-        if matches!(qual.port(), 0x3F9 | 0x3FC) {
-            info!("Serial out: port={:#x}, value={:#x}", qual.port(), regs.rax);
-        }
         match qual.port() {
             0x3F8 => serial::write_byte(regs.rax as u8),
             0x3F9 => {
                 self.serial.ier = regs.rax as u8;
-                if regs.rax & 0x1 != 0 {
-                    self.pending_irq |= 4;
+                if regs.rax & 0b10 != 0 {
+                    self.pending_irq |= 1 << 4;
                 }
             }
             0x3FA => {}
