@@ -129,6 +129,31 @@ pub struct RawVmcb {
     pub avic_enable: bool,
     pub v_intr_vector: B8,
     _reserved9: B24,
+    // 068h
+    pub interrupt_shadow: bool,
+    pub guest_interrupt_mask: bool,
+    _reserved10: B62,
+    // 070h
+    pub exit_code: B64,
+    // 078h
+    pub exit_info1: B64,
+    // 080h
+    pub exit_info2: B64,
+    // 088h
+    pub exit_int_info: B64,
+    // 090h
+    pub np_enable: bool,
+    pub enable_sev: bool,
+    pub enable_encrypted_state: bool,
+    pub guest_mode_execution_trap: bool,
+    pub sss_check_enable: bool,
+    pub virtual_transparent_encryption: bool,
+    pub enable_read_only_guest_page_table: bool,
+    pub enable_invlpgb_and_tlbsync: bool,
+    _reserved11: B56,
+    // 098h
+    _reserved12: B12,
+    pub avic_apic_bar: B52,
 }
 
 #[derive(Specifier, Debug, Clone, Copy, PartialEq, Eq)]
