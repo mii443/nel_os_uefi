@@ -1,2 +1,2 @@
 pub mod vcpu;
-mod vmcb;
+pub mod vmcb;

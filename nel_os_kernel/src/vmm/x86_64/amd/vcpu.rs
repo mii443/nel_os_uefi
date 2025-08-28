@@ -13,6 +13,17 @@ pub struct AMDVCpu {
     vmcb: Vmcb,
 }
 
+impl AMDVCpu {
+    pub fn setup(&mut self) -> Result<(), &'static str> {
+        info!("Setting up AMD VCPU");
+
+        let raw_vmcb = self.vmcb.get_raw_vmcb();
+        raw_vmcb.set_intercept_hlt(true);
+
+        Ok(())
+    }
+}
+
 impl VCpu for AMDVCpu {
     fn run(
         &mut self,
