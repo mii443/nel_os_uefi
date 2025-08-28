@@ -3,18 +3,21 @@ use x86_64::structures::paging::{FrameAllocator, Size4KiB};
 
 use crate::{
     error, info,
-    vmm::{x86_64::common, VCpu},
+    vmm::{
+        x86_64::{amd::vmcb::Vmcb, common},
+        VCpu,
+    },
 };
 
-pub struct AMDVCpu;
+pub struct AMDVCpu {
+    vmcb: Vmcb,
+}
 
 impl VCpu for AMDVCpu {
     fn run(
         &mut self,
         _frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
-        info!("VCpu on AMD");
-
         Ok(())
     }
 
@@ -39,7 +42,7 @@ impl VCpu for AMDVCpu {
         unimplemented!("AMDVCpu::get_guest_memory_size is not implemented yet")
     }
 
-    fn new(_frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
+    fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
     where
         Self: Sized,
     {
@@ -47,7 +50,9 @@ impl VCpu for AMDVCpu {
         efer |= 1 << 12;
         common::write_msr(0xc000_0080, efer);
 
-        Ok(AMDVCpu)
+        Ok(AMDVCpu {
+            vmcb: Vmcb::new(frame_allocator)?,
+        })
     }
 
     fn is_supported() -> bool
