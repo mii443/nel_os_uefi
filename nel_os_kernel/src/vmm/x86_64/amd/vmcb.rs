@@ -154,6 +154,26 @@ pub struct RawVmcb {
     // 098h
     _reserved12: B12,
     pub avic_apic_bar: B52,
+    // 0A0h
+    pub ghcb_gpa: B64,
+    // 0A8h
+    pub event_injection: B64,
+    // 0B0h
+    pub n_cr3: B64,
+    // 0D8h
+    pub lbr_virtualization_enable: bool,
+    pub vmload_vmsave_virtualization_enable: bool,
+    pub ibs_virtualization_enable: bool,
+    pub pmc_virtualization_enable: bool,
+    _reserved13: B60,
+    // 0C0h
+    pub vmcb_clean_bits: B32,
+    _reserved14: B32,
+    // 0C8h
+    pub next_rip: B64,
+    // 0D0h
+    pub fetched_bytes: B8,
+    pub gutest_instruction_bytes: B120,
 }
 
 #[derive(Specifier, Debug, Clone, Copy, PartialEq, Eq)]
