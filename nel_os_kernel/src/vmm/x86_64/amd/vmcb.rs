@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use modular_bitfield::{bitfield, prelude::*};
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
@@ -81,4 +83,63 @@ pub struct RawVmcb {
     pub intercept_write_efer_after_guest_inst_finish: bool,
     pub intercept_write_cr0_after_guest_inst_finish: B16,
     // 014h
+    pub intercept_all_invlpgb: bool,
+    pub intercept_illegally_specified_invlpgb: bool,
+    pub intercept_invpcid: bool,
+    pub intercept_mcommit: bool,
+    pub intercept_tlbsync: bool,
+    pub intercept_bus_lock: bool,
+    pub intercept_idle_hlt: bool,
+    _reserved1: B25,
+    // 018h-03Bh
+    _reserved2: B128,
+    _reserved3: B128,
+    _reserved4: B32,
+    // 03Ch
+    pub pause_filter_threshold: B16,
+    // 03Eh
+    pub pause_filter_count: B16,
+    // 040h
+    pub iopm_base_physical_address: B64,
+    // 048h
+    pub msrpm_base_physical_address: B64,
+    // 050h
+    pub tsc_offset: B64,
+    // 058h
+    pub guest_asid: B32,
+    pub tlb_control: TlbControl,
+    pub allow_larger_rap: bool,
+    pub clear_rap_on_vmrun: bool,
+    _reserved5: B22,
+    // 060h
+    pub v_tpr: B8,
+    pub v_irq: bool,
+    pub vgif: bool,
+    pub v_nmi: bool,
+    pub v_nmi_mask: bool,
+    _reserved6: B3,
+    pub v_intr_prio: B4,
+    pub v_ign_tpr: bool,
+    _reserved7: B3,
+    pub v_intr_masking: bool,
+    pub amd_virtual_gif: bool,
+    pub v_nmi_enable: bool,
+    _reserved8: B3,
+    pub x2avic_enable: bool,
+    pub avic_enable: bool,
+    pub v_intr_vector: B8,
+    _reserved9: B24,
+}
+
+#[derive(Specifier, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TlbControl {
+    DoNothing = 0,
+    FlushAll = 1,
+    _RESERVED1 = 2,
+    FlushGuest = 3,
+    _RESERVED2 = 4,
+    FlushHost = 5,
+    _RESERVED3 = 6,
+    FlushGuestNonGlobal = 7,
 }
