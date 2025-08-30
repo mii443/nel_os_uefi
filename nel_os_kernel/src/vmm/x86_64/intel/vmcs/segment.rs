@@ -26,14 +26,16 @@ pub struct SegmentRights {
     pub desc_type: DescriptorType,
     pub dpl: B2,
     pub present: bool,
-    _reserved: B4,
+    #[skip]
+    __: B4,
     pub avl: bool,
     pub long: bool,
     pub db: bool,
     #[bits = 1]
     pub granularity: Granularity,
     pub unusable: bool,
-    _reserved2: B15,
+    #[skip]
+    __: B15,
 }
 
 impl Default for SegmentRights {

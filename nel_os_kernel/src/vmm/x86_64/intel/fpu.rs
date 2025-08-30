@@ -28,7 +28,8 @@ pub struct XCR0 {
     pub xtilecfg: bool,
     pub xtiledata: bool,
     pub apx: bool,
-    _reserved: B44,
+    #[skip]
+    __: B44,
 }
 
 pub fn set_xcr(vcpu: &mut IntelVCpu, index: u32, xcr: u64) -> Result<(), &'static str> {

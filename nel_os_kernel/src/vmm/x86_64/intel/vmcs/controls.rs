@@ -9,14 +9,17 @@ use crate::vmm::x86_64::intel::vmcs;
 #[derive(Debug, Clone, Copy)]
 pub struct PinBasedVmExecutionControls {
     pub external_interrupt_exiting: bool,
-    _reserved1: B1,
+    #[skip]
+    __: B1,
     pub interrupt_window_exiting: bool,
     pub nmi_exiting: bool,
-    _reserved2: B1,
+    #[skip]
+    __: B1,
     pub virtual_nmi: bool,
     pub activate_vmx_preemption_timer: bool,
     pub process_posted_interrupts: bool,
-    _reserved3: B24,
+    #[skip]
+    __: B24,
 }
 
 impl PinBasedVmExecutionControls {
@@ -36,21 +39,26 @@ impl PinBasedVmExecutionControls {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 pub struct PrimaryProcessorBasedVmExecutionControls {
-    _reserved1: B2,
+    #[skip]
+    __: B2,
     pub interrupt_window: bool,
     pub tsc_offsetting: bool,
-    _reserved2: B3,
+    #[skip]
+    __: B3,
     pub hlt: bool,
-    _reserved3: B1,
+    #[skip]
+    __: B1,
     pub invlpg: bool,
     pub mwait: bool,
     pub rdpmc: bool,
     pub rdtsc: bool,
-    _reserved4: B2,
+    #[skip]
+    __: B2,
     pub cr3load: bool,
     pub cr3store: bool,
     pub activate_teritary_controls: bool,
-    _reserved5: B1,
+    #[skip]
+    __: B1,
     pub cr8load: bool,
     pub cr8store: bool,
     pub use_tpr_shadow: bool,
@@ -58,7 +66,8 @@ pub struct PrimaryProcessorBasedVmExecutionControls {
     pub mov_dr: bool,
     pub unconditional_io: bool,
     pub use_io_bitmap: bool,
-    _reserved6: B1,
+    #[skip]
+    __: B1,
     pub monitor_trap: bool,
     pub use_msr_bitmap: bool,
     pub monitor: bool,
@@ -114,7 +123,8 @@ pub struct SecondaryProcessorBasedVmExecutionControls {
     pub enable_enclv: bool,
     pub vmm_buslock_detect: bool,
     pub instruction_timeout: bool,
-    _reserved: B1,
+    #[skip]
+    __: B1,
 }
 
 impl SecondaryProcessorBasedVmExecutionControls {
@@ -134,13 +144,16 @@ impl SecondaryProcessorBasedVmExecutionControls {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 pub struct EntryControls {
-    _reserved1: B2,
+    #[skip]
+    __: B2,
     pub load_debug_controls: bool,
-    _reserved2: B6,
+    #[skip]
+    __: B6,
     pub ia32e_mode_guest: bool,
     pub entry_smm: bool,
     pub deactivate_dualmonitor: bool,
-    _reserved3: B1,
+    #[skip]
+    __: B1,
     pub load_perf_global_ctrl: bool,
     pub load_ia32_pat: bool,
     pub load_ia32_efer: bool,
@@ -151,7 +164,8 @@ pub struct EntryControls {
     pub load_cet_state: bool,
     pub load_guest_lbr_ctl: bool,
     pub load_pkrs: bool,
-    _reserved4: B9,
+    #[skip]
+    __: B9,
 }
 
 impl EntryControls {
@@ -171,15 +185,20 @@ impl EntryControls {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 pub struct PrimaryExitControls {
-    _reserved1: B2,
+    #[skip]
+    __: B2,
     pub save_debug: bool,
-    _reserved2: B6,
+    #[skip]
+    __: B6,
     pub host_addr_space_size: bool,
-    _reserved3: B3,
+    #[skip]
+    __: B3,
     pub load_perf_global_ctrl: bool,
-    _reserved4: B1,
+    #[skip]
+    __: B1,
     pub ack_interrupt_onexit: bool,
-    _reserved5: B2,
+    #[skip]
+    __: B2,
     pub save_ia32_pat: bool,
     pub load_ia32_pat: bool,
     pub save_ia32_efer: bool,
@@ -216,6 +235,7 @@ pub struct EntryIntrInfo {
     pub vector: B8,
     pub typ: B3,
     pub ec_available: bool,
-    _reserved: B19,
+    #[skip]
+    __: B19,
     pub valid: bool,
 }

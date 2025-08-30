@@ -90,11 +90,15 @@ pub struct RawVmcb {
     pub intercept_tlbsync: bool,
     pub intercept_bus_lock: bool,
     pub intercept_idle_hlt: bool,
-    _reserved1: B25,
+    #[skip]
+    __: B25,
     // 018h-03Bh
-    _reserved2: B128,
-    _reserved3: B128,
-    _reserved4: B32,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B32,
     // 03Ch
     pub pause_filter_threshold: B16,
     // 03Eh
@@ -110,29 +114,35 @@ pub struct RawVmcb {
     pub tlb_control: TlbControl,
     pub allow_larger_rap: bool,
     pub clear_rap_on_vmrun: bool,
-    _reserved5: B22,
+    #[skip]
+    __: B22,
     // 060h
     pub v_tpr: B8,
     pub v_irq: bool,
     pub vgif: bool,
     pub v_nmi: bool,
     pub v_nmi_mask: bool,
-    _reserved6: B3,
+    #[skip]
+    __: B3,
     pub v_intr_prio: B4,
     pub v_ign_tpr: bool,
-    _reserved7: B3,
+    #[skip]
+    __: B3,
     pub v_intr_masking: bool,
     pub amd_virtual_gif: bool,
     pub v_nmi_enable: bool,
-    _reserved8: B3,
+    #[skip]
+    __: B3,
     pub x2avic_enable: bool,
     pub avic_enable: bool,
     pub v_intr_vector: B8,
-    _reserved9: B24,
+    #[skip]
+    __: B24,
     // 068h
     pub interrupt_shadow: bool,
     pub guest_interrupt_mask: bool,
-    _reserved10: B62,
+    #[skip]
+    __: B62,
     // 070h
     pub exit_code: B64,
     // 078h
@@ -150,10 +160,12 @@ pub struct RawVmcb {
     pub virtual_transparent_encryption: bool,
     pub enable_read_only_guest_page_table: bool,
     pub enable_invlpgb_and_tlbsync: bool,
-    _reserved11: B56,
+    #[skip]
+    __: B56,
     // 098h
-    _reserved12: B12,
     pub avic_apic_bar: B52,
+    #[skip]
+    __: B12,
     // 0A0h
     pub ghcb_gpa: B64,
     // 0A8h
@@ -165,15 +177,54 @@ pub struct RawVmcb {
     pub vmload_vmsave_virtualization_enable: bool,
     pub ibs_virtualization_enable: bool,
     pub pmc_virtualization_enable: bool,
-    _reserved13: B60,
+    #[skip]
+    __: B60,
     // 0C0h
     pub vmcb_clean_bits: B32,
-    _reserved14: B32,
+    #[skip]
+    __: B32,
     // 0C8h
     pub next_rip: B64,
     // 0D0h
     pub fetched_bytes: B8,
     pub gutest_instruction_bytes: B120,
+    // 0E0h
+    pub avic_apic_backing_page_pointer: B52,
+    #[skip]
+    __: B12,
+    // 0E8-0EFh Reserved
+    #[skip]
+    __: B64,
+    #[skip]
+    __: B64,
+    #[skip]
+    __: B64,
+    #[skip]
+    __: B64,
+    // 0F0h
+    #[skip]
+    __: B12,
+    pub avic_logical_table_pointer: B40,
+    #[skip]
+    __: B12,
+    // 0F8h
+    pub avic_physical_max_index: B12,
+    pub avic_physical_table_pointer: B40,
+    #[skip]
+    __: B12,
+    // 100h-107h Reserved
+    #[skip]
+    __: B64,
+    // 108h
+    #[skip]
+    __: B12,
+    pub vmsa_pointer: B40,
+    #[skip]
+    __: B12,
+    // 110h
+    pub vmgexit_rax: B64,
+    // 118h
+    pub vmgexit_cpl: B8,
 }
 
 #[derive(Specifier, Debug, Clone, Copy, PartialEq, Eq)]
