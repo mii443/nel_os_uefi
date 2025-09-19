@@ -66,7 +66,7 @@ pub struct RawVmcb {
     pub intercept_shutdown: bool,
     // 010h
     pub intercept_vmrun: bool,
-    pub intercept_vmcall: bool,
+    pub intercept_vmmcall: bool,
     pub intercept_vmload: bool,
     pub intercept_vmsave: bool,
     pub intercept_stgi: bool,
@@ -98,7 +98,7 @@ pub struct RawVmcb {
     #[skip]
     __: B128,
     #[skip]
-    __: B32,
+    __: B25,
     // 03Ch
     pub pause_filter_threshold: B16,
     // 03Eh
@@ -120,6 +120,8 @@ pub struct RawVmcb {
     pub v_tpr: B8,
     pub v_irq: bool,
     pub vgif: bool,
+    #[skip]
+    __: B1,
     pub v_nmi: bool,
     pub v_nmi_mask: bool,
     #[skip]
@@ -172,7 +174,7 @@ pub struct RawVmcb {
     pub event_injection: B64,
     // 0B0h
     pub n_cr3: B64,
-    // 0D8h
+    // 0B8h
     pub lbr_virtualization_enable: bool,
     pub vmload_vmsave_virtualization_enable: bool,
     pub ibs_virtualization_enable: bool,
@@ -187,7 +189,7 @@ pub struct RawVmcb {
     pub next_rip: B64,
     // 0D0h
     pub fetched_bytes: B8,
-    pub gutest_instruction_bytes: B120,
+    pub guest_instruction_bytes: B120,
     // 0E0h
     pub avic_apic_backing_page_pointer: B52,
     #[skip]
@@ -225,6 +227,114 @@ pub struct RawVmcb {
     pub vmgexit_rax: B64,
     // 118h
     pub vmgexit_cpl: B8,
+    // 120h
+    pub bus_lock_threshold_counter: B16,
+    // 128h-133h Reserved
+    #[skip]
+    __: B96,
+    // 134h
+    pub update_irr: bool,
+    #[skip]
+    __: B63,
+    // 138h
+    pub allowed_sev_features_mask: B62,
+    #[skip]
+    __: B1,
+    pub allowed_sev_features_en: bool,
+    // 140h
+    pub guest_sev_features: B62,
+    #[skip]
+    __: B2,
+    // 148h
+    #[skip]
+    __: B8,
+    // 150h
+    pub requested_irr_lo: B128,
+    pub requested_irr_hi: B128,
+    // 170h-3DFh Reserved
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B121,
+    // 3E0h-3FFh Reserved
+    #[skip]
+    __: B128,
+    #[skip]
+    __: B121,
 }
 
 #[derive(Specifier, Debug, Clone, Copy, PartialEq, Eq)]
