@@ -382,7 +382,8 @@ impl IOBitmap {
         }
 
         self.set_io_ports(0x0040..=0x0047);
-        //self.set_io_ports(0x02F8..=0x03EF);
+        self.set_io_ports(0x02F8..=0x03EF);
+        self.set_io_ports(0x03F8..=0x03FF);
 
         vmwrite(vmcs::control::IO_BITMAP_A_ADDR_FULL, bitmap_a_addr as u64)?;
         vmwrite(vmcs::control::IO_BITMAP_B_ADDR_FULL, bitmap_b_addr as u64)?;
