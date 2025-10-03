@@ -28,11 +28,7 @@ pub struct RawVmcb {
 
 #[repr(C, align(1024))]
 #[derive(Debug, Clone, Copy)]
-pub struct VmcbControlArea {}
-
-#[repr(C, align(1024))]
-#[derive(Debug, Clone, Copy)]
-pub struct VmcbStateSaveArea {
+pub struct VmcbControlArea {
     pub intercept_cr_read: u16,
     pub intercept_cr_write: u16,
     pub intercept_dr_read: u16,
@@ -95,4 +91,13 @@ pub struct VmcbStateSaveArea {
     pub intercept_tlbsync: bool,
     pub intercept_bus_lock: bool,
     pub intercept_hlt_not_pending: bool,
+    pub _reserved1: [u8; 3],
+    pub _reserved2: bool,
+    pub _reserved3: [u8; 0x03c - 0x018],
+    pub pause_filter_threshold: u16,
+    pub pause_filter_count: u16,
 }
+
+#[repr(C, align(1024))]
+#[derive(Debug, Clone, Copy)]
+pub struct VmcbStateSaveArea {}

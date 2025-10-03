@@ -18,7 +18,7 @@ impl AMDVCpu {
         info!("Setting up AMD VCPU");
 
         let raw_vmcb = self.vmcb.get_raw_vmcb();
-        raw_vmcb.set_intercept_hlt(true);
+        raw_vmcb.control_area.intercept_hlt = true;
 
         Ok(())
     }
