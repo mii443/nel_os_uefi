@@ -92,7 +92,23 @@ impl VCpu for AMDVCpu {
                 self.setup().expect("Failed to setup AMD VCPU");
                 self.initialized = true;
             }
-            info!("{:?}", self.vmcb.get_raw_vmcb());
+            info!("VMCB: {:?}", self.vmcb.get_raw_vmcb());
+            info!(
+                "VMCB Control area Size: {}",
+                core::mem::size_of::<crate::vmm::x86_64::amd::vmcb::VmcbControlArea>()
+            );
+            info!(
+                "VMCB State Save area Size: {}",
+                core::mem::size_of::<crate::vmm::x86_64::amd::vmcb::VmcbStateSaveArea>()
+            );
+            info!(
+                "VMCB Size: {}",
+                core::mem::size_of_val(self.vmcb.get_raw_vmcb())
+            );
+            info!(
+                "VMCB Physical Address: {:x}",
+                self.vmcb.frame.start_address().as_u64()
+            );
             super::vmrun(self.vmcb.frame.start_address().as_u64());
         });
         Ok(())

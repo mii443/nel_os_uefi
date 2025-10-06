@@ -21,7 +21,7 @@ impl Vmcb {
     }
 }
 
-#[repr(C, align(4096))]
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RawVmcb {
     pub control_area: VmcbControlArea,
@@ -190,7 +190,7 @@ bitflags! {
     }
 }
 
-#[repr(C, align(1024))]
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VmcbControlArea {
     // Offset 0x000
@@ -334,7 +334,7 @@ pub struct VmcbSegment {
     pub base: u64,
 }
 
-#[repr(C, align(1024))]
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VmcbStateSaveArea {
     // Offset 0x000
