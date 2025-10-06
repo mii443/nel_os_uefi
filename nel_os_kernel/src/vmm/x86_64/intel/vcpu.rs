@@ -15,7 +15,7 @@ use crate::{
     info, interrupt,
     vmm::{
         x86_64::{
-            common::{self, read_msr},
+            common::{self, read_msr, X86VCpu},
             intel::{
                 auditor, controls, cpuid, ept,
                 fpu::{self, XCR0},
@@ -35,7 +35,6 @@ use crate::{
         VCpu,
     },
 };
-
 const TEMP_STACK_SIZE: usize = 4096;
 static mut TEMP_STACK: [u8; TEMP_STACK_SIZE + 0x10] = [0; TEMP_STACK_SIZE + 0x10];
 
@@ -932,5 +931,27 @@ impl VCpu for IntelVCpu {
             return false;
         }
         true
+    }
+}
+
+impl X86VCpu for IntelVCpu {
+    fn set_segment_rights(
+        &mut self,
+        segment: common::segment::Segment,
+        rights: common::segment::SegmentRights,
+    ) {
+        todo!()
+    }
+
+    fn set_segment_base(&mut self, segment: common::segment::Segment, base: u64) {
+        todo!()
+    }
+
+    fn set_segment_limit(&mut self, segment: common::segment::Segment, limit: u32) {
+        todo!()
+    }
+
+    fn set_segment_selector(&mut self, segment: common::segment::Segment, selector: u16) {
+        todo!()
     }
 }

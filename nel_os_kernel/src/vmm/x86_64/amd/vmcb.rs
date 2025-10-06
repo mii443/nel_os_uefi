@@ -25,6 +25,7 @@ impl Vmcb {
 #[derive(Debug, Clone, Copy)]
 pub struct RawVmcb {
     pub control_area: VmcbControlArea,
+    pub state_save_area: VmcbStateSaveArea,
 }
 
 bitflags! {
@@ -324,6 +325,154 @@ pub struct VmcbControlArea {
     _reserved10: [u8; 0x400 - 0x170],
 }
 
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct VmcbSegment {
+    pub selector: u16,
+    pub attrib: u16,
+    pub limit: u32,
+    pub base: u64,
+}
+
 #[repr(C, align(1024))]
 #[derive(Debug, Clone, Copy)]
-pub struct VmcbStateSaveArea {}
+pub struct VmcbStateSaveArea {
+    // Offset 0x000
+    pub es: VmcbSegment,
+
+    // Offset 0x010
+    pub cs: VmcbSegment,
+
+    // Offset 0x020
+    pub ss: VmcbSegment,
+
+    // Offset 0x030
+    pub ds: VmcbSegment,
+
+    // Offset 0x040
+    pub fs: VmcbSegment,
+
+    // Offset 0x050
+    pub gs: VmcbSegment,
+
+    // Offset 0x060
+    pub gdtr: VmcbSegment,
+
+    // Offset 0x070
+    pub ldtr: VmcbSegment,
+
+    // Offset 0x080
+    pub idtr: VmcbSegment,
+
+    // Offset 0x090
+    pub tr: VmcbSegment,
+
+    // Offset 0x0A0
+    _reserved1: [u8; 0x0CB - 0x0A0],
+
+    // Offset 0x0CB
+    pub cpl: u8,
+
+    // Offset 0x0CC
+    _reserved2: [u8; 4],
+
+    // Offset 0x0D0
+    pub efer: u64,
+
+    // Offset 0x0D8
+    _reserved3: [u8; 8],
+
+    // Offset 0x0E0 - Performance Counters
+    pub perf_ctl0: u64,
+    pub perf_ctr0: u64,
+    pub perf_ctl1: u64,
+    pub perf_ctr1: u64,
+    pub perf_ctl2: u64,
+    pub perf_ctr2: u64,
+    pub perf_ctl3: u64,
+    pub perf_ctr3: u64,
+    pub perf_ctl4: u64,
+    pub perf_ctr4: u64,
+    pub perf_ctl5: u64,
+    pub perf_ctr5: u64,
+
+    // Offset 0x148
+    pub cr4: u64,
+    pub cr3: u64,
+    pub cr0: u64,
+    pub dr7: u64,
+    pub dr6: u64,
+    pub rflags: u64,
+    pub rip: u64,
+
+    // Offset 0x180
+    _reserved4: [u8; 0x1C0 - 0x180],
+
+    // Offset 0x1C0
+    pub instr_retired_ctr: u64,
+    pub perf_ctr_global_sts: u64,
+    pub perf_ctr_global_ctl: u64,
+
+    // Offset 0x1D4
+    _reserved5: [u8; 4],
+
+    // Offset 0x1D8
+    pub rsp: u64,
+    pub s_cet: u64,
+    pub ssp: u64,
+    pub isst_addr: u64,
+    pub rax: u64,
+
+    // Offset 0x200
+    pub star: u64,
+    pub lstar: u64,
+    pub cstar: u64,
+    pub sfmask: u64,
+    pub kernel_gs_base: u64,
+    pub sysenter_cs: u64,
+    pub sysenter_esp: u64,
+    pub sysenter_eip: u64,
+    pub cr2: u64,
+
+    // Offset 0x248
+    _reserved6: [u8; 0x268 - 0x248],
+
+    // Offset 0x268
+    pub g_pat: u64,
+    pub dbgctl: u64,
+    pub br_from: u64,
+    pub br_to: u64,
+    pub lastexcpfrom: u64,
+    pub lastexcpto: u64,
+    pub dbgextnctl: u64,
+
+    // Offset 0x2A0
+    _reserved7: [u8; 0x2E0 - 0x2A0],
+
+    // Offset 0x2E0
+    pub spec_ctrl: u64,
+
+    // Offset 0x2E8
+    _reserved8: [u8; 0x670 - 0x2E8],
+
+    // Offset 0x670 - LBR Stack (256 bytes)
+    pub lbr_stack: [u8; 256],
+
+    // Offset 0x770
+    pub lbr_select: u64,
+
+    // Offset 0x778 - IBS Virtualization
+    pub ibs_fetch_ctl: u64,
+    pub ibs_fetch_linaddr: u64,
+    pub ibs_op_ctl: u64,
+    pub ibs_op_rip: u64,
+    pub ibs_op_data: u64,
+    pub ibs_op_data2: u64,
+    pub ibs_op_data3: u64,
+    pub ibs_dc_linaddr: u64,
+    pub bp_ibstgt_rip: u64,
+    pub ic_ibs_extd_ctl: u64,
+
+    // Offset 0x7C8 - 0x800
+    _reserved9: [u8; 0x800 - 0x7C8],
+}

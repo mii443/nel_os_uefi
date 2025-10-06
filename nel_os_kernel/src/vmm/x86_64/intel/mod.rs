@@ -10,7 +10,7 @@ mod msr;
 mod qual;
 mod register;
 pub mod vcpu;
-mod vmcs;
+pub mod vmcs;
 mod vmexit;
 mod vmxon;
 

@@ -17,3 +17,6 @@ modular-bitfield = "0.12.0"
 numeric-enum-macro = "0.2.0"
 x86 = "0.52.0"
 bitflags = "2.9.4"
+
+[profile.release]
+debug = true
