@@ -374,13 +374,13 @@ pub struct VmcbStateSaveArea {
     pub cpl: u8,
 
     // Offset 0x0CC
-    _reserved2: [u8; 4],
+    _reserved2: u32,
 
     // Offset 0x0D0
     pub efer: u64,
 
     // Offset 0x0D8
-    _reserved3: [u8; 8],
+    _reserved3: [u8; 0x0E0 - 0x0D8],
 
     // Offset 0x0E0 - Performance Counters
     pub perf_ctl0: u64,
@@ -414,7 +414,7 @@ pub struct VmcbStateSaveArea {
     pub perf_ctr_global_ctl: u64,
 
     // Offset 0x1D4
-    _reserved5: [u8; 4],
+    _reserved5: [u8; 0x1D8 - 0x1D4],
 
     // Offset 0x1D8
     pub rsp: u64,
@@ -474,5 +474,5 @@ pub struct VmcbStateSaveArea {
     pub ic_ibs_extd_ctl: u64,
 
     // Offset 0x7C8 - 0x800
-    _reserved9: [u8; 0x800 - 0x7C8],
+    _reserved9: [u8; 0x7FF - 0x7C8],
 }
