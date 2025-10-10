@@ -16,4 +16,4 @@ qemu-system-x86_64 -enable-kvm \
 	-cpu host \
 	-enable-kvm \
 	-smp 1 \
-	-s
+	-s --no-reboot --no-shutdown

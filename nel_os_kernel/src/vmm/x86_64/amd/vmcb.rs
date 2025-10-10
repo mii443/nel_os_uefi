@@ -190,7 +190,7 @@ bitflags! {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(1024))]
 #[derive(Debug, Clone, Copy)]
 pub struct VmcbControlArea {
     // Offset 0x000
@@ -221,7 +221,7 @@ pub struct VmcbControlArea {
     pub guest_asid: u32,
     pub tlb_control: u8,
     pub rap_flags: u8,
-    _reserved2: [u8; 2],
+    _reserved2: u16,
 
     // Offset 0x060
     pub v_tpr: u8,
@@ -307,7 +307,7 @@ pub struct VmcbControlArea {
 
     // Offset 0x134
     pub update_irr: bool,
-    _reserved8: u8,
+    _reserved8: [u8; 3],
 
     // Offset 0x138
     pub allowed_sev_features_mask: u64,
@@ -316,7 +316,7 @@ pub struct VmcbControlArea {
     pub guest_sev_features: u64,
 
     // Offset 0x148-0x149 - Reserved
-    _reserved9: [u8; 0x150 - 0x148],
+    _reserved9: u64,
 
     // Offset 0x150
     pub requested_irr: [u64; 4],
