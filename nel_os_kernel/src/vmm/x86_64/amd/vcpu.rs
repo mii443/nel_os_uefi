@@ -4,7 +4,7 @@ use raw_cpuid::cpuid;
 use x86::controlregs::{cr0, cr3, cr4};
 use x86_64::{
     instructions::interrupts,
-    structures::paging::{FrameAllocator, Size4KiB},
+    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
     vmm::{
         x86_64::{
             amd::vmcb::{InterceptVector1, InterceptVector2, Vmcb, VmcbSegment},
-            common::{self, read_msr, segment::*, X86VCpu},
+            common::{self, read_msr, segment::*, write_msr, X86VCpu},
         },
         VCpu,
     },
@@ -21,6 +21,7 @@ use crate::{
 pub struct AMDVCpu {
     initialized: bool,
     vmcb: Vmcb,
+    hsave: PhysFrame,
 }
 
 impl AMDVCpu {
@@ -43,7 +44,7 @@ impl AMDVCpu {
         raw_vmcb
             .control_area
             .intercept_vec1
-            .set(InterceptVector1::HLT, true);
+            .set(InterceptVector1::HLT, false);
 
         raw_vmcb
             .control_area
@@ -96,24 +97,24 @@ impl VCpu for AMDVCpu {
                 self.setup().expect("Failed to setup AMD VCPU");
                 self.initialized = true;
             }
-            info!("VMCB: {:?}", self.vmcb.get_raw_vmcb());
-            info!(
-                "VMCB Control area Size: {}",
-                core::mem::size_of::<crate::vmm::x86_64::amd::vmcb::VmcbControlArea>()
-            );
-            info!(
-                "VMCB State Save area Size: {}",
-                core::mem::size_of::<crate::vmm::x86_64::amd::vmcb::VmcbStateSaveArea>()
-            );
-            info!(
-                "VMCB Size: {}",
-                core::mem::size_of_val(self.vmcb.get_raw_vmcb())
-            );
-            info!(
-                "VMCB Physical Address: {:x}",
-                self.vmcb.frame.start_address().as_u64()
-            );
+
+            let vmcb = self.vmcb.get_raw_vmcb();
+
+            vmcb.control_area.exit_code = 0;
+            vmcb.control_area.exit_info1 = 0;
+            vmcb.control_area.exit_info2 = 0;
+
+            write_msr(0xC001_0117, self.hsave.start_address().as_u64());
+
             super::vmrun(self.vmcb.frame.start_address().as_u64());
+
+            info!(
+                "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
+                vmcb.control_area.exit_code,
+                vmcb.control_area.exit_info1,
+                vmcb.control_area.exit_info2,
+                vmcb.control_area.next_rip
+            );
         });
         Ok(())
     }
@@ -147,9 +148,14 @@ impl VCpu for AMDVCpu {
         efer |= 1 << 12;
         common::write_msr(0xc000_0080, efer);
 
+        let hsave = frame_allocator
+            .allocate_frame()
+            .ok_or("Failed to allocate frame for VCPU HSave area")?;
+
         Ok(AMDVCpu {
             initialized: false,
             vmcb: Vmcb::new(frame_allocator)?,
+            hsave,
         })
     }
 
