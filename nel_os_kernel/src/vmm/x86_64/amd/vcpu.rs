@@ -27,7 +27,9 @@ impl AMDVCpu {
     #[unsafe(no_mangle)]
     fn guest_fn() {
         unsafe {
-            asm!("hlt");
+            loop {
+                asm!("hlt");
+            }
         }
     }
 
@@ -50,7 +52,7 @@ impl AMDVCpu {
 
         raw_vmcb.control_area.guest_asid = 1;
 
-        raw_vmcb.state_save_area.efer = read_msr(0xc000_0080);
+        raw_vmcb.state_save_area.efer = read_msr(x86::msr::IA32_EFER);
 
         raw_vmcb.state_save_area.rip = AMDVCpu::guest_fn as u64;
         info!("Guest RIP set to {:x}", raw_vmcb.state_save_area.rip);
@@ -58,6 +60,8 @@ impl AMDVCpu {
         raw_vmcb.state_save_area.cr0 = unsafe { cr0() }.bits() as u64;
         raw_vmcb.state_save_area.cr3 = unsafe { cr3() };
         raw_vmcb.state_save_area.cr4 = unsafe { cr4() }.bits() as u64;
+
+        raw_vmcb.state_save_area.rflags = 0x2;
 
         setup_segments(self);
 

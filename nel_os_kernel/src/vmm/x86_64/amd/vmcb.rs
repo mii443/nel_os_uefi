@@ -301,6 +301,7 @@ pub struct VmcbControlArea {
 
     // Offset 0x120
     pub bus_lock_threshold_counter: u16,
+    _reserved7_1: [u8; 6],
 
     // Offset 0x128-0x133 - Reserved
     _reserved7: [u8; 0x134 - 0x128],
@@ -472,7 +473,6 @@ pub struct VmcbStateSaveArea {
     pub ibs_dc_linaddr: u64,
     pub bp_ibstgt_rip: u64,
     pub ic_ibs_extd_ctl: u64,
-
     // Offset 0x7C8 - 0x800
     _reserved9: [u8; 0x7FF - 0x7C8],
 }
