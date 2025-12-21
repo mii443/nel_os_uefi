@@ -1,3 +1,5 @@
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 #[derive(Debug)]
@@ -23,19 +25,34 @@ unsafe impl Sync for Subscriber {}
 
 const MAX_SUBSCRIBERS: usize = 10;
 
-static SUBSCRIBERS: Mutex<[Option<Subscriber>; MAX_SUBSCRIBERS]> =
-    Mutex::new([None; MAX_SUBSCRIBERS]);
+struct SubscriberArray {
+    data: UnsafeCell<[Option<Subscriber>; MAX_SUBSCRIBERS]>,
+    lock: Mutex<()>,
+}
+
+unsafe impl Sync for SubscriberArray {}
+
+static SUBSCRIBERS: SubscriberArray = SubscriberArray {
+    data: UnsafeCell::new([None; MAX_SUBSCRIBERS]),
+    lock: Mutex::new(()),
+};
+static SUBSCRIBER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn subscribe(
     callback: SubscriberCallback,
     context: *mut core::ffi::c_void,
 ) -> Result<(), &'static str> {
-    let mut subscribers = SUBSCRIBERS.lock();
+    let _lock = SUBSCRIBERS.lock.lock();
 
-    for slot in subscribers.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(Subscriber { callback, context });
-            return Ok(());
+    unsafe {
+        let subscribers = &mut *SUBSCRIBERS.data.get();
+
+        for slot in subscribers.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(Subscriber { callback, context });
+                SUBSCRIBER_COUNT.fetch_add(1, Ordering::Release);
+                return Ok(());
+            }
         }
     }
 
@@ -43,13 +60,18 @@ pub fn subscribe(
 }
 
 pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
-    let mut subscribers = SUBSCRIBERS.lock();
+    let _lock = SUBSCRIBERS.lock.lock();
 
-    for slot in subscribers.iter_mut() {
-        if let Some(subscriber) = slot {
-            if core::ptr::fn_addr_eq(subscriber.callback, callback) {
-                *slot = None;
-                return Ok(());
+    unsafe {
+        let subscribers = &mut *SUBSCRIBERS.data.get();
+
+        for slot in subscribers.iter_mut() {
+            if let Some(subscriber) = slot {
+                if core::ptr::fn_addr_eq(subscriber.callback, callback) {
+                    *slot = None;
+                    SUBSCRIBER_COUNT.fetch_sub(1, Ordering::Release);
+                    return Ok(());
+                }
             }
         }
     }
@@ -57,10 +79,19 @@ pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
     Err("Subscriber not found")
 }
 
+#[inline]
 pub fn dispatch_to_subscribers(context: &InterruptContext) {
-    let subscribers = SUBSCRIBERS.lock();
+    // Early return if no subscribers
+    let count = SUBSCRIBER_COUNT.load(Ordering::Acquire);
+    if count == 0 {
+        return;
+    }
 
-    for subscriber in subscribers.iter().flatten() {
-        (subscriber.callback)(subscriber.context, context);
+    unsafe {
+        let subscribers = &*SUBSCRIBERS.data.get();
+
+        for subscriber in subscribers.iter().flatten() {
+            (subscriber.callback)(subscriber.context, context);
+        }
     }
 }

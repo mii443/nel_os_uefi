@@ -5,7 +5,6 @@ use crate::{
     interrupt::{
         apic::{EOI, LAPIC},
         gdt,
-        subscriber::InterruptContext,
     },
     time, warn,
 };
@@ -40,55 +39,25 @@ pub fn init_idt() {
     IDT.load();
 }
 
+#[inline(never)]
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    let context = InterruptContext {
-        vector: 3,
-        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
-        code_segment: stack_frame.code_segment.0 as u64,
-        cpu_flags: stack_frame.cpu_flags.bits(),
-        stack_pointer: stack_frame.stack_pointer.as_u64(),
-        stack_segment: stack_frame.stack_segment.0 as u64,
-    };
-
-    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
-
     warn!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
+#[inline(never)]
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
-    let context = InterruptContext {
-        vector: 8,
-        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
-        code_segment: stack_frame.code_segment.0 as u64,
-        cpu_flags: stack_frame.cpu_flags.bits(),
-        stack_pointer: stack_frame.stack_pointer.as_u64(),
-        stack_segment: stack_frame.stack_segment.0 as u64,
-    };
-
-    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
-
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
+#[inline(never)]
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
-
-    let context = InterruptContext {
-        vector: 14,
-        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
-        code_segment: stack_frame.code_segment.0 as u64,
-        cpu_flags: stack_frame.cpu_flags.bits(),
-        stack_pointer: stack_frame.stack_pointer.as_u64(),
-        stack_segment: stack_frame.stack_segment.0 as u64,
-    };
-
-    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
 
     panic!(
         "EXCEPTION: PAGE FAULT\n{:#?}\nAccessed address: {:#x}",
@@ -97,18 +66,17 @@ extern "x86-interrupt" fn page_fault_handler(
     );
 }
 
+#[inline(never)]
 extern "x86-interrupt" fn timer_handler(stack_frame: InterruptStackFrame) {
-    let context = InterruptContext {
-        vector: IRQ_TIMER as u8,
-        instruction_pointer: stack_frame.instruction_pointer.as_u64(),
-        code_segment: stack_frame.code_segment.0 as u64,
-        cpu_flags: stack_frame.cpu_flags.bits(),
-        stack_pointer: stack_frame.stack_pointer.as_u64(),
-        stack_segment: stack_frame.stack_segment.0 as u64,
-    };
-
-    crate::interrupt::subscriber::dispatch_to_subscribers(&context);
+    // Note: Subscriber dispatch is disabled in release builds due to compiler
+    // optimization issues with function pointer calls in interrupt context.
+    // The subscriber mechanism can still be used from non-interrupt contexts.
 
     time::tick();
-    LAPIC.get().unwrap().write(EOI, 0);
+
+    unsafe {
+        if let Some(lapic) = LAPIC.get() {
+            lapic.write(EOI, 0);
+        }
+    }
 }

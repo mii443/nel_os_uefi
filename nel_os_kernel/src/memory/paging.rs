@@ -43,10 +43,15 @@ fn new_page_table(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> (PhysFrame, *mut PageTable) {
     let frame = frame_allocator.allocate_frame().unwrap();
+    let phys_addr = frame.start_address().as_u64();
+    let virt_addr = VirtAddr::new(phys_addr);
+    let ptr = virt_addr.as_mut_ptr();
+
+    info!("new_page_table: phys={:#x}, virt={:?}, ptr={:p}", phys_addr, virt_addr, ptr);
 
     (
         frame,
-        VirtAddr::new(frame.start_address().as_u64()).as_mut_ptr(),
+        ptr,
     )
 }
 

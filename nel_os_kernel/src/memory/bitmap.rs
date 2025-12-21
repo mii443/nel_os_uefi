@@ -58,6 +58,12 @@ impl BitmapMemoryTable {
             table.set_frame(bitmap_start_frame + i, false);
         }
 
+        // Reserve the first 256 frames (1 MiB) to avoid null pointer issues
+        // and protect low memory (IVT, BIOS data area, etc.)
+        for i in 0..256 {
+            table.set_frame(i, false);
+        }
+
         for i in 0..entry_count {
             let index = entry_count - i - 1;
             if table.used_map[index] != 0 {
