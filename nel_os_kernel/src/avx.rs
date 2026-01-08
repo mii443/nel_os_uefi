@@ -6,7 +6,7 @@ use crate::info;
 
 pub fn avx_benchmark(use_avx512f: bool) {
     let initial_ticks = crate::time::get_ticks();
-    let n = 1_000;
+    let n = 5_000;
 
     // Pre-allocate and initialize arrays once
     let mut a = vec![0f32; n];
@@ -20,23 +20,24 @@ pub fn avx_benchmark(use_avx512f: bool) {
 
     // Warm-up run
     unsafe {
-        add_f32_avx512f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n);
+        add_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n);
     }
 
     // Benchmark
     let mut tick = crate::time::get_ticks();
     let mut total_ops = 0;
-    while tick - initial_ticks < 5000 {
+    while tick - initial_ticks < 1000 {
         if use_avx512f {
             unsafe {
                 add_f32_avx512f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n);
+                //add_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n);
             }
         } else {
             unsafe {
-                add_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n);
+                add_f32_x87(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n);
             }
         }
-        total_ops += n;
+        total_ops += 1;
         tick = crate::time::get_ticks();
     }
 
@@ -45,10 +46,9 @@ pub fn avx_benchmark(use_avx512f: bool) {
         assert_eq!(out[i], a[i] + b[i]);
     }
 
-    let ops_per_tick = total_ops as f64 / 5000 as f64;
     info!(
-        "{} ops/tick with {}.",
-        ops_per_tick,
+        "{} ops/s with {}.",
+        total_ops,
         if use_avx512f {
             "AVX-512F"
         } else {
@@ -92,10 +92,46 @@ unsafe fn add_f32_avx512f(a: *const f32, b: *const f32, out: *mut f32, n: usize)
     }
 }
 
+#[target_feature(enable = "avx512f")]
+#[inline(never)]
+#[unsafe(no_mangle)]
 unsafe fn add_f32(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
             *out.add(i) = *a.add(i) + *b.add(i);
         }
+    }
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+unsafe fn add_f32_woavx512f(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
+    for i in 0..n {
+        unsafe {
+            *out.add(i) = *a.add(i) + *b.add(i);
+        }
+    }
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+unsafe fn add_f32_x87(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
+    let mut i = 0;
+    while i < n {
+        let ap = a.add(i);
+        let bp = b.add(i);
+        let op = out.add(i);
+
+        asm!(
+            "fld dword ptr [{ap}]",
+            "fadd dword ptr [{bp}]",
+            "fstp dword ptr [{op}]",
+            ap = in(reg) ap,
+            bp = in(reg) bp,
+            op = in(reg) op,
+            options(nostack, preserves_flags)
+        );
+
+        i += 1;
     }
 }

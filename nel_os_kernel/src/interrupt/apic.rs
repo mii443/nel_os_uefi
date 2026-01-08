@@ -104,7 +104,7 @@ pub fn init_local_apic(platform_info: PlatformInfo<'_, Global>) {
 
     local_apic.write(TDCR, X1);
     local_apic.write(TIMER, PERIODIC | IRQ_TIMER);
-    local_apic.write(TICR, local_apic_freq / 250);
+    local_apic.write(TICR, local_apic_freq / 100);
 
     local_apic.write(LINT0, MASKED);
     local_apic.write(LINT1, MASKED);
