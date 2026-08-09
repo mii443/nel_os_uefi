@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
 
+use core::mem::{offset_of, size_of};
+
 use bitflags::bitflags;
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
@@ -12,6 +14,9 @@ impl Vmcb {
         let frame = frame_allocator
             .allocate_frame()
             .ok_or("Failed to allocate VMCB frame")?;
+        unsafe {
+            core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 4096);
+        }
         Ok(Vmcb { frame })
     }
 
@@ -298,17 +303,17 @@ pub struct VmcbControlArea {
 
     // Offset 0x118
     pub vmgexit_cpl: u8,
+    _reserved7: [u8; 0x120 - 0x119],
 
     // Offset 0x120
     pub bus_lock_threshold_counter: u16,
-    _reserved7_1: [u8; 6],
 
-    // Offset 0x128-0x133 - Reserved
-    _reserved7: [u8; 0x134 - 0x128],
+    // Offset 0x122-0x133 - Reserved
+    _reserved8: [u8; 0x134 - 0x122],
 
     // Offset 0x134
     pub update_irr: bool,
-    _reserved8: [u8; 3],
+    _reserved9: [u8; 3],
 
     // Offset 0x138
     pub allowed_sev_features_mask: u64,
@@ -317,13 +322,13 @@ pub struct VmcbControlArea {
     pub guest_sev_features: u64,
 
     // Offset 0x148-0x149 - Reserved
-    _reserved9: u64,
+    _reserved10: u64,
 
     // Offset 0x150
     pub requested_irr: [u64; 4],
 
     // 0x170-0x3FF - Reserved
-    _reserved10: [u8; 0x400 - 0x170],
+    _reserved11: [u8; 0x400 - 0x170],
 }
 
 #[repr(C, packed)]
@@ -396,6 +401,7 @@ pub struct VmcbStateSaveArea {
     pub perf_ctr4: u64,
     pub perf_ctl5: u64,
     pub perf_ctr5: u64,
+    _reserved_perf: [u8; 8],
 
     // Offset 0x148
     pub cr4: u64,
@@ -413,9 +419,6 @@ pub struct VmcbStateSaveArea {
     pub instr_retired_ctr: u64,
     pub perf_ctr_global_sts: u64,
     pub perf_ctr_global_ctl: u64,
-
-    // Offset 0x1D4
-    _reserved5: [u8; 0x1D8 - 0x1D4],
 
     // Offset 0x1D8
     pub rsp: u64,
@@ -474,5 +477,28 @@ pub struct VmcbStateSaveArea {
     pub bp_ibstgt_rip: u64,
     pub ic_ibs_extd_ctl: u64,
     // Offset 0x7C8 - 0x800
-    _reserved9: [u8; 0x7FF - 0x7C8],
+    _reserved9: [u8; 0x800 - 0x7C8],
 }
+
+// VMRUN consumes this layout directly. Keep checks close to the definition so
+// a seemingly harmless field change cannot silently move hardware state.
+const _: () = {
+    assert!(size_of::<VmcbSegment>() == 0x10);
+    assert!(size_of::<VmcbControlArea>() == 0x400);
+    assert!(offset_of!(RawVmcb, state_save_area) == 0x400);
+    assert!(offset_of!(VmcbControlArea, intercept_vec1) == 0x00c);
+    assert!(offset_of!(VmcbControlArea, guest_asid) == 0x058);
+    assert!(offset_of!(VmcbControlArea, exit_code) == 0x070);
+    assert!(offset_of!(VmcbControlArea, next_rip) == 0x0c8);
+    assert!(offset_of!(VmcbControlArea, bus_lock_threshold_counter) == 0x120);
+    assert!(offset_of!(VmcbControlArea, update_irr) == 0x134);
+    assert!(offset_of!(VmcbStateSaveArea, efer) == 0x0d0);
+    assert!(offset_of!(VmcbStateSaveArea, cr4) == 0x148);
+    assert!(offset_of!(VmcbStateSaveArea, rip) == 0x178);
+    assert!(offset_of!(VmcbStateSaveArea, rsp) == 0x1d8);
+    assert!(offset_of!(VmcbStateSaveArea, rax) == 0x1f8);
+    assert!(offset_of!(VmcbStateSaveArea, cr2) == 0x240);
+    assert!(offset_of!(VmcbStateSaveArea, g_pat) == 0x268);
+    assert!(offset_of!(VmcbStateSaveArea, spec_ctrl) == 0x2e0);
+    assert!(size_of::<VmcbStateSaveArea>() == 0x800);
+};

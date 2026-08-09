@@ -8,6 +8,7 @@ use crate::vmm::x86_64::{
     },
 };
 
+#[derive(Clone, Copy)]
 pub enum Segment {
     ES,
     CS,
@@ -75,10 +76,12 @@ impl SegmentRights {
         value |= (self.desc_type as u16) << 4;
         value |= (self.dpl as u16 & 0b11) << 5;
         value |= (self.present as u16) << 7;
-        value |= (self.avl as u16) << 12;
-        value |= (self.long as u16) << 13;
-        value |= (self.db as u16) << 14;
-        value |= (self.granularity as u16) << 15;
+        // Unlike a GDT descriptor, the VMCB stores these four attributes in
+        // bits 8 through 11 (AMD APM Vol. 2, "Segment Attributes").
+        value |= (self.avl as u16) << 8;
+        value |= (self.long as u16) << 9;
+        value |= (self.db as u16) << 10;
+        value |= (self.granularity as u16) << 11;
         value
     }
 

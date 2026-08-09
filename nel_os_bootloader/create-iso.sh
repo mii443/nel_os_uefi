@@ -1,12 +1,15 @@
 #!/bin/bash -ex
 
 EFI_BINARY="$1"
+KERNEL_PROFILE=""
 
 cd ../nel_os_kernel
 if [[ "$EFI_BINARY" == "target/x86_64-unknown-uefi/release/"* ]]; then
-	cargo build --release -q
+	KERNEL_PROFILE="release"
+	cargo build --release -Zjson-target-spec -q
 elif [[ "$EFI_BINARY" == "target/x86_64-unknown-uefi/debug/"* ]]; then
-	cargo build -q
+	KERNEL_PROFILE="debug"
+	cargo build -Zjson-target-spec -q
 else
 	echo "Error: EFI binary path must contain either '/target/x86_64-unknown-uefi/release/' or '/target/x86_64-unknown-uefi/debug/'"
 	exit 1
@@ -18,7 +21,7 @@ mformat -i fat.img -C -h 16 -t 128 -s 32 ::
 mmd -i fat.img ::/EFI
 mmd -i fat.img ::/EFI/BOOT
 mcopy -i fat.img "$EFI_BINARY" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i fat.img ../nel_os_kernel/target/x86_64-nel_os/release/nel_os_kernel.elf ::/nel_os_kernel.elf
+mcopy -i fat.img "../nel_os_kernel/target/x86_64-nel_os/$KERNEL_PROFILE/nel_os_kernel.elf" ::/nel_os_kernel.elf
 mcopy -i fat.img bzImage ::/bzImage
 mcopy -i fat.img rootfs-n.cpio.gz ::/rootfs-n.cpio.gz
 
