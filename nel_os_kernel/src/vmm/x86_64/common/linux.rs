@@ -49,7 +49,9 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     let cmdline_start = LAYOUT_CMDLINE;
     let cmdline_end = cmdline_start + cmdline_max_size as u64;
     vcpu.write_memory_ranged(cmdline_start, cmdline_end, 0)?;
-    let cmdline_val = "console=ttyS0 earlyprintk=serial nokaslr";
+    // PCI devices belong to the outer nel_os instance. Passing their MMIO and
+    // DMA through to an NPT-backed L2 guest would bypass guest-RAM translation.
+    let cmdline_val = "console=ttyS0 earlyprintk=serial nokaslr pci=off";
     let cmdline_bytes = cmdline_val.as_bytes();
     for (i, &byte) in cmdline_bytes.iter().enumerate() {
         vcpu.write_memory(cmdline_start + i as u64, byte)?;
@@ -85,12 +87,7 @@ fn load_image(vcpu: &mut dyn VCpu, image: &[u8], addr: usize) -> Result<(), &'st
         addr,
         image.len()
     );
-    for (i, &byte) in image.iter().enumerate() {
-        let gpa = addr + i;
-        vcpu.write_memory(gpa as u64, byte)?;
-    }
-
-    Ok(())
+    vcpu.write_memory_slice(addr as u64, image)
 }
 
 pub const LAYOUT_BOOTPARAM: u64 = 0x0001_0000;

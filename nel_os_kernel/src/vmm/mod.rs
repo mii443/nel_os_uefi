@@ -31,6 +31,13 @@ pub trait VCpu {
     ) -> Result<(), &'static str>;
     fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str>;
 
+    fn write_memory_slice(&mut self, addr: u64, data: &[u8]) -> Result<(), &'static str> {
+        for (offset, &byte) in data.iter().enumerate() {
+            self.write_memory(addr + offset as u64, byte)?;
+        }
+        Ok(())
+    }
+
     fn get_guest_memory_size(&self) -> u64;
 }
 

@@ -1,15 +1,6 @@
-use core::arch::asm;
-
 use raw_cpuid::cpuid;
-use x86::{
-    controlregs::{cr0, cr3, cr4},
-    dtables::{self, DescriptorTablePointer},
-    segmentation::{cs, ds},
-    task,
-};
 use x86_64::{
     instructions::interrupts,
-    registers::debug::{Dr6, Dr7},
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
@@ -18,8 +9,12 @@ use crate::{
     vmm::{
         VCpu,
         x86_64::{
-            amd::vmcb::{InterceptVector1, InterceptVector2, Vmcb, VmcbSegment},
-            common::{self, X86VCpu, read_msr, segment::*, write_msr},
+            amd::{
+                npt::Npt,
+                register::GuestRegisters,
+                vmcb::{Flags1, InterceptVector1, InterceptVector2, Vmcb, VmcbSegment},
+            },
+            common::{self, X86VCpu, segment::*, write_msr},
         },
     },
 };
@@ -29,39 +24,38 @@ pub struct AMDVCpu {
     exit_reported: bool,
     vmcb: Vmcb,
     hsave: PhysFrame,
+    npt: Npt,
+    guest_registers: GuestRegisters,
+    guest_memory_size: u64,
 }
 
-const GUEST_STACK_SIZE: usize = 4096 * 4;
-
-#[repr(align(16))]
-struct GuestStack([u8; GUEST_STACK_SIZE]);
-
-static mut GUEST_STACK: GuestStack = GuestStack([0; GUEST_STACK_SIZE]);
+const GUEST_MEMORY_SIZE: u64 = 256 * 1024 * 1024;
+const PAGE_SIZE: u64 = 4096;
 
 impl AMDVCpu {
-    #[unsafe(no_mangle)]
-    extern "C" fn guest_fn() {
-        unsafe {
-            loop {
-                asm!("hlt");
-            }
-        }
-    }
-
-    pub fn setup(&mut self) -> Result<(), &'static str>
+    pub fn setup(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str>
     where
         Self: X86VCpu,
     {
-        info!("Setting up AMD VCPU");
+        info!("Setting up AMD VCPU for a Linux guest");
 
-        self.setup_segments_from_host();
+        self.init_guest_memory(frame_allocator)?;
+        common::linux::load_kernel(self)?;
+        self.setup_linux_segments();
 
         {
             let raw_vmcb = self.vmcb.get_raw_vmcb();
             raw_vmcb
                 .control_area
                 .intercept_vec1
-                .set(InterceptVector1::HLT, true);
+                .set(InterceptVector1::SHUTDOWN, true);
+            raw_vmcb
+                .control_area
+                .intercept_vec1
+                .set(InterceptVector1::CPUID, true);
 
             raw_vmcb
                 .control_area
@@ -69,45 +63,41 @@ impl AMDVCpu {
                 .set(InterceptVector2::VMRUN, true);
 
             raw_vmcb.control_area.guest_asid = 1;
+            raw_vmcb.control_area.flags1.set(Flags1::NP_ENABLE, true);
+            raw_vmcb.control_area.nested_page_table_cr3 =
+                self.npt.root_table.start_address().as_u64();
 
-            // SVME must remain set in the guest EFER for VMRUN state
-            // validation. Nested VMRUN is still prevented by its mandatory
-            // intercept below.
-            raw_vmcb.state_save_area.efer = read_msr(x86::msr::IA32_EFER);
-            raw_vmcb.state_save_area.rip = AMDVCpu::guest_fn as *const () as u64;
-            let stack_base = unsafe { (&raw mut GUEST_STACK.0) as *mut u8 as u64 };
-            // A SysV64 function enters with RSP == 8 (mod 16), after the
-            // caller's return address would normally have been pushed.
-            raw_vmcb.state_save_area.rsp = stack_base + GUEST_STACK_SIZE as u64 - 8;
+            // Linux's 32-bit boot entry starts with paging and long mode off.
+            // SVME remains set because it is required by SVM guest-state
+            // validation; nested VMRUN is intercepted above.
+            raw_vmcb.state_save_area.efer = 1 << 12;
+            raw_vmcb.state_save_area.rip = common::linux::LAYOUT_KERNEL_BASE;
+            raw_vmcb.state_save_area.rsp = 0;
             info!("Guest RIP set to {:x}", raw_vmcb.state_save_area.rip);
 
-            raw_vmcb.state_save_area.cr0 = unsafe { cr0() }.bits() as u64;
-            raw_vmcb.state_save_area.cr3 = unsafe { cr3() };
-            raw_vmcb.state_save_area.cr4 = unsafe { cr4() }.bits() as u64;
-            raw_vmcb.state_save_area.dr6 = Dr6::read_raw();
-            raw_vmcb.state_save_area.dr7 = Dr7::read_raw();
+            // PE | ET | NE, with paging disabled as required by the Linux
+            // protected-mode boot protocol.
+            raw_vmcb.state_save_area.cr0 = (1 << 0) | (1 << 4) | (1 << 5);
+            raw_vmcb.state_save_area.cr3 = 0;
+            raw_vmcb.state_save_area.cr4 = 0;
+            raw_vmcb.state_save_area.dr6 = 0xffff_0ff0;
+            raw_vmcb.state_save_area.dr7 = 0x400;
             raw_vmcb.state_save_area.rflags = 0x2;
             raw_vmcb.state_save_area.rax = 0;
+            raw_vmcb.state_save_area.g_pat = 0x0007_0406_0007_0406;
             raw_vmcb.control_area.vmcb_clean_bits = 0;
-            raw_vmcb.control_area.tlb_control = 0;
-            raw_vmcb.state_save_area.cpl = (raw_vmcb.state_save_area.cs.selector & 0b11) as u8;
-
-            raw_vmcb.state_save_area.ldtr.selector = 0;
-            raw_vmcb.state_save_area.ldtr.attrib = 0;
-            raw_vmcb.state_save_area.ldtr.limit = 0;
-            raw_vmcb.state_save_area.ldtr.base = 0;
+            raw_vmcb.control_area.tlb_control = 1;
+            raw_vmcb.state_save_area.cpl = 0;
         }
+
+        self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM;
 
         self.dump_guest_state();
 
         Ok(())
     }
 
-    fn setup_segments_from_host(&mut self) {
-        let cs_selector = cs().bits() as u16;
-        let data_selector = ds().bits() as u16;
-        let tr_selector = unsafe { task::tr() }.bits();
-
+    fn setup_linux_segments(&mut self) {
         let raw_vmcb = self.vmcb.get_raw_vmcb();
 
         let code_attrib = common::segment::SegmentRights {
@@ -119,8 +109,8 @@ impl AMDVCpu {
             dpl: 0,
             present: true,
             avl: false,
-            long: true,
-            db: false,
+            long: false,
+            db: true,
             granularity: common::segment::Granularity::KByte,
         }
         .to_amd_segment_attrib();
@@ -153,7 +143,7 @@ impl AMDVCpu {
         }
         .to_amd_segment_attrib();
 
-        raw_vmcb.state_save_area.cs.selector = cs_selector;
+        raw_vmcb.state_save_area.cs.selector = 0;
         raw_vmcb.state_save_area.cs.attrib = code_attrib;
         raw_vmcb.state_save_area.cs.limit = u32::MAX;
         raw_vmcb.state_save_area.cs.base = 0;
@@ -165,38 +155,93 @@ impl AMDVCpu {
             &mut raw_vmcb.state_save_area.fs,
             &mut raw_vmcb.state_save_area.gs,
         ] {
-            segment.selector = data_selector;
+            segment.selector = 0;
             segment.attrib = data_attrib;
             segment.limit = u32::MAX;
             segment.base = 0;
         }
 
-        raw_vmcb.state_save_area.fs.base = read_msr(x86::msr::IA32_FS_BASE);
-        raw_vmcb.state_save_area.gs.base = read_msr(x86::msr::IA32_GS_BASE);
-
-        raw_vmcb.state_save_area.tr.selector = tr_selector;
+        raw_vmcb.state_save_area.tr.selector = 0;
         raw_vmcb.state_save_area.tr.attrib = tr_attrib;
+        raw_vmcb.state_save_area.tr.base = 0;
+        raw_vmcb.state_save_area.tr.limit = 0;
 
-        let mut gdtp = DescriptorTablePointer::<u64>::default();
-        let mut idtp = DescriptorTablePointer::<u64>::default();
-        unsafe {
-            dtables::sgdt(&mut gdtp);
-            dtables::sidt(&mut idtp);
+        raw_vmcb.state_save_area.gdtr = VmcbSegment {
+            selector: 0,
+            attrib: 0,
+            limit: 0,
+            base: 0,
+        };
+        raw_vmcb.state_save_area.idtr = raw_vmcb.state_save_area.gdtr;
+        raw_vmcb.state_save_area.ldtr = VmcbSegment {
+            selector: 0,
+            attrib: 0x82,
+            limit: 0,
+            base: 0,
+        };
+    }
+
+    fn init_guest_memory(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        info!(
+            "Allocating {} MiB of AMD guest RAM",
+            self.guest_memory_size / 1024 / 1024
+        );
+        let mut gpa = 0;
+        while gpa < self.guest_memory_size {
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or("No free frames for guest RAM")?;
+            unsafe {
+                core::ptr::write_bytes(
+                    frame.start_address().as_u64() as *mut u8,
+                    0,
+                    PAGE_SIZE as usize,
+                );
+            }
+            self.npt
+                .map_4k(gpa, frame.start_address().as_u64(), frame_allocator)?;
+            gpa += PAGE_SIZE;
         }
-        raw_vmcb.state_save_area.gdtr.base = gdtp.base as u64;
-        raw_vmcb.state_save_area.gdtr.limit = gdtp.limit as u32;
-        raw_vmcb.state_save_area.idtr.base = idtp.base as u64;
-        raw_vmcb.state_save_area.idtr.limit = idtp.limit as u32;
 
-        let tr_index = (tr_selector as usize) >> 3;
-        let gdt_base = gdtp.base as *const u64;
-        let tr_low = unsafe { *gdt_base.add(tr_index) };
-        let tr_high = unsafe { *gdt_base.add(tr_index + 1) };
-        raw_vmcb.state_save_area.tr.base = ((tr_low >> 16) & 0x00ff_ffff)
-            | ((tr_low >> 32) & 0xff00_0000)
-            | ((tr_high & 0xffff_ffff) << 32);
-        raw_vmcb.state_save_area.tr.limit =
-            ((tr_low & 0xffff) | (((tr_low >> 48) & 0xf) << 16)) as u32;
+        // Allow a nested Linux guest to access the legacy IOAPIC and LAPIC
+        // MMIO pages exposed by the outer QEMU machine.
+        for mmio_gpa in [0xfec0_0000, 0xfee0_0000] {
+            self.npt.map_4k(mmio_gpa, mmio_gpa, frame_allocator)?;
+        }
+        Ok(())
+    }
+
+    fn handle_cpuid(&mut self) {
+        let leaf = self.vmcb.get_raw_vmcb().state_save_area.rax as u32;
+        let subleaf = self.guest_registers.rcx as u32;
+        let mut result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+
+        match leaf {
+            // L1 does not yet implement KVM paravirtual MSRs for L2. Hide the
+            // hypervisor bit so Linux selects its native AMD clock path.
+            0x0000_0001 => result.ecx &= !(1 << 31),
+            // Do not expose another level of SVM until its state is fully
+            // virtualized by this VMM.
+            0x8000_0001 => result.ecx &= !(1 << 2),
+            0x4000_0000..=0x4000_00ff | 0x8000_000a => {
+                result.eax = 0;
+                result.ebx = 0;
+                result.ecx = 0;
+                result.edx = 0;
+            }
+            _ => {}
+        }
+
+        let vmcb = self.vmcb.get_raw_vmcb();
+        vmcb.state_save_area.rax = result.eax as u64;
+        self.guest_registers.rbx = result.ebx as u64;
+        self.guest_registers.rcx = result.ecx as u64;
+        self.guest_registers.rdx = result.edx as u64;
+        vmcb.state_save_area.rip = vmcb.control_area.next_rip;
+        vmcb.control_area.vmcb_clean_bits = 0;
     }
 
     fn dump_guest_state(&mut self) {
@@ -270,26 +315,32 @@ impl AMDVCpu {
 impl VCpu for AMDVCpu {
     fn run(
         &mut self,
-        _frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
         interrupts::without_interrupts(|| unsafe {
             if !self.initialized {
-                self.setup().expect("Failed to setup AMD VCPU");
+                self.setup(frame_allocator)?;
                 self.initialized = true;
             }
 
-            let vmcb = self.vmcb.get_raw_vmcb();
-
-            vmcb.control_area.exit_code = 0;
-            vmcb.control_area.exit_info1 = 0;
-            vmcb.control_area.exit_info2 = 0;
+            {
+                let vmcb = self.vmcb.get_raw_vmcb();
+                vmcb.control_area.exit_code = 0;
+                vmcb.control_area.exit_info1 = 0;
+                vmcb.control_area.exit_info2 = 0;
+                vmcb.control_area.tlb_control = 0;
+            }
 
             write_msr(0xC001_0117, self.hsave.start_address().as_u64());
 
-            super::vmrun(self.vmcb.frame.start_address().as_u64());
+            super::asm::asm_vmrun(
+                self.vmcb.frame.start_address().as_u64(),
+                &mut self.guest_registers,
+            );
 
+            let vmcb = self.vmcb.get_raw_vmcb();
             let exit_code = vmcb.control_area.exit_code;
-            if !self.exit_reported || exit_code != 0x78 {
+            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x78) {
                 info!(
                     "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
                     exit_code,
@@ -301,32 +352,42 @@ impl VCpu for AMDVCpu {
             }
 
             match exit_code as u32 {
+                0x72 => {
+                    self.handle_cpuid();
+                    Ok(())
+                }
                 0x78 => Ok(()), // HLT
+                0x7f => Err("AMD guest shutdown (likely a triple fault)"),
+                0x400 => Err("AMD nested page fault"),
                 u32::MAX => Err("VMRUN rejected the VMCB guest state"),
                 _ => Err("Unhandled AMD VMEXIT"),
             }
         })
     }
 
-    fn write_memory(&mut self, _addr: u64, _data: u8) -> Result<(), &'static str> {
-        unimplemented!("AMDVCpu::write_memory is not implemented yet");
+    fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str> {
+        self.npt.set(addr, data)
     }
 
     fn write_memory_ranged(
         &mut self,
-        _addr_start: u64,
-        _addr_end: u64,
-        _data: u8,
+        addr_start: u64,
+        addr_end: u64,
+        data: u8,
     ) -> Result<(), &'static str> {
-        unimplemented!("AMDVCpu::write_memory_ranged is not implemented yet");
+        self.npt.set_range(addr_start, addr_end, data)
     }
 
-    fn read_memory(&mut self, _addr: u64) -> Result<u8, &'static str> {
-        unimplemented!("AMDVCpu::read_memory is not implemented yet");
+    fn read_memory(&mut self, addr: u64) -> Result<u8, &'static str> {
+        self.npt.get(addr)
+    }
+
+    fn write_memory_slice(&mut self, addr: u64, data: &[u8]) -> Result<(), &'static str> {
+        self.npt.set_slice(addr, data)
     }
 
     fn get_guest_memory_size(&self) -> u64 {
-        unimplemented!("AMDVCpu::get_guest_memory_size is not implemented yet")
+        self.guest_memory_size
     }
 
     fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
@@ -349,6 +410,9 @@ impl VCpu for AMDVCpu {
             exit_reported: false,
             vmcb: Vmcb::new(frame_allocator)?,
             hsave,
+            npt: Npt::new(frame_allocator)?,
+            guest_registers: GuestRegisters::default(),
+            guest_memory_size: GUEST_MEMORY_SIZE,
         })
     }
 
