@@ -15,12 +15,4 @@ pub struct GuestRegisters {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
-    pub xmm0: u128,
-    pub xmm1: u128,
-    pub xmm2: u128,
-    pub xmm3: u128,
-    pub xmm4: u128,
-    pub xmm5: u128,
-    pub xmm6: u128,
-    pub xmm7: u128,
 }

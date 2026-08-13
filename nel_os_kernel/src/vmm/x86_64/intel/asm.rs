@@ -17,6 +17,10 @@ global_asm!(
 "push r13",
 "push r12",
 "push rbx",
+"cmp qword ptr [rdi + {host_xsave_mask_offset}], 0",
+"jne 3f",
+"fxsave64 [rdi + {host_fx_state_offset}]",
+"3:",
 /*
    stack:
    +-----+
@@ -46,6 +50,7 @@ global_asm!(
 "call intel_set_host_stack",
 "pop rdi", // rdi = *VCpu
 "test byte ptr [rdi + {launch_done_offset}], 1", // flag = launch_done ? 1 : 0
+"fxrstor64 [rdi + {guest_fx_state_offset}]",
 /*
    stack:
    +-------------+
@@ -86,14 +91,6 @@ global_asm!(
 "mov r13, [rax+{reg_offset_r13}]", // r13 = guest_regs.r13
 "mov r14, [rax+{reg_offset_r14}]", // r14 = guest_regs.r14
 "mov r15, [rax+{reg_offset_r15}]", // r15 = guest_regs.r15
-"movaps xmm0, [rax+{reg_offset_xmm0}]", // xmm0 = guest_regs.xmm0
-"movaps xmm1, [rax+{reg_offset_xmm1}]", // xmm1 = guest_regs.xmm1
-"movaps xmm2, [rax+{reg_offset_xmm2}]", // xmm2 = guest_regs.xmm2
-"movaps xmm3, [rax+{reg_offset_xmm3}]", // xmm3 = guest_regs.xmm3
-"movaps xmm4, [rax+{reg_offset_xmm4}]", // xmm4 = guest_regs.xmm4
-"movaps xmm5, [rax+{reg_offset_xmm5}]", // xmm5 = guest_regs.xmm5
-"movaps xmm6, [rax+{reg_offset_xmm6}]", // xmm6 = guest_regs.xmm6
-"movaps xmm7, [rax+{reg_offset_xmm7}]", // xmm7 = guest_regs.xmm7
 "mov rax, [rax+{reg_offset_rax}]", // rax = guest_regs.rax
 /*
    stack:
@@ -119,6 +116,10 @@ global_asm!(
 "vmresume",
 "2:",
 "vmlaunch",
+"mov rax, [rsp]", // rax = *guest_regs
+"sub rax, {guest_regs_offset}", // rax = *VCpu
+"mov rdi, rax",
+"call 4f",
 "mov ax, 1",
 "add rsp, 0x8",
 "pop rbx",
@@ -161,6 +162,9 @@ global_asm!(
    */
 "push rax",
 "mov rax, qword ptr [rsp + 0x8]", // rax = *guest_regs
+"sub rax, {guest_regs_offset}", // rax = *VCpu
+"fxsave64 [rax + {guest_fx_state_offset}]",
+"add rax, {guest_regs_offset}", // rax = *guest_regs
 /*
    stack:
    +-------------+
@@ -208,7 +212,7 @@ global_asm!(
    +-------------+
    */
 
-// save rcx, rdx, rbx, rsi, rdi, rbp, r8~15, xmm0~7
+// save rcx, rdx, rbx, rsi, rdi, rbp, r8~15
 "mov [rax + {reg_offset_rcx}], rcx",
 "mov [rax + {reg_offset_rdx}], rdx",
 "mov [rax + {reg_offset_rbx}], rbx",
@@ -225,14 +229,10 @@ global_asm!(
 "mov [rax + {reg_offset_r14}], r14",
 "mov [rax + {reg_offset_r15}], r15",
 
-"movaps [rax + {reg_offset_xmm0}], xmm0",
-"movaps [rax + {reg_offset_xmm1}], xmm1",
-"movaps [rax + {reg_offset_xmm2}], xmm2",
-"movaps [rax + {reg_offset_xmm3}], xmm3",
-"movaps [rax + {reg_offset_xmm4}], xmm4",
-"movaps [rax + {reg_offset_xmm5}], xmm5",
-"movaps [rax + {reg_offset_xmm6}], xmm6",
-"movaps [rax + {reg_offset_xmm7}], xmm7",
+"mov rdi, rax",
+"sub rdi, {guest_regs_offset}", // rdi = *VCpu
+"call 4f",
+
 "pop rbx",
 "pop r12",
 "pop r13",
@@ -249,10 +249,34 @@ global_asm!(
 "mov rax, 0x0",
 "ret",
 
+// Restore all host processor state. rdi = *VCpu. Guest GPRs have already
+// been saved, so the XSETBV/XRSTOR operands may freely use caller-saved regs.
+"4:",
+"mov rax, [rdi + {host_xsave_mask_offset}]",
+"test rax, rax",
+"jz 5f",
+"mov rdx, rax",
+"shr rdx, 32",
+"xor ecx, ecx",
+"xsetbv",
+"mov rax, [rdi + {host_xsave_mask_offset}]",
+"mov rdx, rax",
+"shr rdx, 32",
+"mov rsi, [rdi + {host_xsave_addr_offset}]",
+"xrstor64 [rsi]",
+"ret",
+"5:",
+"fxrstor64 [rdi + {host_fx_state_offset}]",
+"ret",
+
 
 ".size asm_vmexit_handler, . - asm_vmexit_handler",
 
 guest_regs_offset = const offset_of!(IntelVCpu, guest_registers),
+host_fx_state_offset = const offset_of!(IntelVCpu, host_fx_state),
+guest_fx_state_offset = const offset_of!(IntelVCpu, guest_fx_state),
+host_xsave_addr_offset = const offset_of!(IntelVCpu, host_xsave_addr),
+host_xsave_mask_offset = const offset_of!(IntelVCpu, host_xsave_mask),
 launch_done_offset = const offset_of!(IntelVCpu, launch_done),
 reg_offset_rax = const offset_of!(GuestRegisters, rax),
 reg_offset_rcx = const offset_of!(GuestRegisters, rcx),
@@ -270,12 +294,4 @@ reg_offset_r12 = const offset_of!(GuestRegisters, r12),
 reg_offset_r13 = const offset_of!(GuestRegisters, r13),
 reg_offset_r14 = const offset_of!(GuestRegisters, r14),
 reg_offset_r15 = const offset_of!(GuestRegisters, r15),
-reg_offset_xmm0 = const offset_of!(GuestRegisters, xmm0),
-reg_offset_xmm1 = const offset_of!(GuestRegisters, xmm1),
-reg_offset_xmm2 = const offset_of!(GuestRegisters, xmm2),
-reg_offset_xmm3 = const offset_of!(GuestRegisters, xmm3),
-reg_offset_xmm4 = const offset_of!(GuestRegisters, xmm4),
-reg_offset_xmm5 = const offset_of!(GuestRegisters, xmm5),
-reg_offset_xmm6 = const offset_of!(GuestRegisters, xmm6),
-reg_offset_xmm7 = const offset_of!(GuestRegisters, xmm7),
 );

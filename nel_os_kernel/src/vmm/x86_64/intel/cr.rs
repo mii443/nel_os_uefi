@@ -16,12 +16,10 @@ pub fn handle_cr_access(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'sta
                 passthrough_write(vcpu, qual)?;
                 update_ia32e(vcpu)?;
             }
-            _ => panic!("Unsupported CR index: {}", qual.index()),
+            _ => return Err("Unsupported guest CR write"),
         },
         AccessType::MovFrom => passthrough_read(vcpu, qual)?,
-        _ => {
-            panic!("Unsupported CR access type: {:?}", qual.access_type());
-        }
+        _ => return Err("Unsupported guest CR access type"),
     }
 
     Ok(())
@@ -30,7 +28,7 @@ pub fn handle_cr_access(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'sta
 fn passthrough_read(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static str> {
     let value = match qual.index() {
         3 => vmread(x86::vmx::vmcs::guest::CR3)?,
-        _ => panic!("Unsupported CR index: {}", qual.index()),
+        _ => return Err("Unsupported guest CR read"),
     };
 
     set_value(vcpu, qual, value)?;
@@ -49,9 +47,7 @@ fn passthrough_write(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static
             vmwrite(vmcs::guest::CR4, adjust_cr4(value))?;
             vmwrite(vmcs::control::CR4_READ_SHADOW, value)?;
         }
-        _ => {
-            panic!("Unsupported CR index: {}", qual.index());
-        }
+        _ => return Err("Unsupported guest CR write"),
     }
 
     Ok(())

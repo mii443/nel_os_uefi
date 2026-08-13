@@ -1,5 +1,7 @@
+pub mod fxsave;
 pub mod linux;
 pub mod segment;
+pub mod xsave;
 
 use core::arch::asm;
 

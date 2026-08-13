@@ -3,9 +3,10 @@ use alloc::alloc::Global;
 use spin::Once;
 use x86_64::instructions::port::Port;
 
-use crate::interrupt::idt::IRQ_TIMER;
+use crate::{info, interrupt::idt::IRQ_TIMER};
 
 pub static LAPIC: Once<LocalApic> = Once::new();
+pub static GUEST_TSC_KHZ: Once<u64> = Once::new();
 
 pub fn disable_pic_8259() {
     unsafe {
@@ -67,6 +68,22 @@ pub const EOI: u32 = 0x00b0 / 4;
 const TPR: u32 = 0x0080 / 4;
 
 const PM_TIMER_FREQ: usize = 3579545;
+const CALIBRATION_MS: usize = 100;
+
+fn read_tsc_ordered() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags),
+        );
+    }
+    ((high as u64) << 32) | low as u64
+}
 
 pub fn init_local_apic(platform_info: PlatformInfo<'_, Global>) {
     disable_pic_8259();
@@ -91,7 +108,9 @@ pub fn init_local_apic(platform_info: PlatformInfo<'_, Global>) {
         .expect("PM Timer not found in ACPI tables");
     let mut time = Port::<u32>::new(pm_timer.base.address as u16);
     let start = unsafe { time.read() };
-    let mut end = start.wrapping_add((PM_TIMER_FREQ * 100 / 1000) as u32);
+    let tsc_start = read_tsc_ordered();
+    let calibration_ticks = PM_TIMER_FREQ * CALIBRATION_MS / 1000;
+    let mut end = start.wrapping_add(calibration_ticks as u32);
     if !pm_timer.supports_32bit {
         end &= 0x00ffffff;
     }
@@ -99,8 +118,17 @@ pub fn init_local_apic(platform_info: PlatformInfo<'_, Global>) {
         while unsafe { time.read() } >= start {}
     }
     while unsafe { time.read() } < end {}
+    let tsc_end = read_tsc_ordered();
     let local_apic_freq = u32::MAX - local_apic.read(TCCR);
     local_apic.write(TICR, 0);
+
+    let tsc_delta = tsc_end.wrapping_sub(tsc_start);
+    let tsc_khz =
+        (tsc_delta as u128 * PM_TIMER_FREQ as u128 / calibration_ticks as u128 / 1000) as u64;
+    if tsc_khz != 0 && u32::try_from(tsc_khz).is_ok() {
+        GUEST_TSC_KHZ.call_once(|| tsc_khz);
+        info!("TSC calibrated at {} kHz using ACPI PM timer", tsc_khz);
+    }
 
     local_apic.write(TDCR, X1);
     local_apic.write(TIMER, PERIODIC | IRQ_TIMER);

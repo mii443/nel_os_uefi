@@ -49,10 +49,23 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     let cmdline_start = LAYOUT_CMDLINE;
     let cmdline_end = cmdline_start + cmdline_max_size as u64;
     vcpu.write_memory_ranged(cmdline_start, cmdline_end, 0)?;
+    let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+        .get()
+        .copied()
+        .ok_or("TSC frequency was not calibrated before guest setup")?;
     // PCI devices belong to the outer nel_os instance. Passing their MMIO and
     // DMA through to an NPT-backed L2 guest would bypass guest-RAM translation.
-    let cmdline_val = "console=ttyS0 earlyprintk=serial nokaslr pci=off";
+    // The guest observes the same TSC as this single-vCPU host (no SVM TSC
+    // offset/scaling), so the ACPI PM-timer measurement is its exact early
+    // calibration reference as well.
+    let cmdline_val = alloc::format!(
+        "console=ttyS0 earlyprintk=serial nokaslr pci=off tsc_early_khz={} tsc=reliable",
+        tsc_khz
+    );
     let cmdline_bytes = cmdline_val.as_bytes();
+    if cmdline_bytes.len() >= cmdline_max_size as usize {
+        return Err("Linux command line is too small for the measured TSC frequency");
+    }
     for (i, &byte) in cmdline_bytes.iter().enumerate() {
         vcpu.write_memory(cmdline_start + i as u64, byte)?;
     }

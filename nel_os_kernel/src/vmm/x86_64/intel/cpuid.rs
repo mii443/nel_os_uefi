@@ -74,7 +74,10 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
                 invalid(vcpu);
             }
             _ => {
-                panic!("Unhandled CPUID leaf: {:#x}.{:#x}", regs.rax, regs.rcx);
+                // Architecturally unsupported structured-feature subleaves
+                // return zero.  The subleaf is guest-controlled, so it must
+                // never be allowed to panic the host.
+                invalid(vcpu);
             }
         },
         VmxLeaf::EXTENDED_PROCESSOR_SIGNATURE => {
