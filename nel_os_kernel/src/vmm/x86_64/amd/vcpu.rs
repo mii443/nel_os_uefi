@@ -8,18 +8,21 @@ use x86_64::{
 use crate::{
     error, info, serial,
     vmm::{
-        VCpu,
         x86_64::{
             amd::{
                 npt::Npt,
                 permissions::PermissionMaps,
                 register::GuestRegisters,
-                vmcb::{Flags1, InterceptVector1, InterceptVector2, Vmcb, VmcbSegment},
+                vmcb::{
+                    Flags1, InterceptVector1, InterceptVector2, InterruptShadowFlags, Vmcb,
+                    VmcbSegment,
+                },
             },
             common::{
-                self, X86VCpu, fxsave::FxState, segment::*, write_msr, xsave::HostXsaveState,
+                self, fxsave::FxState, segment::*, write_msr, xsave::HostXsaveState, X86VCpu,
             },
         },
+        VCpu,
     },
 };
 
@@ -31,6 +34,9 @@ pub struct AMDVCpu {
     npt: Npt,
     permission_maps: PermissionMaps,
     serial: SerialState,
+    legacy_timer: LegacyTimer,
+    halted: bool,
+    tsc_aux: u64,
     guest_registers: GuestRegisters,
     host_fx_state: FxState,
     guest_fx_state: FxState,
@@ -48,6 +54,239 @@ struct SerialState {
     scratch: u8,
     divisor_low: u8,
     divisor_high: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PicInitPhase {
+    Ready,
+    Icw2,
+    Icw3,
+    Icw4,
+}
+
+struct PicState {
+    master_mask: u8,
+    slave_mask: u8,
+    master_base: u8,
+    slave_base: u8,
+    master_phase: PicInitPhase,
+    slave_phase: PicInitPhase,
+    read_isr: bool,
+    irq0_pending: bool,
+    irq0_in_service: bool,
+}
+
+impl PicState {
+    fn new() -> Self {
+        Self {
+            master_mask: u8::MAX,
+            slave_mask: u8::MAX,
+            master_base: 0x20,
+            slave_base: 0x28,
+            master_phase: PicInitPhase::Ready,
+            slave_phase: PicInitPhase::Ready,
+            read_isr: false,
+            irq0_pending: false,
+            irq0_in_service: false,
+        }
+    }
+
+    fn read(&self, port: u16) -> u8 {
+        match port {
+            0x20 if self.read_isr => self.irq0_in_service as u8,
+            0x20 => self.irq0_pending as u8,
+            0x21 => self.master_mask,
+            0xa0 => 0,
+            0xa1 => self.slave_mask,
+            _ => u8::MAX,
+        }
+    }
+
+    fn write(&mut self, port: u16, value: u8) {
+        match port {
+            0x20 if value & 0x10 != 0 => {
+                self.master_phase = PicInitPhase::Icw2;
+                self.master_mask = u8::MAX;
+            }
+            0xa0 if value & 0x10 != 0 => {
+                self.slave_phase = PicInitPhase::Icw2;
+                self.slave_mask = u8::MAX;
+            }
+            0x20 if value == 0x0a => self.read_isr = false,
+            0x20 if value == 0x0b => self.read_isr = true,
+            0x20 if value == 0x20 || value & 0xf8 == 0x60 => self.irq0_in_service = false,
+            0x21 => match self.master_phase {
+                PicInitPhase::Icw2 => {
+                    self.master_base = value & 0xf8;
+                    self.master_phase = PicInitPhase::Icw3;
+                }
+                PicInitPhase::Icw3 => self.master_phase = PicInitPhase::Icw4,
+                PicInitPhase::Icw4 => self.master_phase = PicInitPhase::Ready,
+                PicInitPhase::Ready => self.master_mask = value,
+            },
+            0xa1 => match self.slave_phase {
+                PicInitPhase::Icw2 => {
+                    self.slave_base = value & 0xf8;
+                    self.slave_phase = PicInitPhase::Icw3;
+                }
+                PicInitPhase::Icw3 => self.slave_phase = PicInitPhase::Icw4,
+                PicInitPhase::Icw4 => self.slave_phase = PicInitPhase::Ready,
+                PicInitPhase::Ready => self.slave_mask = value,
+            },
+            _ => {}
+        }
+    }
+
+    fn can_inject_irq0(&self) -> bool {
+        self.master_phase == PicInitPhase::Ready
+            && self.irq0_pending
+            && !self.irq0_in_service
+            && self.master_mask & 1 == 0
+    }
+}
+
+struct PitChannel0 {
+    tsc_hz: u64,
+    access_mode: u8,
+    mode: u8,
+    reload_low: u8,
+    reload: u32,
+    deadline: u64,
+    armed: bool,
+    write_high: bool,
+    read_high: bool,
+    read_latch: Option<u16>,
+}
+
+impl PitChannel0 {
+    const PIT_HZ: u64 = 1_193_182;
+
+    fn new(tsc_khz: u64) -> Self {
+        Self {
+            tsc_hz: tsc_khz * 1000,
+            access_mode: 3,
+            mode: 3,
+            reload_low: 0,
+            reload: 0x1_0000,
+            deadline: 0,
+            armed: false,
+            write_high: false,
+            read_high: false,
+            read_latch: None,
+        }
+    }
+
+    fn rdtsc() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    fn period_cycles(&self) -> u64 {
+        ((self.reload as u128 * self.tsc_hz as u128 / Self::PIT_HZ as u128) as u64).max(1)
+    }
+
+    fn program(&mut self, value: u16) {
+        self.reload = if value == 0 { 0x1_0000 } else { value as u32 };
+        self.deadline = Self::rdtsc().wrapping_add(self.period_cycles());
+        self.armed = true;
+        self.read_latch = None;
+        self.read_high = false;
+    }
+
+    fn write(&mut self, value: u8) {
+        match self.access_mode {
+            1 => self.program(value as u16),
+            2 => self.program((value as u16) << 8),
+            3 if !self.write_high => {
+                self.reload_low = value;
+                self.write_high = true;
+            }
+            3 => {
+                self.write_high = false;
+                self.program(u16::from_le_bytes([self.reload_low, value]));
+            }
+            _ => {}
+        }
+    }
+
+    fn write_control(&mut self, value: u8) {
+        if value >> 6 != 0 {
+            return;
+        }
+        let access_mode = (value >> 4) & 3;
+        if access_mode == 0 {
+            self.read_latch = Some(self.current_count());
+            self.read_high = false;
+            return;
+        }
+        self.access_mode = access_mode;
+        self.mode = (value >> 1) & 7;
+        if self.mode >= 6 {
+            self.mode -= 4;
+        }
+        self.write_high = false;
+        self.read_high = false;
+        self.read_latch = None;
+    }
+
+    fn current_count(&self) -> u16 {
+        if !self.armed {
+            return self.reload as u16;
+        }
+        let remaining_cycles = self.deadline.saturating_sub(Self::rdtsc());
+        let ticks = (remaining_cycles as u128 * Self::PIT_HZ as u128 / self.tsc_hz as u128)
+            .min(self.reload as u128) as u32;
+        ticks as u16
+    }
+
+    fn read(&mut self) -> u8 {
+        if self.access_mode == 3 && !self.read_high && self.read_latch.is_none() {
+            self.read_latch = Some(self.current_count());
+        }
+        let count = self.read_latch.unwrap_or_else(|| self.current_count());
+        let value = match self.access_mode {
+            1 => count as u8,
+            2 => (count >> 8) as u8,
+            _ if self.read_high => (count >> 8) as u8,
+            _ => count as u8,
+        };
+        if self.access_mode == 3 {
+            self.read_high = !self.read_high;
+            if !self.read_high {
+                self.read_latch = None;
+            }
+        }
+        value
+    }
+
+    fn poll(&mut self) -> bool {
+        if !self.armed || Self::rdtsc() < self.deadline {
+            return false;
+        }
+        if matches!(self.mode, 2 | 3) {
+            let period = self.period_cycles();
+            let elapsed = Self::rdtsc().wrapping_sub(self.deadline);
+            self.deadline = self
+                .deadline
+                .wrapping_add((elapsed / period + 1).saturating_mul(period));
+        } else {
+            self.armed = false;
+        }
+        true
+    }
+}
+
+struct LegacyTimer {
+    pic: PicState,
+    pit: PitChannel0,
+}
+
+impl LegacyTimer {
+    fn new(tsc_khz: u64) -> Self {
+        Self {
+            pic: PicState::new(),
+            pit: PitChannel0::new(tsc_khz),
+        }
+    }
 }
 
 const GUEST_MEMORY_SIZE: u64 = 256 * 1024 * 1024;
@@ -261,11 +500,40 @@ impl AMDVCpu {
                     | (1 << 28)
                     | (1 << 29)
                     | (1 << 31));
-                result.edx &= !(1 << 9);
+                // Machine-check and MTRR state is MSR-backed.  Advertising
+                // these while the default-deny MSRPM rejects their MSRs sends
+                // Linux down a partially initialized firmware-error path.
+                result.edx &= !((1 << 7) | (1 << 9) | (1 << 12) | (1 << 14) | (1 << 28));
+
+                // The VMM exposes one vCPU. Do not leak the physical initial
+                // APIC ID or the host's logical-processor count.
+                result.ebx = (result.ebx & 0x0000_ffff) | (1 << 16);
+            }
+            0x0000_000b | 0x0000_001f | 0x8000_0026 => {
+                // Enumerate one thread in one core. A zero shift is valid for
+                // a level containing a single logical processor.
+                result.eax = 0;
+                result.ebx = 1;
+                result.ecx = match subleaf {
+                    0 => 1 << 8,       // SMT level
+                    1 => (2 << 8) | 1, // Core level
+                    _ => 0,
+                };
+                result.edx = 0;
+                if subleaf > 1 {
+                    result.ebx = 0;
+                }
             }
             0x0000_0007 => {
+                if subleaf != 0 {
+                    result.eax = 0;
+                    result.ebx = 0;
+                    result.ecx = 0;
+                    result.edx = 0;
+                }
                 // Do not advertise AVX2/AVX-512 without complete extended
-                // processor-state isolation.
+                // processor-state isolation. Speculation-control MSRs are
+                // also not virtualized, so do not promise their semantics.
                 result.ebx &= !((1 << 5)
                     | (1 << 16)
                     | (1 << 17)
@@ -274,6 +542,27 @@ impl AMDVCpu {
                     | (1 << 27)
                     | (1 << 28)
                     | (1 << 30)
+                    | (1 << 31));
+                result.ecx &= !((1 << 1)
+                    | (1 << 6)
+                    | (1 << 9)
+                    | (1 << 10)
+                    | (1 << 11)
+                    | (1 << 12)
+                    | (1 << 14)
+                    // RDPID exposes the physical host's TSC_AUX unless the
+                    // instruction itself is virtualized.
+                    | (1 << 22));
+                result.edx &= !((1 << 2)
+                    | (1 << 3)
+                    | (1 << 8)
+                    | (1 << 22)
+                    | (1 << 23)
+                    | (1 << 24)
+                    | (1 << 25)
+                    | (1 << 26)
+                    | (1 << 27)
+                    | (1 << 29)
                     | (1 << 31));
             }
             0x0000_000d => {
@@ -284,7 +573,51 @@ impl AMDVCpu {
             }
             // Do not expose another level of SVM until its state is fully
             // virtualized by this VMM.
-            0x8000_0001 => result.ecx &= !((1 << 2) | (1 << 11) | (1 << 16)),
+            0x8000_0001 => {
+                result.ecx &= !((1 << 2) | (1 << 11) | (1 << 16));
+                // AMD repeats legacy feature flags in this extended leaf;
+                // keep it consistent with leaf 1.
+                result.edx &= !((1 << 7)
+                    | (1 << 9)
+                    | (1 << 12)
+                    | (1 << 14)
+                    // RDTSCP returns the physical host's TSC_AUX.  The MSR
+                    // permission map only shadows guest WRMSR/RDMSR, so do
+                    // not advertise the instruction until it is intercepted.
+                    | (1 << 27));
+            }
+            0x8000_0008 => {
+                // RDPRU and speculative-execution mitigation controls require
+                // dedicated virtualization. Hiding them prevents the guest
+                // from relying on MSRs which are intentionally intercepted.
+                result.ebx &= !((1 << 4)
+                    | (1 << 12)
+                    | (1 << 14)
+                    | (1 << 15)
+                    | (1 << 16)
+                    | (1 << 17)
+                    | (1 << 18)
+                    | (1 << 19)
+                    | (1 << 24)
+                    | (1 << 25)
+                    | (1 << 26)
+                    | (1 << 28)
+                    | (1 << 29)
+                    | (1 << 30)
+                    | (1 << 31));
+
+                // NC=0 means one core; a zero APIC-ID core-width lets legacy
+                // enumeration derive the same single-core topology.
+                result.ecx &= !0xffff;
+            }
+            0x8000_001e => {
+                // Extended APIC ID, compute-unit ID/thread count, and node ID
+                // all describe CPU 0 as the sole thread/core/node.
+                result.eax = 0;
+                result.ebx = 0;
+                result.ecx = 0;
+                result.edx = 0;
+            }
             0x4000_0000..=0x4000_00ff | 0x8000_000a => {
                 result.eax = 0;
                 result.ebx = 0;
@@ -313,6 +646,76 @@ impl AMDVCpu {
         Ok(())
     }
 
+    fn prepare_timer_interrupt(&mut self) -> Result<(), &'static str> {
+        if self.legacy_timer.pit.poll() {
+            self.legacy_timer.pic.irq0_pending = true;
+        }
+        if !self.legacy_timer.pic.irq0_pending {
+            return Ok(());
+        }
+
+        let vmcb = self.vmcb.get_raw_vmcb();
+        let interrupts_enabled = vmcb.state_save_area.rflags & (1 << 9) != 0;
+        let in_interrupt_shadow = vmcb
+            .control_area
+            .interrupt_shadow_flags
+            .contains(InterruptShadowFlags::INTERRUPT_SHADOW);
+        let event_already_pending = vmcb.control_area.event_injection & (1 << 31) != 0;
+        let can_inject_pic = self.legacy_timer.pic.can_inject_irq0();
+        if !can_inject_pic || !interrupts_enabled || in_interrupt_shadow || event_already_pending {
+            return Ok(());
+        }
+
+        if self.halted {
+            self.advance_guest_rip()?;
+            self.halted = false;
+        }
+
+        const EVENT_VALID: u64 = 1 << 31;
+        let vector = self.legacy_timer.pic.master_base;
+        let control = &mut self.vmcb.get_raw_vmcb().control_area;
+        // EVENTINJ type 0 is an architectural external interrupt.
+        control.event_injection = vector as u64 | EVENT_VALID;
+        control.vmcb_clean_bits = 0;
+        self.legacy_timer.pic.irq0_pending = false;
+        self.legacy_timer.pic.irq0_in_service = true;
+        Ok(())
+    }
+
+    fn should_reenter_hlt_to_clear_shadow(&mut self) -> bool {
+        if !self.halted
+            || !self.legacy_timer.pic.irq0_pending
+            || !self.legacy_timer.pic.can_inject_irq0()
+        {
+            return false;
+        }
+
+        let vmcb = self.vmcb.get_raw_vmcb();
+        let interrupts_enabled = vmcb.state_save_area.rflags & (1 << 9) != 0;
+        let in_interrupt_shadow = vmcb
+            .control_area
+            .interrupt_shadow_flags
+            .contains(InterruptShadowFlags::INTERRUPT_SHADOW);
+        let event_already_pending = vmcb.control_area.event_injection & (1 << 31) != 0;
+
+        interrupts_enabled && in_interrupt_shadow && !event_already_pending
+    }
+
+    fn inject_exception(&mut self, vector: u8, error_code: Option<u32>) {
+        const EVENT_TYPE_EXCEPTION: u64 = 3;
+        const EVENT_ERROR_CODE_VALID: u64 = 1 << 11;
+        const EVENT_VALID: u64 = 1 << 31;
+
+        let mut event = vector as u64 | (EVENT_TYPE_EXCEPTION << 8) | EVENT_VALID;
+        if let Some(error_code) = error_code {
+            event |= EVENT_ERROR_CODE_VALID | ((error_code as u64) << 32);
+        }
+
+        let control = &mut self.vmcb.get_raw_vmcb().control_area;
+        control.event_injection = event;
+        control.vmcb_clean_bits = 0;
+    }
+
     fn handle_io(&mut self) -> Result<(), &'static str> {
         let exit_info = self.vmcb.get_raw_vmcb().control_area.exit_info1;
         let is_input = exit_info & 1 != 0;
@@ -332,15 +735,14 @@ impl AMDVCpu {
         };
 
         if is_input {
-            let value = if size == 1 && (0x3f8..=0x3ff).contains(&port) {
-                self.serial_in(port) as u32
-            } else {
-                match size {
-                    1 => u8::MAX as u32,
-                    2 => u16::MAX as u32,
-                    4 => u32::MAX,
-                    _ => unreachable!(),
-                }
+            let value = match (port, size) {
+                (0x40, 1) => self.legacy_timer.pit.read() as u32,
+                (0x20 | 0x21 | 0xa0 | 0xa1, 1) => self.legacy_timer.pic.read(port) as u32,
+                (0x3f8..=0x3ff, 1) => self.serial_in(port) as u32,
+                (_, 1) => u8::MAX as u32,
+                (_, 2) => u16::MAX as u32,
+                (_, 4) => u32::MAX,
+                _ => unreachable!(),
             };
             let mask = match size {
                 1 => u8::MAX as u64,
@@ -351,6 +753,15 @@ impl AMDVCpu {
             };
             let rax = &mut self.vmcb.get_raw_vmcb().state_save_area.rax;
             *rax = (*rax & !mask) | value as u64;
+        } else if size == 1 && port == 0x40 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.legacy_timer.pit.write(value);
+        } else if size == 1 && port == 0x43 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.legacy_timer.pit.write_control(value);
+        } else if size == 1 && matches!(port, 0x20 | 0x21 | 0xa0 | 0xa1) {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.legacy_timer.pic.write(port, value);
         } else if size == 1 && (0x3f8..=0x3ff).contains(&port) {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.serial_out(port, value);
@@ -401,6 +812,8 @@ impl AMDVCpu {
         const SYSENTER_ESP: u32 = 0x175;
         const SYSENTER_EIP: u32 = 0x176;
         const PAT: u32 = 0x277;
+        const PATCH_LEVEL: u32 = 0x8b;
+        const TSC_AUX: u32 = 0xc000_0103;
 
         let is_write = self.vmcb.get_raw_vmcb().control_area.exit_info1 & 1 != 0;
         let index = self.guest_registers.rcx as u32;
@@ -421,7 +834,15 @@ impl AMDVCpu {
                 SYSENTER_ESP => state.sysenter_esp = value,
                 SYSENTER_EIP => state.sysenter_eip = value,
                 PAT => state.g_pat = value,
-                _ => return Err("AMD guest attempted unsupported WRMSR"),
+                TSC_AUX => self.tsc_aux = value,
+                _ => {
+                    info!(
+                        "Unsupported AMD guest WRMSR: index={:#x} value={:#x}",
+                        index, value
+                    );
+                    self.inject_exception(13, Some(0));
+                    return Ok(());
+                }
             }
         } else {
             let state = &self.vmcb.get_raw_vmcb().state_save_area;
@@ -438,7 +859,16 @@ impl AMDVCpu {
                 SYSENTER_ESP => state.sysenter_esp,
                 SYSENTER_EIP => state.sysenter_eip,
                 PAT => state.g_pat,
-                _ => return Err("AMD guest attempted unsupported RDMSR"),
+                // Linux reads the AMD microcode patch level during early
+                // boot. Expose a neutral virtual value without consulting
+                // the host MSR.
+                PATCH_LEVEL => 0,
+                TSC_AUX => self.tsc_aux,
+                _ => {
+                    info!("Unsupported AMD guest RDMSR: {:#x}", index);
+                    self.inject_exception(13, Some(0));
+                    return Ok(());
+                }
             };
             self.vmcb.get_raw_vmcb().state_save_area.rax = value as u32 as u64;
             self.guest_registers.rdx = (value >> 32) as u32 as u64;
@@ -534,6 +964,17 @@ impl VCpu for AMDVCpu {
                 vmcb.control_area.tlb_control = 0;
             }
 
+            self.prepare_timer_interrupt()?;
+            if self.halted && !self.should_reenter_hlt_to_clear_shadow() {
+                // Do not repeatedly enter the same intercepted HLT while no
+                // interrupt is deliverable. Returning from this
+                // without_interrupts closure lets L1 service interrupts
+                // between polls. A pending IRQ after STI;HLT is allowed one
+                // re-entry to retire the interrupt shadow; the next poll can
+                // then advance NRIP and inject the interrupt.
+                return Ok(());
+            }
+
             write_msr(0xC001_0117, self.hsave.start_address().as_u64());
 
             self.host_xsave_state.save_host_and_load_guest(3)?;
@@ -549,7 +990,7 @@ impl VCpu for AMDVCpu {
 
             let vmcb = self.vmcb.get_raw_vmcb();
             let exit_code = vmcb.control_area.exit_code;
-            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x78) {
+            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x78 | 0x7b | 0x7c) {
                 info!(
                     "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
                     exit_code,
@@ -565,7 +1006,12 @@ impl VCpu for AMDVCpu {
                     self.handle_cpuid();
                     Ok(())
                 }
-                0x78 => Ok(()), // HLT
+                0x78 => {
+                    // Poll on the intercepted HLT until an interrupt is
+                    // deliverable. IRQ injection advances to NRIP.
+                    self.halted = true;
+                    Ok(())
+                }
                 0x7b => self.handle_io(),
                 0x7c => self.handle_msr(),
                 0x8c => Err("AMD guest attempted unsupported XSETBV"),
@@ -628,6 +1074,10 @@ impl VCpu for AMDVCpu {
         let host_xsave_state = HostXsaveState::new(frame_allocator)?;
         let host_xsave_addr = host_xsave_state.addr();
         let host_xsave_mask = host_xsave_state.mask();
+        let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .ok_or("TSC frequency unavailable for AMD legacy timer")?;
 
         Ok(AMDVCpu {
             initialized: false,
@@ -637,6 +1087,9 @@ impl VCpu for AMDVCpu {
             npt: Npt::new(frame_allocator)?,
             permission_maps,
             serial: SerialState::default(),
+            legacy_timer: LegacyTimer::new(tsc_khz),
+            halted: false,
+            tsc_aux: 0,
             guest_registers: GuestRegisters::default(),
             host_fx_state: FxState::zeroed(),
             guest_fx_state: FxState::guest_default(),
