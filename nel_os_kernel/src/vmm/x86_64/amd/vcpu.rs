@@ -34,9 +34,11 @@ pub struct AMDVCpu {
     npt: Npt,
     permission_maps: PermissionMaps,
     serial: SerialState,
+    rtc: RtcState,
     legacy_timer: LegacyTimer,
     halted: bool,
     tsc_aux: u64,
+    host_patch_level: u64,
     guest_registers: GuestRegisters,
     host_fx_state: FxState,
     guest_fx_state: FxState,
@@ -54,6 +56,58 @@ struct SerialState {
     scratch: u8,
     divisor_low: u8,
     divisor_high: u8,
+}
+
+struct RtcState {
+    selector: u8,
+    registers: [u8; 128],
+}
+
+impl RtcState {
+    fn new() -> Self {
+        let mut registers = [0; 128];
+        // Fixed, valid BCD timestamp: 2000-01-01 00:00:00 (Saturday).
+        registers[0x06] = 0x07;
+        registers[0x07] = 0x01;
+        registers[0x08] = 0x01;
+        registers[0x09] = 0x00;
+        registers[0x0a] = 0x26; // UIP clear, 32-KHz divider.
+        registers[0x0b] = 0x02; // BCD, 24-hour mode, interrupts disabled.
+        registers[0x0c] = 0x00;
+        registers[0x0d] = 0x80; // Valid RAM/time (VRT).
+        registers[0x32] = 0x20; // Conventional BCD century byte.
+        Self {
+            selector: 0,
+            registers,
+        }
+    }
+
+    fn select(&mut self, value: u8) {
+        self.selector = value;
+    }
+
+    fn read_selector(&self) -> u8 {
+        self.selector
+    }
+
+    fn read_data(&self) -> u8 {
+        match self.selector & 0x7f {
+            0x0a => self.registers[0x0a] & 0x7f,
+            0x0c => 0,
+            0x0d => self.registers[0x0d] | 0x80,
+            index => self.registers[index as usize],
+        }
+    }
+
+    fn write_data(&mut self, value: u8) {
+        let index = (self.selector & 0x7f) as usize;
+        self.registers[index] = match index {
+            0x0a => value & 0x7f,
+            0x0c => 0,
+            0x0d => value | 0x80,
+            _ => value,
+        };
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -302,6 +356,14 @@ impl AMDVCpu {
     {
         info!("Setting up AMD VCPU for a Linux guest");
 
+        // Without the hardware pause filter, intercepting every PAUSE turns
+        // normal spin loops into a VMEXIT storm. Require the architectural
+        // filter before using PAUSE as a cooperative timer polling point.
+        const SVM_FEATURE_PAUSE_FILTER: u32 = 1 << 10;
+        if cpuid!(0x8000_000a).edx & SVM_FEATURE_PAUSE_FILTER == 0 {
+            return Err("SVM pause filter is required for AMD timer preemption");
+        }
+
         self.init_guest_memory(frame_allocator)?;
         common::linux::load_kernel(self)?;
         self.setup_linux_segments();
@@ -312,6 +374,7 @@ impl AMDVCpu {
                 InterceptVector1::CPUID
                     | InterceptVector1::RDPMC
                     | InterceptVector1::INVD
+                    | InterceptVector1::PAUSE
                     | InterceptVector1::HLT
                     | InterceptVector1::INVLPGA
                     | InterceptVector1::IOIO_PROT
@@ -336,6 +399,7 @@ impl AMDVCpu {
 
             raw_vmcb.control_area.iopm_base_pa = self.permission_maps.iopm_base_pa();
             raw_vmcb.control_area.msrpm_base_pa = self.permission_maps.msrpm_base_pa();
+            raw_vmcb.control_area.pause_filter_count = 4096;
 
             raw_vmcb.control_area.guest_asid = 1;
             raw_vmcb.control_area.flags1.set(Flags1::NP_ENABLE, true);
@@ -495,6 +559,8 @@ impl AMDVCpu {
             0x0000_0001 => {
                 result.ecx &= !((1 << 12)
                     | (1 << 21)
+                    // A TSC deadline requires a virtual local APIC timer.
+                    | (1 << 24)
                     | (1 << 26)
                     | (1 << 27)
                     | (1 << 28)
@@ -531,10 +597,10 @@ impl AMDVCpu {
                     result.ecx = 0;
                     result.edx = 0;
                 }
-                // Do not advertise AVX2/AVX-512 without complete extended
-                // processor-state isolation. Speculation-control MSRs are
-                // also not virtualized, so do not promise their semantics.
-                result.ebx &= !((1 << 5)
+                // IA32_TSC_ADJUST, AVX2/AVX-512, and speculation-control
+                // MSRs are not fully virtualized, so do not promise them.
+                result.ebx &= !((1 << 1)
+                    | (1 << 5)
                     | (1 << 16)
                     | (1 << 17)
                     | (1 << 21)
@@ -701,6 +767,30 @@ impl AMDVCpu {
         interrupts_enabled && in_interrupt_shadow && !event_already_pending
     }
 
+    fn preserve_interrupted_event(&mut self) -> Result<(), &'static str> {
+        const EVENT_VALID: u64 = 1 << 31;
+
+        let control = &mut self.vmcb.get_raw_vmcb().control_area;
+        let interrupted_event = control.exit_int_info;
+        if interrupted_event & EVENT_VALID == 0 {
+            return Ok(());
+        }
+
+        // EXITINTINFO describes an event whose delivery was interrupted by
+        // this VMEXIT. SVM does not queue it automatically: copying the full
+        // field preserves vector, type, error-code-valid, and error code for
+        // the next VMRUN. Losing an injected IRQ0 here would leave the virtual
+        // PIC in-service forever because the guest never reaches its handler
+        // and EOI.
+        let pending_event = control.event_injection;
+        if pending_event & EVENT_VALID != 0 && pending_event != interrupted_event {
+            return Err("AMD VMEXIT returned an event while another injection was pending");
+        }
+        control.event_injection = interrupted_event;
+        control.vmcb_clean_bits = 0;
+        Ok(())
+    }
+
     fn inject_exception(&mut self, vector: u8, error_code: Option<u32>) {
         const EVENT_TYPE_EXCEPTION: u64 = 3;
         const EVENT_ERROR_CODE_VALID: u64 = 1 << 11;
@@ -737,6 +827,8 @@ impl AMDVCpu {
         if is_input {
             let value = match (port, size) {
                 (0x40, 1) => self.legacy_timer.pit.read() as u32,
+                (0x70, 1) => self.rtc.read_selector() as u32,
+                (0x71, 1) => self.rtc.read_data() as u32,
                 (0x20 | 0x21 | 0xa0 | 0xa1, 1) => self.legacy_timer.pic.read(port) as u32,
                 (0x3f8..=0x3ff, 1) => self.serial_in(port) as u32,
                 (_, 1) => u8::MAX as u32,
@@ -759,6 +851,12 @@ impl AMDVCpu {
         } else if size == 1 && port == 0x43 {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.legacy_timer.pit.write_control(value);
+        } else if size == 1 && port == 0x70 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.rtc.select(value);
+        } else if size == 1 && port == 0x71 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.rtc.write_data(value);
         } else if size == 1 && matches!(port, 0x20 | 0x21 | 0xa0 | 0xa1) {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.legacy_timer.pic.write(port, value);
@@ -859,10 +957,11 @@ impl AMDVCpu {
                 SYSENTER_ESP => state.sysenter_esp,
                 SYSENTER_EIP => state.sysenter_eip,
                 PAT => state.g_pat,
-                // Linux reads the AMD microcode patch level during early
-                // boot. Expose a neutral virtual value without consulting
-                // the host MSR.
-                PATCH_LEVEL => 0,
+                // The physical family/model is exposed to the guest, so the
+                // matching host patch revision is the only consistent
+                // read-only value. It is captured once when the VCPU is
+                // created; guest accesses never pass through to the host MSR.
+                PATCH_LEVEL => self.host_patch_level,
                 TSC_AUX => self.tsc_aux,
                 _ => {
                     info!("Unsupported AMD guest RDMSR: {:#x}", index);
@@ -961,11 +1060,13 @@ impl VCpu for AMDVCpu {
                 vmcb.control_area.exit_code = 0;
                 vmcb.control_area.exit_info1 = 0;
                 vmcb.control_area.exit_info2 = 0;
+                vmcb.control_area.exit_int_info = 0;
                 vmcb.control_area.tlb_control = 0;
             }
 
             self.prepare_timer_interrupt()?;
-            if self.halted && !self.should_reenter_hlt_to_clear_shadow() {
+            let should_reenter_hlt = self.should_reenter_hlt_to_clear_shadow();
+            if self.halted && !should_reenter_hlt {
                 // Do not repeatedly enter the same intercepted HLT while no
                 // interrupt is deliverable. Returning from this
                 // without_interrupts closure lets L1 service interrupts
@@ -988,9 +1089,11 @@ impl VCpu for AMDVCpu {
                 self.host_xsave_mask,
             );
 
+            self.preserve_interrupted_event()?;
+
             let vmcb = self.vmcb.get_raw_vmcb();
             let exit_code = vmcb.control_area.exit_code;
-            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x78 | 0x7b | 0x7c) {
+            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x77 | 0x78 | 0x7b | 0x7c) {
                 info!(
                     "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
                     exit_code,
@@ -1006,6 +1109,7 @@ impl VCpu for AMDVCpu {
                     self.handle_cpuid();
                     Ok(())
                 }
+                0x77 => self.advance_guest_rip(),
                 0x78 => {
                     // Poll on the intercepted HLT until an interrupt is
                     // deliverable. IRQ injection advances to NRIP.
@@ -1074,6 +1178,7 @@ impl VCpu for AMDVCpu {
         let host_xsave_state = HostXsaveState::new(frame_allocator)?;
         let host_xsave_addr = host_xsave_state.addr();
         let host_xsave_mask = host_xsave_state.mask();
+        let host_patch_level = common::read_msr(0x8b);
         let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
             .get()
             .copied()
@@ -1087,9 +1192,11 @@ impl VCpu for AMDVCpu {
             npt: Npt::new(frame_allocator)?,
             permission_maps,
             serial: SerialState::default(),
+            rtc: RtcState::new(),
             legacy_timer: LegacyTimer::new(tsc_khz),
             halted: false,
             tsc_aux: 0,
+            host_patch_level,
             guest_registers: GuestRegisters::default(),
             host_fx_state: FxState::zeroed(),
             guest_fx_state: FxState::guest_default(),
