@@ -1,25 +1,23 @@
-use core::arch::{
-    asm,
-    x86_64::{_xgetbv, _xsetbv},
-};
+use core::arch::{asm, x86_64::_xgetbv};
 
 use raw_cpuid::cpuid;
-use x86::controlregs::cr4;
 use x86_64::{
+    VirtAddr,
     registers::control::{Cr4, Cr4Flags},
     structures::paging::{FrameAllocator, Size4KiB},
-    VirtAddr,
 };
 
 use crate::{
+    constant::PAGE_SIZE,
     info, interrupt,
     vmm::{
+        VCpu,
         x86_64::{
-            common::{self, read_msr, X86VCpu},
+            common::{self, X86VCpu, fxsave::FxState, read_msr, xsave::HostXsaveState},
             intel::{
                 auditor, controls, cpuid, ept,
                 fpu::{self, XCR0},
-                io::{vmm_interrupt_subscriber, IOBitmap},
+                io::{IOBitmap, vmm_interrupt_subscriber},
                 msr::{self, ShadowMsr},
                 qual::{QualCr, QualIo},
                 register::GuestRegisters,
@@ -32,7 +30,6 @@ use crate::{
                 vmread, vmwrite, vmxon,
             },
         },
-        VCpu,
     },
 };
 const TEMP_STACK_SIZE: usize = 4096;
@@ -42,6 +39,11 @@ static mut TEMP_STACK: [u8; TEMP_STACK_SIZE + 0x10] = [0; TEMP_STACK_SIZE + 0x10
 pub struct IntelVCpu {
     pub launch_done: bool,
     pub guest_registers: GuestRegisters,
+    pub host_fx_state: FxState,
+    pub guest_fx_state: FxState,
+    pub host_xsave_addr: u64,
+    pub host_xsave_mask: u64,
+    host_xsave_state: HostXsaveState,
     activated: bool,
     vmxon: vmxon::Vmxon,
     vmcs: vmcs::Vmcs,
@@ -81,7 +83,9 @@ impl IntelVCpu {
             return Err("VMEntry failure");
         } else {
             let basic_reason = (exit_reason_raw & 0xFFFF) as u16;
-            let exit_reason: VmxExitReason = basic_reason.try_into().unwrap();
+            let exit_reason: VmxExitReason = basic_reason
+                .try_into()
+                .map_err(|_| "Unknown VMX exit reason")?;
 
             match exit_reason {
                 VmxExitReason::HLT => {
@@ -105,37 +109,54 @@ impl IntelVCpu {
                     self.step_next_inst()?;
                 }
                 VmxExitReason::RDMSR => {
-                    msr::ShadowMsr::handle_read_msr_vmexit(self);
-                    self.step_next_inst()?;
+                    if msr::ShadowMsr::handle_read_msr_vmexit(self).is_ok() {
+                        self.step_next_inst()?;
+                    } else {
+                        self.pic.inject_exception(13, Some(0))?;
+                    }
                 }
                 VmxExitReason::WRMSR => {
-                    msr::ShadowMsr::handle_wrmsr_vmexit(self);
-                    self.step_next_inst()?;
+                    if msr::ShadowMsr::handle_wrmsr_vmexit(self).is_ok() {
+                        self.step_next_inst()?;
+                    } else {
+                        self.pic.inject_exception(13, Some(0))?;
+                    }
                 }
                 VmxExitReason::CONTROL_REGISTER_ACCESSES => {
                     let qual = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
                     let qual = QualCr::from(qual);
 
-                    super::cr::handle_cr_access(self, &qual)?;
-
-                    self.step_next_inst()?;
+                    if super::cr::handle_cr_access(self, &qual).is_ok() {
+                        self.step_next_inst()?;
+                    } else {
+                        self.pic.inject_exception(13, Some(0))?;
+                    }
                 }
                 VmxExitReason::XSETBV => {
-                    fpu::set_xcr(
-                        self,
-                        self.guest_registers.rcx as u32,
-                        self.guest_registers.rax,
-                    )?;
-
-                    self.step_next_inst()?;
+                    let guest_cr4 = vmread(vmcs::guest::CR4)?;
+                    let value = ((self.guest_registers.rdx & 0xffff_ffff) << 32)
+                        | (self.guest_registers.rax & 0xffff_ffff);
+                    if guest_cr4 & Cr4Flags::OSXSAVE.bits() == 0 {
+                        self.pic.inject_exception(6, None)?;
+                    } else if fpu::set_xcr(self, self.guest_registers.rcx as u32, value).is_ok() {
+                        self.step_next_inst()?;
+                    } else {
+                        self.pic.inject_exception(13, Some(0))?;
+                    }
                 }
                 VmxExitReason::IO_INSTRUCTION => {
                     let qual = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
                     let qual_io = QualIo::from(qual);
 
-                    self.pic.handle_io(&mut self.guest_registers, qual_io);
-
-                    self.step_next_inst()?;
+                    if self
+                        .pic
+                        .handle_io(&mut self.guest_registers, qual_io)
+                        .is_ok()
+                    {
+                        self.step_next_inst()?;
+                    } else {
+                        self.pic.inject_exception(6, None)?;
+                    }
                 }
                 VmxExitReason::EXTERNAL_INTERRUPT => {
                     vmwrite(vmcs::ro::VMEXIT_INTERRUPTION_INFO, 0)?;
@@ -158,17 +179,17 @@ impl IntelVCpu {
                     return Err("Triple fault");
                 }
                 VmxExitReason::EXCEPTION => {
-                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO).unwrap();
+                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO)?;
                     let vector = (vmexit_intr_info & 0xFF) as u32;
                     let has_error_code = (vmexit_intr_info & (1 << 11)) != 0;
 
                     let error_code = if has_error_code {
-                        Some(vmread(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE).unwrap() as u32)
+                        Some(vmread(vmcs::ro::VMEXIT_INTERRUPTION_ERR_CODE)? as u32)
                     } else {
                         None
                     };
 
-                    let rip = vmread(vmcs::guest::RIP).unwrap();
+                    let rip = vmread(vmcs::guest::RIP)?;
 
                     let mut instruction_bytes = [0u8; 16];
                     let mut valid_bytes = 0;
@@ -194,42 +215,16 @@ impl IntelVCpu {
                         }
                     }
 
-                    if valid_bytes > 0 {
-                        match instruction_bytes[0] {
-                            0x0F => {
-                                if valid_bytes > 1 {
-                                    match instruction_bytes[1] {
-                                        0x01 => match instruction_bytes[2] {
-                                            0xCA => {
-                                                let rflags = vmread(vmcs::guest::RFLAGS).unwrap();
-                                                vmwrite(vmcs::guest::RFLAGS, rflags & !(1 << 18))
-                                                    .unwrap();
-                                                self.step_next_inst().unwrap();
-                                            }
-                                            0xCB => {
-                                                let rflags = vmread(vmcs::guest::RFLAGS).unwrap();
-                                                vmwrite(vmcs::guest::RFLAGS, rflags | (1 << 18))
-                                                    .unwrap();
-                                                self.step_next_inst().unwrap();
-                                            }
-                                            _ => {
-                                                self.pic
-                                                    .inject_exception(vector, error_code)
-                                                    .unwrap();
-                                            }
-                                        },
-                                        _ => {
-                                            self.pic.inject_exception(vector, error_code).unwrap();
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                self.pic.inject_exception(vector, error_code).unwrap();
-                            }
-                        }
+                    if valid_bytes > 2 && instruction_bytes[..3] == [0x0f, 0x01, 0xca] {
+                        let rflags = vmread(vmcs::guest::RFLAGS)?;
+                        vmwrite(vmcs::guest::RFLAGS, rflags & !(1 << 18))?;
+                        self.step_next_inst()?;
+                    } else if valid_bytes > 2 && instruction_bytes[..3] == [0x0f, 0x01, 0xcb] {
+                        let rflags = vmread(vmcs::guest::RFLAGS)?;
+                        vmwrite(vmcs::guest::RFLAGS, rflags | (1 << 18))?;
+                        self.step_next_inst()?;
                     } else {
-                        self.pic.inject_exception(vector, error_code).unwrap();
+                        self.pic.inject_exception(vector, error_code)?;
                     }
                 }
                 _ => {
@@ -242,46 +237,18 @@ impl IntelVCpu {
     }
 
     fn load_guest_xcr0(&mut self) -> Result<(), &'static str> {
-        let host_cr4 = unsafe { cr4() };
-        if (host_cr4.bits() & Cr4Flags::OSXSAVE.bits() as usize) == 0 {
-            return Ok(());
+        unsafe {
+            self.host_xsave_state
+                .save_host_and_load_guest(u64::from(self.guest_xcr0))
         }
-
-        if self.host_xcr0 == 0 {
-            self.host_xcr0 = unsafe { _xgetbv(0) };
-        }
-
-        let guest_cr4 = vmread(x86::vmx::vmcs::guest::CR4)?;
-
-        if guest_cr4 & Cr4Flags::OSXSAVE.bits() != 0
-            && u64::from(self.guest_xcr0) != self.host_xcr0
-            && u64::from(self.guest_xcr0) != 0
-        {
-            unsafe {
-                _xsetbv(0, u64::from(self.guest_xcr0));
-            }
-        }
-
-        Ok(())
     }
 
     fn load_host_xcr0(&mut self) -> Result<(), &'static str> {
-        let host_cr4 = unsafe { cr4() };
-        if (host_cr4.bits() & Cr4Flags::OSXSAVE.bits() as usize) == 0 {
-            return Ok(());
+        if self.host_xsave_state.is_enabled()
+            && unsafe { _xgetbv(0) } != self.host_xsave_state.mask()
+        {
+            return Err("VM-exit failed to restore host XCR0");
         }
-
-        let guest_cr4 = vmread(x86::vmx::vmcs::guest::CR4)?;
-
-        if guest_cr4 & Cr4Flags::OSXSAVE.bits() != 0 {
-            let current_xcr0 = unsafe { _xgetbv(0) };
-            if current_xcr0 != self.host_xcr0 {
-                unsafe {
-                    _xsetbv(0, self.host_xcr0);
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -368,6 +335,9 @@ impl IntelVCpu {
             let frame = frame_allocator.allocate_frame().ok_or("No free frames")?;
             let hpa = frame.start_address().as_u64();
 
+            unsafe {
+                core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE);
+            }
             self.ept.map_4k(gpa, hpa, frame_allocator)?;
             gpa += 0x1000;
             pages -= 1;
@@ -845,7 +815,8 @@ impl VCpu for IntelVCpu {
             self.activated = true;
         }
 
-        self.vmentry().map_err(|e| e.to_str())?;
+        x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
+            .map_err(|e| e.to_str())?;
         self.vmexit_handler()?;
 
         Ok(())
@@ -896,10 +867,18 @@ impl VCpu for IntelVCpu {
 
         let ept = ept::Ept::new(frame_allocator)?;
         let eptp = ept::Eptp::init(&ept.root_table);
+        let host_xsave_state = HostXsaveState::new(frame_allocator)?;
+        let host_xsave_addr = host_xsave_state.addr();
+        let host_xsave_mask = host_xsave_state.mask();
 
         Ok(IntelVCpu {
             launch_done: false,
             guest_registers: GuestRegisters::default(),
+            host_fx_state: FxState::zeroed(),
+            guest_fx_state: FxState::guest_default(),
+            host_xsave_addr,
+            host_xsave_mask,
+            host_xsave_state,
             activated: false,
             vmxon,
             vmcs,
@@ -911,8 +890,8 @@ impl VCpu for IntelVCpu {
             ia32e_enabled: false,
             pic: super::io::Pic::new(),
             io_bitmap: IOBitmap::new(frame_allocator),
-            host_xcr0: 0,
-            guest_xcr0: XCR0::new(),
+            host_xcr0: host_xsave_mask,
+            guest_xcr0: XCR0::from(1),
         })
     }
 

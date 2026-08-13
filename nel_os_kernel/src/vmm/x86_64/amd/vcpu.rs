@@ -1,20 +1,24 @@
 use raw_cpuid::cpuid;
 use x86_64::{
     instructions::interrupts,
+    registers::control::{Cr4, Cr4Flags},
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
 use crate::{
-    error, info,
+    error, info, serial,
     vmm::{
         VCpu,
         x86_64::{
             amd::{
                 npt::Npt,
+                permissions::PermissionMaps,
                 register::GuestRegisters,
                 vmcb::{Flags1, InterceptVector1, InterceptVector2, Vmcb, VmcbSegment},
             },
-            common::{self, X86VCpu, segment::*, write_msr},
+            common::{
+                self, X86VCpu, fxsave::FxState, segment::*, write_msr, xsave::HostXsaveState,
+            },
         },
     },
 };
@@ -25,8 +29,25 @@ pub struct AMDVCpu {
     vmcb: Vmcb,
     hsave: PhysFrame,
     npt: Npt,
+    permission_maps: PermissionMaps,
+    serial: SerialState,
     guest_registers: GuestRegisters,
+    host_fx_state: FxState,
+    guest_fx_state: FxState,
+    host_xsave_addr: u64,
+    host_xsave_mask: u64,
+    host_xsave_state: HostXsaveState,
     guest_memory_size: u64,
+}
+
+#[derive(Default)]
+struct SerialState {
+    ier: u8,
+    lcr: u8,
+    mcr: u8,
+    scratch: u8,
+    divisor_low: u8,
+    divisor_high: u8,
 }
 
 const GUEST_MEMORY_SIZE: u64 = 256 * 1024 * 1024;
@@ -48,19 +69,34 @@ impl AMDVCpu {
 
         {
             let raw_vmcb = self.vmcb.get_raw_vmcb();
-            raw_vmcb
-                .control_area
-                .intercept_vec1
-                .set(InterceptVector1::SHUTDOWN, true);
-            raw_vmcb
-                .control_area
-                .intercept_vec1
-                .set(InterceptVector1::CPUID, true);
+            raw_vmcb.control_area.intercept_vec1.insert(
+                InterceptVector1::CPUID
+                    | InterceptVector1::RDPMC
+                    | InterceptVector1::INVD
+                    | InterceptVector1::HLT
+                    | InterceptVector1::INVLPGA
+                    | InterceptVector1::IOIO_PROT
+                    | InterceptVector1::MSR_PROT
+                    | InterceptVector1::SHUTDOWN,
+            );
 
-            raw_vmcb
-                .control_area
-                .intercept_vec2
-                .set(InterceptVector2::VMRUN, true);
+            raw_vmcb.control_area.intercept_vec2.insert(
+                InterceptVector2::VMRUN
+                    | InterceptVector2::VMMCALL
+                    | InterceptVector2::VMLOAD
+                    | InterceptVector2::VMSAVE
+                    | InterceptVector2::STGI
+                    | InterceptVector2::CLGI
+                    | InterceptVector2::SKINIT
+                    | InterceptVector2::WBINVD
+                    | InterceptVector2::MONITOR
+                    | InterceptVector2::MWAIT
+                    | InterceptVector2::XSETBV
+                    | InterceptVector2::RDPRU,
+            );
+
+            raw_vmcb.control_area.iopm_base_pa = self.permission_maps.iopm_base_pa();
+            raw_vmcb.control_area.msrpm_base_pa = self.permission_maps.msrpm_base_pa();
 
             raw_vmcb.control_area.guest_asid = 1;
             raw_vmcb.control_area.flags1.set(Flags1::NP_ENABLE, true);
@@ -206,11 +242,6 @@ impl AMDVCpu {
             gpa += PAGE_SIZE;
         }
 
-        // Allow a nested Linux guest to access the legacy IOAPIC and LAPIC
-        // MMIO pages exposed by the outer QEMU machine.
-        for mmio_gpa in [0xfec0_0000, 0xfee0_0000] {
-            self.npt.map_4k(mmio_gpa, mmio_gpa, frame_allocator)?;
-        }
         Ok(())
     }
 
@@ -222,10 +253,38 @@ impl AMDVCpu {
         match leaf {
             // L1 does not yet implement KVM paravirtual MSRs for L2. Hide the
             // hypervisor bit so Linux selects its native AMD clock path.
-            0x0000_0001 => result.ecx &= !(1 << 31),
+            0x0000_0001 => {
+                result.ecx &= !((1 << 12)
+                    | (1 << 21)
+                    | (1 << 26)
+                    | (1 << 27)
+                    | (1 << 28)
+                    | (1 << 29)
+                    | (1 << 31));
+                result.edx &= !(1 << 9);
+            }
+            0x0000_0007 => {
+                // Do not advertise AVX2/AVX-512 without complete extended
+                // processor-state isolation.
+                result.ebx &= !((1 << 5)
+                    | (1 << 16)
+                    | (1 << 17)
+                    | (1 << 21)
+                    | (1 << 26)
+                    | (1 << 27)
+                    | (1 << 28)
+                    | (1 << 30)
+                    | (1 << 31));
+            }
+            0x0000_000d => {
+                result.eax = 0;
+                result.ebx = 0;
+                result.ecx = 0;
+                result.edx = 0;
+            }
             // Do not expose another level of SVM until its state is fully
             // virtualized by this VMM.
-            0x8000_0001 => result.ecx &= !(1 << 2),
+            0x8000_0001 => result.ecx &= !((1 << 2) | (1 << 11) | (1 << 16)),
             0x4000_0000..=0x4000_00ff | 0x8000_000a => {
                 result.eax = 0;
                 result.ebx = 0;
@@ -242,6 +301,150 @@ impl AMDVCpu {
         self.guest_registers.rdx = result.edx as u64;
         vmcb.state_save_area.rip = vmcb.control_area.next_rip;
         vmcb.control_area.vmcb_clean_bits = 0;
+    }
+
+    fn advance_guest_rip(&mut self) -> Result<(), &'static str> {
+        let vmcb = self.vmcb.get_raw_vmcb();
+        if vmcb.control_area.next_rip <= vmcb.state_save_area.rip {
+            return Err("AMD VMEXIT did not provide a valid next RIP");
+        }
+        vmcb.state_save_area.rip = vmcb.control_area.next_rip;
+        vmcb.control_area.vmcb_clean_bits = 0;
+        Ok(())
+    }
+
+    fn handle_io(&mut self) -> Result<(), &'static str> {
+        let exit_info = self.vmcb.get_raw_vmcb().control_area.exit_info1;
+        let is_input = exit_info & 1 != 0;
+        let is_string = exit_info & (1 << 2) != 0;
+        let is_rep = exit_info & (1 << 3) != 0;
+        let size_bits = (exit_info >> 4) & 0x7;
+        let port = ((exit_info >> 16) & 0xffff) as u16;
+
+        if is_string || is_rep {
+            return Err("AMD guest attempted unsupported string I/O");
+        }
+        let size = match size_bits {
+            1 => 1,
+            2 => 2,
+            4 => 4,
+            _ => return Err("AMD guest attempted I/O with invalid operand size"),
+        };
+
+        if is_input {
+            let value = if size == 1 && (0x3f8..=0x3ff).contains(&port) {
+                self.serial_in(port) as u32
+            } else {
+                match size {
+                    1 => u8::MAX as u32,
+                    2 => u16::MAX as u32,
+                    4 => u32::MAX,
+                    _ => unreachable!(),
+                }
+            };
+            let mask = match size {
+                1 => u8::MAX as u64,
+                2 => u16::MAX as u64,
+                // A 32-bit register write clears the upper half of RAX.
+                4 => u64::MAX,
+                _ => unreachable!(),
+            };
+            let rax = &mut self.vmcb.get_raw_vmcb().state_save_area.rax;
+            *rax = (*rax & !mask) | value as u64;
+        } else if size == 1 && (0x3f8..=0x3ff).contains(&port) {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.serial_out(port, value);
+        }
+
+        self.advance_guest_rip()
+    }
+
+    fn serial_in(&self, port: u16) -> u8 {
+        match port {
+            0x3f8 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_low,
+            0x3f8 => 0,
+            0x3f9 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_high,
+            0x3f9 => self.serial.ier,
+            0x3fa => 0x01, // no interrupt pending
+            0x3fb => self.serial.lcr,
+            0x3fc => self.serial.mcr,
+            0x3fd => 0x60, // transmitter holding register and transmitter empty
+            0x3fe => 0xb0,
+            0x3ff => self.serial.scratch,
+            _ => u8::MAX,
+        }
+    }
+
+    fn serial_out(&mut self, port: u16, value: u8) {
+        match port {
+            0x3f8 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_low = value,
+            0x3f8 => serial::write_byte(value),
+            0x3f9 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_high = value,
+            0x3f9 => self.serial.ier = value,
+            0x3fb => self.serial.lcr = value,
+            0x3fc => self.serial.mcr = value,
+            0x3ff => self.serial.scratch = value,
+            _ => {}
+        }
+    }
+
+    fn handle_msr(&mut self) -> Result<(), &'static str> {
+        const EFER: u32 = 0xc000_0080;
+        const STAR: u32 = 0xc000_0081;
+        const LSTAR: u32 = 0xc000_0082;
+        const CSTAR: u32 = 0xc000_0083;
+        const SFMASK: u32 = 0xc000_0084;
+        const FS_BASE: u32 = 0xc000_0100;
+        const GS_BASE: u32 = 0xc000_0101;
+        const KERNEL_GS_BASE: u32 = 0xc000_0102;
+        const SYSENTER_CS: u32 = 0x174;
+        const SYSENTER_ESP: u32 = 0x175;
+        const SYSENTER_EIP: u32 = 0x176;
+        const PAT: u32 = 0x277;
+
+        let is_write = self.vmcb.get_raw_vmcb().control_area.exit_info1 & 1 != 0;
+        let index = self.guest_registers.rcx as u32;
+        if is_write {
+            let value = (self.guest_registers.rdx as u32 as u64) << 32
+                | self.vmcb.get_raw_vmcb().state_save_area.rax as u32 as u64;
+            let state = &mut self.vmcb.get_raw_vmcb().state_save_area;
+            match index {
+                EFER => state.efer = value | (1 << 12),
+                STAR => state.star = value,
+                LSTAR => state.lstar = value,
+                CSTAR => state.cstar = value,
+                SFMASK => state.sfmask = value,
+                FS_BASE => state.fs.base = value,
+                GS_BASE => state.gs.base = value,
+                KERNEL_GS_BASE => state.kernel_gs_base = value,
+                SYSENTER_CS => state.sysenter_cs = value,
+                SYSENTER_ESP => state.sysenter_esp = value,
+                SYSENTER_EIP => state.sysenter_eip = value,
+                PAT => state.g_pat = value,
+                _ => return Err("AMD guest attempted unsupported WRMSR"),
+            }
+        } else {
+            let state = &self.vmcb.get_raw_vmcb().state_save_area;
+            let value = match index {
+                EFER => state.efer,
+                STAR => state.star,
+                LSTAR => state.lstar,
+                CSTAR => state.cstar,
+                SFMASK => state.sfmask,
+                FS_BASE => state.fs.base,
+                GS_BASE => state.gs.base,
+                KERNEL_GS_BASE => state.kernel_gs_base,
+                SYSENTER_CS => state.sysenter_cs,
+                SYSENTER_ESP => state.sysenter_esp,
+                SYSENTER_EIP => state.sysenter_eip,
+                PAT => state.g_pat,
+                _ => return Err("AMD guest attempted unsupported RDMSR"),
+            };
+            self.vmcb.get_raw_vmcb().state_save_area.rax = value as u32 as u64;
+            self.guest_registers.rdx = (value >> 32) as u32 as u64;
+        }
+
+        self.advance_guest_rip()
     }
 
     fn dump_guest_state(&mut self) {
@@ -333,9 +536,15 @@ impl VCpu for AMDVCpu {
 
             write_msr(0xC001_0117, self.hsave.start_address().as_u64());
 
+            self.host_xsave_state.save_host_and_load_guest(3)?;
+
             super::asm::asm_vmrun(
                 self.vmcb.frame.start_address().as_u64(),
                 &mut self.guest_registers,
+                &mut self.host_fx_state,
+                &mut self.guest_fx_state,
+                self.host_xsave_addr,
+                self.host_xsave_mask,
             );
 
             let vmcb = self.vmcb.get_raw_vmcb();
@@ -357,6 +566,9 @@ impl VCpu for AMDVCpu {
                     Ok(())
                 }
                 0x78 => Ok(()), // HLT
+                0x7b => self.handle_io(),
+                0x7c => self.handle_msr(),
+                0x8c => Err("AMD guest attempted unsupported XSETBV"),
                 0x7f => Err("AMD guest shutdown (likely a triple fault)"),
                 0x400 => Err("AMD nested page fault"),
                 u32::MAX => Err("VMRUN rejected the VMCB guest state"),
@@ -394,6 +606,13 @@ impl VCpu for AMDVCpu {
     where
         Self: Sized,
     {
+        // FXSAVE64/FXRSTOR64 are used around every VMRUN to isolate x87,
+        // MXCSR, and XMM state. Make the host prerequisite explicit before
+        // the first assembly entry.
+        unsafe {
+            Cr4::write(Cr4::read() | Cr4Flags::OSFXSR);
+        }
+
         let mut efer = common::read_msr(0xc000_0080);
         efer |= 1 << 12;
         common::write_msr(0xc000_0080, efer);
@@ -405,13 +624,25 @@ impl VCpu for AMDVCpu {
             core::ptr::write_bytes(hsave.start_address().as_u64() as *mut u8, 0, 4096);
         }
 
+        let permission_maps = PermissionMaps::new(frame_allocator)?;
+        let host_xsave_state = HostXsaveState::new(frame_allocator)?;
+        let host_xsave_addr = host_xsave_state.addr();
+        let host_xsave_mask = host_xsave_state.mask();
+
         Ok(AMDVCpu {
             initialized: false,
             exit_reported: false,
             vmcb: Vmcb::new(frame_allocator)?,
             hsave,
             npt: Npt::new(frame_allocator)?,
+            permission_maps,
+            serial: SerialState::default(),
             guest_registers: GuestRegisters::default(),
+            host_fx_state: FxState::zeroed(),
+            guest_fx_state: FxState::guest_default(),
+            host_xsave_addr,
+            host_xsave_mask,
+            host_xsave_state,
             guest_memory_size: GUEST_MEMORY_SIZE,
         })
     }

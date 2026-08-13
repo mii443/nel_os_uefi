@@ -13,6 +13,7 @@ pub mod vcpu;
 pub mod vmcs;
 mod vmexit;
 mod vmxon;
+mod xcr0;
 
 use core::arch::asm;
 

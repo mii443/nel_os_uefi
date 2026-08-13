@@ -1,8 +1,10 @@
 #![allow(non_snake_case)]
 
 use modular_bitfield::{bitfield, prelude::B44};
+use raw_cpuid::cpuid;
 
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
+use crate::vmm::x86_64::intel::xcr0::{GUEST_XCR0_MASK, validate};
 
 #[bitfield]
 #[repr(u64)]
@@ -32,36 +34,20 @@ pub struct XCR0 {
     __: B44,
 }
 
+pub fn supported_xcr0_mask() -> u64 {
+    let supported = cpuid!(0xD, 0);
+    ((supported.edx as u64) << 32) | supported.eax as u64
+}
+
+fn guest_supported_xcr0_mask() -> u64 {
+    supported_xcr0_mask() & GUEST_XCR0_MASK
+}
+
 pub fn set_xcr(vcpu: &mut IntelVCpu, index: u32, xcr: u64) -> Result<(), &'static str> {
-    if index != 0 {
-        return Err("Invalid XCR index");
-    }
-
-    if xcr & 0b1 == 0 {
-        return Err("X87 is not enabled");
-    }
-
-    if (xcr & 0b100 != 0) && (xcr & 0b10 == 0) {
-        return Err("SSE is not enabled");
-    }
-
-    if !(xcr & 0b1000) != (!(xcr & 0b10000)) {
-        return Err("BNDREGS and BNDCSR are not both enabled");
-    }
-
-    if xcr & 0b11100000 != 0 {
-        if xcr & 0b100 == 0 {
-            return Err("YMM bits are not enabled");
-        }
-
-        if (xcr & 0b11100000) != 0b11100000 {
-            return Err("Invalid bits set in XCR0");
-        }
-    }
-
-    if (xcr & 0b1000000000000 != 0) && (xcr & 0b1000000000000 != 0b1000000000000) {
-        return Err("xtile bits are not both enabled");
-    }
+    // CPUID.0xD exposes only x87 and SSE to this guest. Keep XSETBV in
+    // lock-step with that virtual capability surface even if the host supports
+    // additional state components.
+    validate(index, xcr, guest_supported_xcr0_mask())?;
 
     vcpu.guest_xcr0 = XCR0::from(xcr);
 

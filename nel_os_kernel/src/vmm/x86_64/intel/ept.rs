@@ -5,8 +5,8 @@ use modular_bitfield::{
     prelude::{B1, B3, B4, B52},
 };
 use x86_64::{
-    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
     PhysAddr,
+    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
 pub struct Ept {
@@ -27,16 +27,31 @@ impl Ept {
     }
 
     fn init_table(frame: &PhysFrame) {
-        let table_ptr = frame.start_address().as_u64();
-        let entries = unsafe { &mut *(table_ptr as *mut [EntryBase; 512]) };
-
-        for entry in entries {
-            entry.set_read(false);
-            entry.set_write(false);
-            entry.set_exec_super(false);
-            entry.set_map_memory(false);
-            entry.set_typ(0);
+        unsafe {
+            core::ptr::write_bytes(
+                frame.start_address().as_u64() as *mut u8,
+                0,
+                core::mem::size_of::<[EntryBase; 512]>(),
+            );
         }
+    }
+
+    fn table_entry(frame: &PhysFrame) -> EntryBase {
+        EntryBase::new()
+            .with_read(true)
+            .with_write(true)
+            .with_exec_super(true)
+            .with_phys(frame.start_address().as_u64() >> 12)
+    }
+
+    fn memory_entry(hpa: u64, map_memory: bool) -> EntryBase {
+        EntryBase::new()
+            .with_read(true)
+            .with_write(true)
+            .with_exec_super(true)
+            .with_typ(0)
+            .with_map_memory(map_memory)
+            .with_phys(hpa >> 12)
     }
 
     #[allow(dead_code)]
@@ -57,13 +72,9 @@ impl Ept {
             let frame = allocator
                 .allocate_frame()
                 .ok_or("Failed to allocate LV3 frame")?;
+            Self::init_table(&frame);
             let table_ptr = Self::frame_to_table_ptr(&frame);
-            lv4_entry.set_phys(frame.start_address().as_u64() >> 12);
-            lv4_entry.set_map_memory(false);
-            lv4_entry.set_typ(0);
-            lv4_entry.set_read(true);
-            lv4_entry.set_write(true);
-            lv4_entry.set_exec_super(true);
+            *lv4_entry = Self::table_entry(&frame);
 
             table_ptr
         } else {
@@ -78,13 +89,9 @@ impl Ept {
             let frame = allocator
                 .allocate_frame()
                 .ok_or("Failed to allocate LV2 frame")?;
+            Self::init_table(&frame);
             let table_ptr = Self::frame_to_table_ptr(&frame);
-            lv3_entry.set_phys(frame.start_address().as_u64() >> 12);
-            lv3_entry.set_map_memory(false);
-            lv3_entry.set_typ(0);
-            lv3_entry.set_read(true);
-            lv3_entry.set_write(true);
-            lv3_entry.set_exec_super(true);
+            *lv3_entry = Self::table_entry(&frame);
 
             table_ptr
         } else {
@@ -94,12 +101,7 @@ impl Ept {
         };
 
         let lv2_entry = &mut lv2_table[lv2_index as usize];
-        lv2_entry.set_phys(hpa >> 12);
-        lv2_entry.set_map_memory(true);
-        lv2_entry.set_typ(0);
-        lv2_entry.set_read(true);
-        lv2_entry.set_write(true);
-        lv2_entry.set_exec_super(true);
+        *lv2_entry = Self::memory_entry(hpa, true);
 
         Ok(())
     }
@@ -122,13 +124,9 @@ impl Ept {
             let frame = allocator
                 .allocate_frame()
                 .ok_or("Failed to allocate LV3 frame")?;
+            Self::init_table(&frame);
             let table_ptr = Self::frame_to_table_ptr(&frame);
-            lv4_entry.set_phys(frame.start_address().as_u64() >> 12);
-            lv4_entry.set_map_memory(false);
-            lv4_entry.set_typ(0);
-            lv4_entry.set_read(true);
-            lv4_entry.set_write(true);
-            lv4_entry.set_exec_super(true);
+            *lv4_entry = Self::table_entry(&frame);
 
             table_ptr
         } else {
@@ -143,13 +141,9 @@ impl Ept {
             let frame = allocator
                 .allocate_frame()
                 .ok_or("Failed to allocate LV2 frame")?;
+            Self::init_table(&frame);
             let table_ptr = Self::frame_to_table_ptr(&frame);
-            lv3_entry.set_phys(frame.start_address().as_u64() >> 12);
-            lv3_entry.set_map_memory(false);
-            lv3_entry.set_typ(0);
-            lv3_entry.set_read(true);
-            lv3_entry.set_write(true);
-            lv3_entry.set_exec_super(true);
+            *lv3_entry = Self::table_entry(&frame);
 
             table_ptr
         } else {
@@ -164,13 +158,9 @@ impl Ept {
             let frame = allocator
                 .allocate_frame()
                 .ok_or("Failed to allocate LV1 frame")?;
+            Self::init_table(&frame);
             let table_ptr = Self::frame_to_table_ptr(&frame);
-            lv2_entry.set_phys(frame.start_address().as_u64() >> 12);
-            lv2_entry.set_map_memory(false);
-            lv2_entry.set_typ(0);
-            lv2_entry.set_read(true);
-            lv2_entry.set_write(true);
-            lv2_entry.set_exec_super(true);
+            *lv2_entry = Self::table_entry(&frame);
 
             table_ptr
         } else {
@@ -180,12 +170,7 @@ impl Ept {
         };
 
         let lv1_entry = &mut lv1_table[lv1_index as usize];
-        lv1_entry.set_phys(hpa >> 12);
-        lv1_entry.set_map_memory(true);
-        lv1_entry.set_typ(0);
-        lv1_entry.set_read(true);
-        lv1_entry.set_write(true);
-        lv1_entry.set_exec_super(true);
+        *lv1_entry = Self::memory_entry(hpa, true);
 
         Ok(())
     }

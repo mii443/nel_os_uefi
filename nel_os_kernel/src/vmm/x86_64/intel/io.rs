@@ -1,7 +1,4 @@
-use x86::{
-    io::inb,
-    vmx::{self, vmcs},
-};
+use x86::vmx::{self, vmcs};
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
 use super::qual::QualIo;
@@ -84,7 +81,18 @@ impl Pic {
         }
     }
 
-    pub fn handle_io(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
+    pub fn handle_io(
+        &mut self,
+        regs: &mut GuestRegisters,
+        qual: QualIo,
+    ) -> Result<(), &'static str> {
+        // String and REP I/O require guest-memory translation and partial
+        // completion semantics. They are not implemented by this emulator, so
+        // reject them without touching host I/O or guest memory.
+        if qual.string() != 0 || qual.rep() != 0 {
+            return Err("String/REP guest I/O is unsupported");
+        }
+
         match qual.direction() {
             0 => {
                 self.handle_io_out(regs, qual);
@@ -94,6 +102,8 @@ impl Pic {
             }
             _ => {}
         }
+
+        Ok(())
     }
 
     pub fn inject_external_interrupt(&mut self) -> Result<bool, &'static str> {
@@ -218,9 +228,10 @@ impl Pic {
 
     fn handle_serial_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x3F8 => regs.rax = unsafe { inb(qual.port()).into() },
+            // No emulated receive FIFO is currently connected.
+            0x3F8 => regs.rax = 0,
             0x3F9 => regs.rax = self.serial.ier as u64,
-            0x3FA => {} //regs.rax = 0, //  unsafe { inb(qual.port()).into() },
+            0x3FA => {}
             0x3FB => {} //regs.rax = 0,
             0x3FC => {} //regs.rax = 0, //self.serial.mcr as u64,
             0x3FD => {
@@ -234,9 +245,7 @@ impl Pic {
                 }
             }
             0x3FF => {} //regs.rax = 0,
-            _ => {
-                panic!("Serial in: invalid port: {:#x}", qual.port());
-            }
+            _ => regs.rax = 0,
         }
     }
 
@@ -254,9 +263,7 @@ impl Pic {
             0x3FC => self.serial.mcr = regs.rax as u8,
             0x3FD => {}
             0x3FF => {}
-            _ => {
-                panic!("Serial out: invalid port: {:#x}", qual.port());
-            }
+            _ => {}
         }
     }
 
@@ -307,7 +314,9 @@ impl Pic {
                     let irq = dx & 0x7;
                     pic.primary_isr &= !(1 << irq);
                 }
-                _ => panic!("Primary Pic command: {:#x}", dx),
+                // Unsupported OCW/ICW commands are guest input. Ignore them
+                // instead of allowing a malformed command to stop the host.
+                _ => {}
             },
             0x21 => match pic.primary_phase {
                 InitPhase::Uninitialized | InitPhase::Initialized => pic.primary_mask = dx,
@@ -334,7 +343,7 @@ impl Pic {
                     let irq = dx & 0x7;
                     pic.secondary_isr &= !(1 << irq);
                 }
-                _ => panic!("Secondary Pic command: {:#x}", dx),
+                _ => {}
             },
             0xA1 => match pic.secondary_phase {
                 InitPhase::Uninitialized | InitPhase::Initialized => pic.secondary_mask = dx,
@@ -381,42 +390,9 @@ impl IOBitmap {
             core::ptr::write_bytes(bitmap_b_addr as *mut u8, u8::MAX, 4096);
         }
 
-        self.set_io_ports(0x0040..=0x0047);
-        self.set_io_ports(0x02F8..=0x03EF);
-        self.set_io_ports(0x03F8..=0x03FF);
-
         vmwrite(vmcs::control::IO_BITMAP_A_ADDR_FULL, bitmap_a_addr as u64)?;
         vmwrite(vmcs::control::IO_BITMAP_B_ADDR_FULL, bitmap_b_addr as u64)?;
 
         Ok(())
-    }
-
-    pub fn set_io_ports(&mut self, ports: core::ops::RangeInclusive<u16>) {
-        for port in ports {
-            if port <= 0x7FFF {
-                let byte_index = port as usize / 8;
-                let bit_index = port as usize % 8;
-
-                self.get_bitmap_a()[byte_index] &= !(1 << bit_index);
-            } else {
-                let adjusted_port = port - 0x8000;
-                let byte_index = adjusted_port as usize / 8;
-                let bit_index = adjusted_port as usize % 8;
-
-                self.get_bitmap_b()[byte_index] &= !(1 << bit_index);
-            }
-        }
-    }
-
-    fn get_bitmap_a(&mut self) -> &mut [u8] {
-        unsafe {
-            core::slice::from_raw_parts_mut(self.bitmap_a.start_address().as_u64() as *mut u8, 4096)
-        }
-    }
-
-    fn get_bitmap_b(&mut self) -> &mut [u8] {
-        unsafe {
-            core::slice::from_raw_parts_mut(self.bitmap_b.start_address().as_u64() as *mut u8, 4096)
-        }
     }
 }

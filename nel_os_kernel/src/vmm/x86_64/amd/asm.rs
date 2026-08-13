@@ -1,9 +1,17 @@
 use core::{arch::global_asm, mem::offset_of};
 
 use super::register::GuestRegisters;
+use crate::vmm::x86_64::common::fxsave::FxState;
 
 unsafe extern "C" {
-    pub unsafe fn asm_vmrun(vmcb_phys_addr: u64, registers: *mut GuestRegisters);
+    pub unsafe fn asm_vmrun(
+        vmcb_phys_addr: u64,
+        registers: *mut GuestRegisters,
+        host_fx_state: *mut FxState,
+        guest_fx_state: *mut FxState,
+        host_xsave_addr: u64,
+        host_xsave_mask: u64,
+    );
 }
 
 global_asm!(
@@ -18,6 +26,15 @@ global_asm!(
     "push rbx",
     "push rsi",
     "push rdi",
+    "push rdx",
+    "push rcx",
+    "push r8",
+    "push r9",
+    "test r9, r9",
+    "jnz 1f",
+    "fxsave64 [rdx]",
+    "1:",
+    "fxrstor64 [rcx]",
     "mov rax, rsi",
     "mov rcx, [rax + {rcx}]",
     "mov rdx, [rax + {rdx}]",
@@ -33,18 +50,10 @@ global_asm!(
     "mov r13, [rax + {r13}]",
     "mov r14, [rax + {r14}]",
     "mov r15, [rax + {r15}]",
-    "movaps xmm0, [rax + {xmm0}]",
-    "movaps xmm1, [rax + {xmm1}]",
-    "movaps xmm2, [rax + {xmm2}]",
-    "movaps xmm3, [rax + {xmm3}]",
-    "movaps xmm4, [rax + {xmm4}]",
-    "movaps xmm5, [rax + {xmm5}]",
-    "movaps xmm6, [rax + {xmm6}]",
-    "movaps xmm7, [rax + {xmm7}]",
-    "pop rax",
+    "mov rax, [rsp + 32]",
     "vmrun",
     "push rax",
-    "mov rax, [rsp + 8]",
+    "mov rax, [rsp + 48]",
     "mov [rax + {rcx}], rcx",
     "mov [rax + {rdx}], rdx",
     "mov [rax + {rbx}], rbx",
@@ -59,15 +68,26 @@ global_asm!(
     "mov [rax + {r13}], r13",
     "mov [rax + {r14}], r14",
     "mov [rax + {r15}], r15",
-    "movaps [rax + {xmm0}], xmm0",
-    "movaps [rax + {xmm1}], xmm1",
-    "movaps [rax + {xmm2}], xmm2",
-    "movaps [rax + {xmm3}], xmm3",
-    "movaps [rax + {xmm4}], xmm4",
-    "movaps [rax + {xmm5}], xmm5",
-    "movaps [rax + {xmm6}], xmm6",
-    "movaps [rax + {xmm7}], xmm7",
-    "add rsp, 16",
+    "mov rax, [rsp + 24]",
+    "fxsave64 [rax]",
+    "mov rax, [rsp + 8]", // host XSAVE mask
+    "test rax, rax",
+    "jz 2f",
+    "mov rdx, rax",
+    "shr rdx, 32",
+    "xor ecx, ecx",
+    "xsetbv",
+    "mov rax, [rsp + 8]",
+    "mov rdx, rax",
+    "shr rdx, 32",
+    "mov rcx, [rsp + 16]", // host XSAVE address
+    "xrstor64 [rcx]",
+    "jmp 3f",
+    "2:",
+    "mov rax, [rsp + 32]", // host FXSAVE address
+    "fxrstor64 [rax]",
+    "3:",
+    "add rsp, 56",
     "pop rbx",
     "pop r12",
     "pop r13",
@@ -90,12 +110,4 @@ global_asm!(
     r13 = const offset_of!(GuestRegisters, r13),
     r14 = const offset_of!(GuestRegisters, r14),
     r15 = const offset_of!(GuestRegisters, r15),
-    xmm0 = const offset_of!(GuestRegisters, xmm0),
-    xmm1 = const offset_of!(GuestRegisters, xmm1),
-    xmm2 = const offset_of!(GuestRegisters, xmm2),
-    xmm3 = const offset_of!(GuestRegisters, xmm3),
-    xmm4 = const offset_of!(GuestRegisters, xmm4),
-    xmm5 = const offset_of!(GuestRegisters, xmm5),
-    xmm6 = const offset_of!(GuestRegisters, xmm6),
-    xmm7 = const offset_of!(GuestRegisters, xmm7),
 );
