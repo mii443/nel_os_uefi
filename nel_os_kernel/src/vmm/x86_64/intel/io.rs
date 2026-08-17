@@ -204,8 +204,12 @@ impl Pic {
 
     fn handle_io_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x0CF8..=0x0CFF => regs.rax = 0,
-            0xC000..=0xCFFF => {} //ignore
+            // The outer kernel owns physical PCI and virtio I/O. Config-data
+            // reads return the architectural "no device" value and physical
+            // device BARs are never forwarded into the guest.
+            0x0CF8..=0x0CFB => regs.rax = 0,
+            0x0CFC..=0x0CFF => regs.rax = u32::MAX as u64,
+            0xC000..=0xCFFF => regs.rax = u32::MAX as u64,
             0x20..=0x21 => self.handle_pic_in(regs, qual),
             0xA0..=0xA1 => self.handle_pic_in(regs, qual),
             0x0070..=0x0071 => regs.rax = 0,

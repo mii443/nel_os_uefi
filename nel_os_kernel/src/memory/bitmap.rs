@@ -3,8 +3,8 @@ use core::slice;
 use nel_os_common::memory::{self, UsableMemory};
 use spin::Once;
 use x86_64::{
-    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
     PhysAddr,
+    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
 use crate::constant::{BITS_PER_ENTRY, PAGE_SIZE};
@@ -51,6 +51,11 @@ impl BitmapMemoryTable {
         for range in usable_memory.ranges() {
             table.set_range(range);
         }
+
+        // Never hand out physical page zero. Besides catching null pointers,
+        // firmware memory maps are allowed to describe boot-services storage
+        // at address zero, while Rust references may never be null.
+        table.set_frame(0, false);
 
         let bitmap_start_frame = Self::addr_to_pfn(bitmap_addr);
         let bitmap_frames = bitmap_size.div_ceil(PAGE_SIZE);

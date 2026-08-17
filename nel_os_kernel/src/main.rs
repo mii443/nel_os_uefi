@@ -12,6 +12,7 @@ pub mod graphics;
 pub mod interrupt;
 pub mod logging;
 pub mod memory;
+pub mod network;
 pub mod platform;
 pub mod serial;
 pub mod time;
@@ -23,12 +24,12 @@ use core::ptr::addr_of;
 
 use ::acpi::AcpiTables;
 use spin::Once;
-use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtAddr};
+use x86_64::{VirtAddr, registers::control::Cr3, structures::paging::OffsetPageTable};
 
 use crate::{
     acpi::KernelAcpiHandler,
     constant::{KERNEL_STACK_SIZE, PKG_VERSION},
-    graphics::{FrameBuffer, FRAME_BUFFER},
+    graphics::{FRAME_BUFFER, FrameBuffer},
     interrupt::apic,
     memory::{allocator, bitmap::BitmapMemoryTable, paging},
 };
@@ -49,7 +50,7 @@ static mut KERNEL_STACK: AlignedStack = AlignedStack {
 };
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn asm_main() -> ! {
+pub extern "sysv64" fn asm_main(boot_info: &nel_os_common::BootInfo) -> ! {
     unsafe {
         let stack_base = addr_of!(KERNEL_STACK.stack) as *const u8;
         let stack_top = stack_base.add(KERNEL_STACK_SIZE);
@@ -58,11 +59,12 @@ pub extern "sysv64" fn asm_main() -> ! {
             "mov rsp, {stack_top}",
             "call {main}",
             stack_top = in(reg) stack_top,
-            main = sym main
+            main = sym main,
+            in("rdi") boot_info,
+            clobber_abi("sysv64"),
+            options(noreturn),
         )
     }
-
-    hlt_loop();
 }
 
 #[panic_handler]
@@ -81,7 +83,7 @@ fn hlt_loop() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
+pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
     serial::disable_screen_output();
 
     interrupt::gdt::init();
@@ -180,13 +182,71 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     ROOTFS_ADDR.call_once(|| boot_info.rootfs_addr);
     ROOTFS_SIZE.call_once(|| boot_info.rootfs_size);
 
+    // The physical NIC is owned by the outer kernel. It is initialized before
+    // guest RAM is created, and is never mapped into EPT/NPT or represented by
+    // the guest's deliberately empty PCI model.
+    let mut network_device = match network::VirtioNet::probe(&mut bitmap_table) {
+        Ok(device) => device,
+        Err(error) => {
+            error!("Hypervisor network unavailable: {}", error);
+            error!("Linux VM will not start without a network start command");
+            hlt_loop();
+        }
+    };
+
+    info!(
+        "Linux VM is gated until DHCP completes and UDP port {} receives `start`",
+        network::CONTROL_PORT
+    );
+    loop {
+        if let Err(error) = network_device.poll() {
+            error!("Hypervisor network failed before VM start: {}", error);
+            hlt_loop();
+        }
+        if network_device.take_start_request() {
+            info!("Network start command accepted; creating Linux VM");
+            break;
+        }
+        unsafe {
+            asm!("hlt");
+        }
+    }
+
+    let mut network = Some(network_device);
     let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
 
     info!("Running guest VM...");
     loop {
+        if let Some(device) = network.as_mut() {
+            if let Err(error) = device.poll() {
+                error!("Hypervisor network poll failed: {}", error);
+                network = None;
+            }
+        }
+
         let result = vcpu.run(&mut bitmap_table);
         if let Err(e) = result {
             error!("VCPU run failed: {}", e);
+
+            // Host management networking remains useful even when the guest
+            // cannot start. The APIC timer wakes this polling loop without
+            // burning a core between packets.
+            if network.is_some() {
+                warn!("Guest stopped; keeping hypervisor networking online");
+                loop {
+                    if let Some(device) = network.as_mut() {
+                        if let Err(error) = device.poll() {
+                            error!("Hypervisor network poll failed: {}", error);
+                            network = None;
+                        }
+                    } else {
+                        hlt_loop();
+                    }
+                    unsafe {
+                        asm!("hlt");
+                    }
+                }
+            }
             break;
         }
     }
