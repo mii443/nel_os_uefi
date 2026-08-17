@@ -34,9 +34,11 @@ pub struct AMDVCpu {
     npt: Npt,
     permission_maps: PermissionMaps,
     serial: SerialState,
+    rtc: RtcState,
     legacy_timer: LegacyTimer,
     halted: bool,
     tsc_aux: u64,
+    host_patch_level: u64,
     guest_registers: GuestRegisters,
     host_fx_state: FxState,
     guest_fx_state: FxState,
@@ -46,7 +48,6 @@ pub struct AMDVCpu {
     guest_memory_size: u64,
 }
 
-#[derive(Default)]
 struct SerialState {
     ier: u8,
     lcr: u8,
@@ -54,6 +55,178 @@ struct SerialState {
     scratch: u8,
     divisor_low: u8,
     divisor_high: u8,
+    fifo_enabled: bool,
+    overrun: bool,
+    thre_interrupt_pending: bool,
+    rx: [u8; 256],
+    rx_head: usize,
+    rx_len: usize,
+}
+
+impl Default for SerialState {
+    fn default() -> Self {
+        Self {
+            ier: 0,
+            lcr: 0,
+            mcr: 0,
+            scratch: 0,
+            divisor_low: 0,
+            divisor_high: 0,
+            fifo_enabled: false,
+            overrun: false,
+            thre_interrupt_pending: false,
+            rx: [0; 256],
+            rx_head: 0,
+            rx_len: 0,
+        }
+    }
+}
+
+impl SerialState {
+    fn enqueue_rx(&mut self, value: u8) {
+        if self.rx_len == self.rx.len() {
+            self.overrun = true;
+            return;
+        }
+        let tail = (self.rx_head + self.rx_len) % self.rx.len();
+        self.rx[tail] = value;
+        self.rx_len += 1;
+    }
+
+    fn dequeue_rx(&mut self) -> u8 {
+        if self.rx_len == 0 {
+            return 0;
+        }
+        let value = self.rx[self.rx_head];
+        self.rx_head = (self.rx_head + 1) % self.rx.len();
+        self.rx_len -= 1;
+        value
+    }
+
+    fn clear_rx(&mut self) {
+        self.rx_head = 0;
+        self.rx_len = 0;
+        self.overrun = false;
+    }
+
+    fn write_ier(&mut self, value: u8) {
+        let old_ier = self.ier;
+        self.ier = value & 0x0f;
+        if old_ier & 0x02 == 0 && self.ier & 0x02 != 0 {
+            self.thre_interrupt_pending = true;
+        }
+    }
+
+    fn write_fcr(&mut self, value: u8) {
+        self.fifo_enabled = value & 1 != 0;
+        if value & 0x02 != 0 {
+            self.clear_rx();
+        }
+        if value & 0x04 != 0 && self.ier & 0x02 != 0 {
+            self.thre_interrupt_pending = true;
+        }
+    }
+
+    fn interrupt_identification(&mut self) -> u8 {
+        let fifo = if self.fifo_enabled { 0xc0 } else { 0 };
+        let reason = if self.overrun && self.ier & 0x04 != 0 {
+            0x06
+        } else if self.rx_len != 0 && self.ier & 0x01 != 0 {
+            0x04
+        } else if self.thre_interrupt_pending && self.ier & 0x02 != 0 {
+            // Reading IIR acknowledges the edge-like THRE indication. The
+            // next THR write completes immediately and raises it again.
+            self.thre_interrupt_pending = false;
+            0x02
+        } else {
+            0x01
+        };
+        fifo | reason
+    }
+
+    fn line_status(&mut self) -> u8 {
+        let mut status = 0x60; // THR and transmitter are always empty.
+        if self.rx_len != 0 {
+            status |= 0x01;
+        }
+        if self.overrun {
+            status |= 0x02;
+            self.overrun = false;
+        }
+        status
+    }
+
+    fn interrupt_pending(&self) -> bool {
+        (self.overrun && self.ier & 0x04 != 0)
+            || (self.rx_len != 0 && self.ier & 0x01 != 0)
+            || (self.thre_interrupt_pending && self.ier & 0x02 != 0)
+    }
+
+    fn interrupt_output_enabled(&self) -> bool {
+        self.mcr & 0x08 != 0
+    }
+
+    fn modem_status(&self) -> u8 {
+        if self.mcr & 0x10 == 0 {
+            return 0xb0;
+        }
+        ((self.mcr & 0x02) << 3)
+            | ((self.mcr & 0x01) << 5)
+            | ((self.mcr & 0x04) << 4)
+            | ((self.mcr & 0x08) << 4)
+    }
+}
+
+struct RtcState {
+    selector: u8,
+    registers: [u8; 128],
+}
+
+impl RtcState {
+    fn new() -> Self {
+        let mut registers = [0; 128];
+        // Fixed, valid BCD timestamp: 2000-01-01 00:00:00 (Saturday).
+        registers[0x06] = 0x07;
+        registers[0x07] = 0x01;
+        registers[0x08] = 0x01;
+        registers[0x09] = 0x00;
+        registers[0x0a] = 0x26; // UIP clear, 32-KHz divider.
+        registers[0x0b] = 0x02; // BCD, 24-hour mode, interrupts disabled.
+        registers[0x0c] = 0x00;
+        registers[0x0d] = 0x80; // Valid RAM/time (VRT).
+        registers[0x32] = 0x20; // Conventional BCD century byte.
+        Self {
+            selector: 0,
+            registers,
+        }
+    }
+
+    fn select(&mut self, value: u8) {
+        self.selector = value;
+    }
+
+    fn read_selector(&self) -> u8 {
+        self.selector
+    }
+
+    fn read_data(&self) -> u8 {
+        match self.selector & 0x7f {
+            0x0a => self.registers[0x0a] & 0x7f,
+            0x0c => 0,
+            0x0d => self.registers[0x0d] | 0x80,
+            index => self.registers[index as usize],
+        }
+    }
+
+    fn write_data(&mut self, value: u8) {
+        let index = (self.selector & 0x7f) as usize;
+        self.registers[index] = match index {
+            0x0a => value & 0x7f,
+            0x0c => 0,
+            0x0d => value | 0x80,
+            _ => value,
+        };
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,8 +245,8 @@ struct PicState {
     master_phase: PicInitPhase,
     slave_phase: PicInitPhase,
     read_isr: bool,
-    irq0_pending: bool,
-    irq0_in_service: bool,
+    master_irr: u8,
+    master_isr: u8,
 }
 
 impl PicState {
@@ -86,15 +259,15 @@ impl PicState {
             master_phase: PicInitPhase::Ready,
             slave_phase: PicInitPhase::Ready,
             read_isr: false,
-            irq0_pending: false,
-            irq0_in_service: false,
+            master_irr: 0,
+            master_isr: 0,
         }
     }
 
     fn read(&self, port: u16) -> u8 {
         match port {
-            0x20 if self.read_isr => self.irq0_in_service as u8,
-            0x20 => self.irq0_pending as u8,
+            0x20 if self.read_isr => self.master_isr,
+            0x20 => self.master_irr,
             0x21 => self.master_mask,
             0xa0 => 0,
             0xa1 => self.slave_mask,
@@ -107,6 +280,8 @@ impl PicState {
             0x20 if value & 0x10 != 0 => {
                 self.master_phase = PicInitPhase::Icw2;
                 self.master_mask = u8::MAX;
+                self.master_irr = 0;
+                self.master_isr = 0;
             }
             0xa0 if value & 0x10 != 0 => {
                 self.slave_phase = PicInitPhase::Icw2;
@@ -114,7 +289,12 @@ impl PicState {
             }
             0x20 if value == 0x0a => self.read_isr = false,
             0x20 if value == 0x0b => self.read_isr = true,
-            0x20 if value == 0x20 || value & 0xf8 == 0x60 => self.irq0_in_service = false,
+            0x20 if value == 0x20 => {
+                if self.master_isr != 0 {
+                    self.master_isr &= !(1 << self.master_isr.trailing_zeros());
+                }
+            }
+            0x20 if value & 0xf8 == 0x60 => self.master_isr &= !(1 << (value & 7)),
             0x21 => match self.master_phase {
                 PicInitPhase::Icw2 => {
                     self.master_base = value & 0xf8;
@@ -137,11 +317,33 @@ impl PicState {
         }
     }
 
-    fn can_inject_irq0(&self) -> bool {
-        self.master_phase == PicInitPhase::Ready
-            && self.irq0_pending
-            && !self.irq0_in_service
-            && self.master_mask & 1 == 0
+    fn raise_irq(&mut self, irq: u8) {
+        self.master_irr |= 1 << irq;
+    }
+
+    fn set_irq_level(&mut self, irq: u8, asserted: bool) {
+        if asserted {
+            self.raise_irq(irq);
+        } else {
+            self.master_irr &= !(1 << irq);
+        }
+    }
+
+    fn next_irq(&self) -> Option<u8> {
+        if self.master_phase != PicInitPhase::Ready {
+            return None;
+        }
+        let mut pending = self.master_irr & !self.master_mask;
+        if self.master_isr != 0 {
+            let in_service = self.master_isr.trailing_zeros() as u8;
+            pending &= (1u8 << in_service).wrapping_sub(1);
+        }
+        (pending != 0).then(|| pending.trailing_zeros() as u8)
+    }
+
+    fn acknowledge(&mut self, irq: u8) {
+        self.master_irr &= !(1 << irq);
+        self.master_isr |= 1 << irq;
     }
 }
 
@@ -302,6 +504,14 @@ impl AMDVCpu {
     {
         info!("Setting up AMD VCPU for a Linux guest");
 
+        // Without the hardware pause filter, intercepting every PAUSE turns
+        // normal spin loops into a VMEXIT storm. Require the architectural
+        // filter before using PAUSE as a cooperative timer polling point.
+        const SVM_FEATURE_PAUSE_FILTER: u32 = 1 << 10;
+        if cpuid!(0x8000_000a).edx & SVM_FEATURE_PAUSE_FILTER == 0 {
+            return Err("SVM pause filter is required for AMD timer preemption");
+        }
+
         self.init_guest_memory(frame_allocator)?;
         common::linux::load_kernel(self)?;
         self.setup_linux_segments();
@@ -312,6 +522,7 @@ impl AMDVCpu {
                 InterceptVector1::CPUID
                     | InterceptVector1::RDPMC
                     | InterceptVector1::INVD
+                    | InterceptVector1::PAUSE
                     | InterceptVector1::HLT
                     | InterceptVector1::INVLPGA
                     | InterceptVector1::IOIO_PROT
@@ -336,6 +547,7 @@ impl AMDVCpu {
 
             raw_vmcb.control_area.iopm_base_pa = self.permission_maps.iopm_base_pa();
             raw_vmcb.control_area.msrpm_base_pa = self.permission_maps.msrpm_base_pa();
+            raw_vmcb.control_area.pause_filter_count = 4096;
 
             raw_vmcb.control_area.guest_asid = 1;
             raw_vmcb.control_area.flags1.set(Flags1::NP_ENABLE, true);
@@ -495,6 +707,8 @@ impl AMDVCpu {
             0x0000_0001 => {
                 result.ecx &= !((1 << 12)
                     | (1 << 21)
+                    // A TSC deadline requires a virtual local APIC timer.
+                    | (1 << 24)
                     | (1 << 26)
                     | (1 << 27)
                     | (1 << 28)
@@ -531,10 +745,10 @@ impl AMDVCpu {
                     result.ecx = 0;
                     result.edx = 0;
                 }
-                // Do not advertise AVX2/AVX-512 without complete extended
-                // processor-state isolation. Speculation-control MSRs are
-                // also not virtualized, so do not promise their semantics.
-                result.ebx &= !((1 << 5)
+                // IA32_TSC_ADJUST, AVX2/AVX-512, and speculation-control
+                // MSRs are not fully virtualized, so do not promise them.
+                result.ebx &= !((1 << 1)
+                    | (1 << 5)
                     | (1 << 16)
                     | (1 << 17)
                     | (1 << 21)
@@ -646,13 +860,30 @@ impl AMDVCpu {
         Ok(())
     }
 
-    fn prepare_timer_interrupt(&mut self) -> Result<(), &'static str> {
+    fn poll_host_serial(&mut self) {
+        // Loopback disconnects the external receiver. Leave host bytes in the
+        // outer UART until the guest completes 8250 auto-configuration.
+        if self.serial.mcr & 0x10 == 0 {
+            let mut input = [0; 16];
+            let received = serial::poll_input(&mut input);
+            for &value in &input[..received] {
+                self.serial.enqueue_rx(value);
+            }
+        }
+        self.sync_uart_irq();
+    }
+
+    fn sync_uart_irq(&mut self) {
+        let asserted = self.serial.interrupt_output_enabled() && self.serial.interrupt_pending();
+        self.legacy_timer.pic.set_irq_level(4, asserted);
+    }
+
+    fn prepare_device_interrupt(&mut self) -> Result<(), &'static str> {
         if self.legacy_timer.pit.poll() {
-            self.legacy_timer.pic.irq0_pending = true;
+            self.legacy_timer.pic.raise_irq(0);
         }
-        if !self.legacy_timer.pic.irq0_pending {
-            return Ok(());
-        }
+        self.sync_uart_irq();
+        let next_irq = self.legacy_timer.pic.next_irq();
 
         let vmcb = self.vmcb.get_raw_vmcb();
         let interrupts_enabled = vmcb.state_save_area.rflags & (1 << 9) != 0;
@@ -661,44 +892,63 @@ impl AMDVCpu {
             .interrupt_shadow_flags
             .contains(InterruptShadowFlags::INTERRUPT_SHADOW);
         let event_already_pending = vmcb.control_area.event_injection & (1 << 31) != 0;
-        let can_inject_pic = self.legacy_timer.pic.can_inject_irq0();
-        if !can_inject_pic || !interrupts_enabled || in_interrupt_shadow || event_already_pending {
+        let Some(irq) = next_irq else {
+            return Ok(());
+        };
+        if !interrupts_enabled || event_already_pending {
+            return Ok(());
+        }
+
+        // SVM reports intercepted HLT before executing it. For STI;HLT, the
+        // VMCB therefore still carries STI's interrupt shadow. Completing the
+        // HLT in software retires that shadow, so a pending IRQ can be
+        // injected immediately instead of re-entering the same HLT forever.
+        if in_interrupt_shadow && !self.halted {
             return Ok(());
         }
 
         if self.halted {
             self.advance_guest_rip()?;
             self.halted = false;
+            self.vmcb
+                .get_raw_vmcb()
+                .control_area
+                .interrupt_shadow_flags
+                .remove(InterruptShadowFlags::INTERRUPT_SHADOW);
         }
 
         const EVENT_VALID: u64 = 1 << 31;
-        let vector = self.legacy_timer.pic.master_base;
+        let vector = self.legacy_timer.pic.master_base.wrapping_add(irq);
         let control = &mut self.vmcb.get_raw_vmcb().control_area;
         // EVENTINJ type 0 is an architectural external interrupt.
         control.event_injection = vector as u64 | EVENT_VALID;
         control.vmcb_clean_bits = 0;
-        self.legacy_timer.pic.irq0_pending = false;
-        self.legacy_timer.pic.irq0_in_service = true;
+        self.legacy_timer.pic.acknowledge(irq);
         Ok(())
     }
 
-    fn should_reenter_hlt_to_clear_shadow(&mut self) -> bool {
-        if !self.halted
-            || !self.legacy_timer.pic.irq0_pending
-            || !self.legacy_timer.pic.can_inject_irq0()
-        {
-            return false;
+    fn preserve_interrupted_event(&mut self) -> Result<bool, &'static str> {
+        const EVENT_VALID: u64 = 1 << 31;
+
+        let control = &mut self.vmcb.get_raw_vmcb().control_area;
+        let interrupted_event = control.exit_int_info;
+        if interrupted_event & EVENT_VALID == 0 {
+            return Ok(false);
         }
 
-        let vmcb = self.vmcb.get_raw_vmcb();
-        let interrupts_enabled = vmcb.state_save_area.rflags & (1 << 9) != 0;
-        let in_interrupt_shadow = vmcb
-            .control_area
-            .interrupt_shadow_flags
-            .contains(InterruptShadowFlags::INTERRUPT_SHADOW);
-        let event_already_pending = vmcb.control_area.event_injection & (1 << 31) != 0;
-
-        interrupts_enabled && in_interrupt_shadow && !event_already_pending
+        // EXITINTINFO describes an event whose delivery was interrupted by
+        // this VMEXIT. SVM does not queue it automatically: copying the full
+        // field preserves vector, type, error-code-valid, and error code for
+        // the next VMRUN. Losing an injected IRQ0 here would leave the virtual
+        // PIC in-service forever because the guest never reaches its handler
+        // and EOI.
+        let pending_event = control.event_injection;
+        if pending_event & EVENT_VALID != 0 && pending_event != interrupted_event {
+            return Err("AMD VMEXIT returned an event while another injection was pending");
+        }
+        control.event_injection = interrupted_event;
+        control.vmcb_clean_bits = 0;
+        Ok(true)
     }
 
     fn inject_exception(&mut self, vector: u8, error_code: Option<u32>) {
@@ -737,6 +987,8 @@ impl AMDVCpu {
         if is_input {
             let value = match (port, size) {
                 (0x40, 1) => self.legacy_timer.pit.read() as u32,
+                (0x70, 1) => self.rtc.read_selector() as u32,
+                (0x71, 1) => self.rtc.read_data() as u32,
                 (0x20 | 0x21 | 0xa0 | 0xa1, 1) => self.legacy_timer.pic.read(port) as u32,
                 (0x3f8..=0x3ff, 1) => self.serial_in(port) as u32,
                 (_, 1) => u8::MAX as u32,
@@ -759,6 +1011,12 @@ impl AMDVCpu {
         } else if size == 1 && port == 0x43 {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.legacy_timer.pit.write_control(value);
+        } else if size == 1 && port == 0x70 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.rtc.select(value);
+        } else if size == 1 && port == 0x71 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.rtc.write_data(value);
         } else if size == 1 && matches!(port, 0x20 | 0x21 | 0xa0 | 0xa1) {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.legacy_timer.pic.write(port, value);
@@ -767,20 +1025,24 @@ impl AMDVCpu {
             self.serial_out(port, value);
         }
 
+        if size == 1 && (0x3f8..=0x3ff).contains(&port) {
+            self.sync_uart_irq();
+        }
+
         self.advance_guest_rip()
     }
 
-    fn serial_in(&self, port: u16) -> u8 {
+    fn serial_in(&mut self, port: u16) -> u8 {
         match port {
             0x3f8 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_low,
-            0x3f8 => 0,
+            0x3f8 => self.serial.dequeue_rx(),
             0x3f9 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_high,
             0x3f9 => self.serial.ier,
-            0x3fa => 0x01, // no interrupt pending
+            0x3fa => self.serial.interrupt_identification(),
             0x3fb => self.serial.lcr,
             0x3fc => self.serial.mcr,
-            0x3fd => 0x60, // transmitter holding register and transmitter empty
-            0x3fe => 0xb0,
+            0x3fd => self.serial.line_status(),
+            0x3fe => self.serial.modem_status(),
             0x3ff => self.serial.scratch,
             _ => u8::MAX,
         }
@@ -789,11 +1051,19 @@ impl AMDVCpu {
     fn serial_out(&mut self, port: u16, value: u8) {
         match port {
             0x3f8 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_low = value,
-            0x3f8 => serial::write_byte(value),
+            0x3f8 => {
+                if self.serial.mcr & 0x10 != 0 {
+                    self.serial.enqueue_rx(value);
+                } else {
+                    serial::write_raw_byte(value);
+                }
+                self.serial.thre_interrupt_pending = self.serial.ier & 0x02 != 0;
+            }
             0x3f9 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_high = value,
-            0x3f9 => self.serial.ier = value,
+            0x3f9 => self.serial.write_ier(value),
+            0x3fa => self.serial.write_fcr(value),
             0x3fb => self.serial.lcr = value,
-            0x3fc => self.serial.mcr = value,
+            0x3fc => self.serial.mcr = value & 0x1f,
             0x3ff => self.serial.scratch = value,
             _ => {}
         }
@@ -859,10 +1129,11 @@ impl AMDVCpu {
                 SYSENTER_ESP => state.sysenter_esp,
                 SYSENTER_EIP => state.sysenter_eip,
                 PAT => state.g_pat,
-                // Linux reads the AMD microcode patch level during early
-                // boot. Expose a neutral virtual value without consulting
-                // the host MSR.
-                PATCH_LEVEL => 0,
+                // The physical family/model is exposed to the guest, so the
+                // matching host patch revision is the only consistent
+                // read-only value. It is captured once when the VCPU is
+                // created; guest accesses never pass through to the host MSR.
+                PATCH_LEVEL => self.host_patch_level,
                 TSC_AUX => self.tsc_aux,
                 _ => {
                     info!("Unsupported AMD guest RDMSR: {:#x}", index);
@@ -961,17 +1232,17 @@ impl VCpu for AMDVCpu {
                 vmcb.control_area.exit_code = 0;
                 vmcb.control_area.exit_info1 = 0;
                 vmcb.control_area.exit_info2 = 0;
+                vmcb.control_area.exit_int_info = 0;
                 vmcb.control_area.tlb_control = 0;
             }
 
-            self.prepare_timer_interrupt()?;
-            if self.halted && !self.should_reenter_hlt_to_clear_shadow() {
-                // Do not repeatedly enter the same intercepted HLT while no
-                // interrupt is deliverable. Returning from this
-                // without_interrupts closure lets L1 service interrupts
-                // between polls. A pending IRQ after STI;HLT is allowed one
-                // re-entry to retire the interrupt shadow; the next poll can
-                // then advance NRIP and inject the interrupt.
+            self.poll_host_serial();
+            self.prepare_device_interrupt()?;
+            if self.halted && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
+            {
+                // Avoid repeatedly entering an intercepted HLT while no event
+                // is deliverable. Returning restores host interrupts between
+                // bounded device polls.
                 return Ok(());
             }
 
@@ -988,9 +1259,17 @@ impl VCpu for AMDVCpu {
                 self.host_xsave_mask,
             );
 
+            if self.preserve_interrupted_event()? {
+                // Delivery of EXITINTINFO takes precedence over handling the
+                // coincident VMEXIT. Leave RIP and the intercepted instruction
+                // untouched; after the event handler returns, that instruction
+                // executes again and produces a fresh exit to handle normally.
+                return Ok(());
+            }
+
             let vmcb = self.vmcb.get_raw_vmcb();
             let exit_code = vmcb.control_area.exit_code;
-            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x78 | 0x7b | 0x7c) {
+            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x77 | 0x78 | 0x7b | 0x7c) {
                 info!(
                     "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
                     exit_code,
@@ -1006,6 +1285,7 @@ impl VCpu for AMDVCpu {
                     self.handle_cpuid();
                     Ok(())
                 }
+                0x77 => self.advance_guest_rip(),
                 0x78 => {
                     // Poll on the intercepted HLT until an interrupt is
                     // deliverable. IRQ injection advances to NRIP.
@@ -1074,6 +1354,7 @@ impl VCpu for AMDVCpu {
         let host_xsave_state = HostXsaveState::new(frame_allocator)?;
         let host_xsave_addr = host_xsave_state.addr();
         let host_xsave_mask = host_xsave_state.mask();
+        let host_patch_level = common::read_msr(0x8b);
         let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
             .get()
             .copied()
@@ -1087,9 +1368,11 @@ impl VCpu for AMDVCpu {
             npt: Npt::new(frame_allocator)?,
             permission_maps,
             serial: SerialState::default(),
+            rtc: RtcState::new(),
             legacy_timer: LegacyTimer::new(tsc_khz),
             halted: false,
             tsc_aux: 0,
+            host_patch_level,
             guest_registers: GuestRegisters::default(),
             host_fx_state: FxState::zeroed(),
             guest_fx_state: FxState::guest_default(),
@@ -1141,5 +1424,49 @@ impl X86VCpu for AMDVCpu {
     fn set_segment_selector(&mut self, segment: common::segment::Segment, selector: u16) {
         let seg = self.get_segment(segment);
         seg.selector = selector;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uart_rx_ring_is_bounded_and_reports_overrun() {
+        let mut uart = SerialState::default();
+        for value in 0..=u8::MAX {
+            uart.enqueue_rx(value);
+        }
+        uart.enqueue_rx(0xaa);
+        assert_eq!(uart.rx_len, 256);
+        assert!(uart.overrun);
+        for value in 0..=u8::MAX {
+            assert_eq!(uart.dequeue_rx(), value);
+        }
+        assert_eq!(uart.rx_len, 0);
+    }
+
+    #[test]
+    fn uart_prioritizes_rx_and_clears_thre_on_iir_read() {
+        let mut uart = SerialState::default();
+        uart.write_ier(0x03);
+        uart.enqueue_rx(b'x');
+        assert_eq!(uart.interrupt_identification() & 0x0f, 0x04);
+        assert_eq!(uart.dequeue_rx(), b'x');
+        assert_eq!(uart.interrupt_identification() & 0x0f, 0x02);
+        assert_eq!(uart.interrupt_identification() & 0x0f, 0x01);
+    }
+
+    #[test]
+    fn pic_prioritizes_irq0_and_specific_eoi_releases_irq4() {
+        let mut pic = PicState::new();
+        pic.master_mask = !(1 << 0 | 1 << 4);
+        pic.raise_irq(4);
+        pic.raise_irq(0);
+        assert_eq!(pic.next_irq(), Some(0));
+        pic.acknowledge(0);
+        assert_eq!(pic.next_irq(), None);
+        pic.write(0x20, 0x60);
+        assert_eq!(pic.next_irq(), Some(4));
     }
 }

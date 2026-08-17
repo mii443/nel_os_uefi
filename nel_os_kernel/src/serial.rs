@@ -56,6 +56,38 @@ pub fn write_byte(byte: u8) {
     });
 }
 
+/// Sends one byte without terminal-oriented backspace expansion.
+///
+/// This is used by the virtual UART, whose guest-visible byte stream must be
+/// relayed verbatim to the fixed host COM1 device.
+#[inline(always)]
+pub fn write_raw_byte(byte: u8) {
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        SERIAL1.lock().send_raw(byte);
+    });
+}
+
+/// Non-blockingly polls the fixed host COM1 device into a bounded buffer.
+#[inline(always)]
+pub fn poll_input(buffer: &mut [u8]) -> usize {
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        let mut serial = SERIAL1.lock();
+        let mut received = 0;
+        for slot in buffer {
+            let Ok(value) = serial.try_receive() else {
+                break;
+            };
+            *slot = value;
+            received += 1;
+        }
+        received
+    })
+}
+
 #[inline(always)]
 pub fn write_bytes(bytes: &[u8]) {
     use x86_64::instructions::interrupts;
