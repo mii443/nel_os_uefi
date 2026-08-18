@@ -1,12 +1,21 @@
-#!/bin/bash -ex
+#!/usr/bin/env bash
+set -euxo pipefail
 
-EFI_BINARY="$1"
+readonly SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly EFI_BINARY="$(realpath -- "$1")"
 readonly NET_MODE="${NEL_OS_NET_MODE:-user}"
 readonly NET_BRIDGE="${NEL_OS_NET_BRIDGE:-br0}"
 readonly NET_TAP="${NEL_OS_NET_TAP:-tap-nel0}"
 readonly NET_MAC="${NEL_OS_NET_MAC:-52:54:00:12:34:56}"
 readonly NET_BIND_ADDRESS="${NEL_OS_NET_BIND_ADDR:-127.0.0.1}"
 readonly NET_HOST_PORT="${NEL_OS_NET_HOST_PORT:-5555}"
+readonly LOCAL_CACHE_BASE="${NEL_OS_LOCAL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/nel_os_uefi}"
+readonly RUNTIME_BASE="${NEL_OS_RUNTIME_BASE:-${XDG_RUNTIME_DIR:-/tmp}/nel_os_uefi-${UID}}"
+HOST_SLUG="$(hostname -s | tr -cd '[:alnum:]_.-')"
+readonly HOST_SLUG
+readonly RUNTIME_DIR="${RUNTIME_BASE}/${HOST_SLUG}-${NET_MODE}-${NET_HOST_PORT}"
+
+export CARGO_TARGET_DIR="${NEL_OS_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-${LOCAL_CACHE_BASE}/target}}"
 
 if [[ ! "${NET_MAC}" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
     echo "Invalid virtio-net MAC address: ${NET_MAC}" >&2
@@ -50,17 +59,17 @@ case "${NET_MODE}" in
         fi
         if [[ ! -d "/sys/class/net/${NET_BRIDGE}/bridge" ]]; then
             echo "Required bridge ${NET_BRIDGE} is not configured." >&2
-            echo "Configure a physical LAN bridge, then run ./setup-br0.sh up." >&2
+            echo "Configure a physical LAN bridge, then run ${SOURCE_DIR}/setup-br0.sh up." >&2
             exit 1
         fi
         if [[ ! -e "/sys/class/net/${NET_TAP}/tun_flags" ]]; then
             echo "Required tap ${NET_TAP} is not configured." >&2
-            echo "Run ./setup-br0.sh up before starting QEMU." >&2
+            echo "Run ${SOURCE_DIR}/setup-br0.sh up before starting QEMU." >&2
             exit 1
         fi
         if [[ "$(basename "$(readlink -f "/sys/class/net/${NET_TAP}/master")")" != "${NET_BRIDGE}" ]]; then
             echo "Tap ${NET_TAP} is not attached to required bridge ${NET_BRIDGE}." >&2
-            echo "Run ./setup-br0.sh up before starting QEMU." >&2
+            echo "Run ${SOURCE_DIR}/setup-br0.sh up before starting QEMU." >&2
             exit 1
         fi
 
@@ -85,8 +94,9 @@ case "${NET_MODE}" in
         ;;
 esac
 
-./clean.sh
-./create-iso.sh "$EFI_BINARY"
+mkdir -p "${CARGO_TARGET_DIR}" "${RUNTIME_DIR}"
+"${SOURCE_DIR}/create-iso.sh" "${EFI_BINARY}" "${RUNTIME_DIR}"
+cp "${SOURCE_DIR}/OVMF_VARS.fd" "${RUNTIME_DIR}/OVMF_VARS.fd"
 
 QEMU_ACCEL_ARGS=()
 if [[ -r /dev/kvm && -w /dev/kvm ]]; then
@@ -105,9 +115,9 @@ run_qemu() {
         -m 1G \
         -serial mon:stdio \
         -nographic \
-        -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd \
-        -drive if=pflash,format=raw,readonly=on,file=OVMF_VARS.fd \
-        -cdrom nel_os.iso \
+        -drive "if=pflash,format=raw,readonly=on,file=${SOURCE_DIR}/OVMF_CODE.fd" \
+        -drive "if=pflash,format=raw,file=${RUNTIME_DIR}/OVMF_VARS.fd" \
+        -cdrom "${RUNTIME_DIR}/nel_os.iso" \
         -boot d \
         -smp 1 \
         "${NET_ARGS[@]}" \
