@@ -101,8 +101,9 @@ remains available if the network device fails. `exit` closes a TCP session; on
 the non-disconnectable local console it simply returns another prompt. Pressing
 Enter on an empty line also redraws `nel>`.
 
-The embedded TCP server accepts one management connection at a time. Close or
-`exit` the current session before connecting another client.
+The embedded TCP server accepts up to four simultaneous management connections.
+Each client has independent command, response, retransmit, and idle-timeout
+state, so one slow or idle client does not block the other management shells.
 
 While attached to a VM serial port, press `Ctrl-]` to detach and return to
 the `nel>` prompt. Guest COM1 output is hidden by default and is sent only to

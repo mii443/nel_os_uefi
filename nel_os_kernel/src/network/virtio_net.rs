@@ -397,52 +397,56 @@ impl VirtioNet {
         self.stack.take_start_request()
     }
 
-    pub fn take_management_command(&mut self) -> Option<ManagementCommand> {
+    pub fn take_management_command(&mut self) -> Option<(super::ConnectionId, ManagementCommand)> {
         self.stack.take_management_command()
     }
 
-    pub fn write_management(&mut self, bytes: &[u8]) -> usize {
-        self.stack.write_management(bytes)
+    pub fn write_management(&mut self, id: super::ConnectionId, bytes: &[u8]) -> usize {
+        self.stack.write_management(id, bytes)
     }
 
-    pub fn management_prompt(&mut self) {
-        self.stack.management_prompt();
+    pub fn management_prompt(&mut self, id: super::ConnectionId) {
+        self.stack.management_prompt(id);
     }
 
-    pub fn notify_management_detach_or_close(&mut self, notice: &[u8]) -> bool {
-        self.stack.notify_management_detach_or_close(notice)
+    pub fn notify_management_detach_or_close(
+        &mut self,
+        id: super::ConnectionId,
+        notice: &[u8],
+    ) -> bool {
+        self.stack.notify_management_detach_or_close(id, notice)
     }
 
-    pub fn write_management_help(&mut self) {
-        self.stack.write_management_help();
+    pub fn write_management_help(&mut self, id: super::ConnectionId) {
+        self.stack.write_management_help(id);
     }
 
-    pub fn request_management_close(&mut self) {
-        self.stack.request_management_close();
+    pub fn request_management_close(&mut self, id: super::ConnectionId) {
+        self.stack.request_management_close(id);
     }
 
-    pub fn set_serial_attached(&mut self, attached: bool) {
-        self.stack.set_serial_attached(attached);
+    pub fn set_serial_attached(&mut self, id: super::ConnectionId, attached: bool) {
+        self.stack.set_serial_attached(id, attached);
     }
 
-    pub fn serial_attached(&self) -> bool {
-        self.stack.serial_attached()
+    pub fn serial_attached(&self, id: super::ConnectionId) -> bool {
+        self.stack.serial_attached(id)
     }
 
-    pub fn take_serial_input(&mut self, output: &mut [u8]) -> usize {
-        self.stack.take_serial_input(output)
+    pub fn take_serial_input(&mut self, id: super::ConnectionId, output: &mut [u8]) -> usize {
+        self.stack.take_serial_input(id, output)
     }
 
-    pub fn discard_serial_input(&mut self) -> usize {
-        self.stack.discard_serial_input()
+    pub fn discard_serial_input(&mut self, id: super::ConnectionId) -> usize {
+        self.stack.discard_serial_input(id)
     }
 
-    pub fn write_serial_output(&mut self, bytes: &[u8]) -> usize {
-        self.stack.write_serial_output(bytes)
+    pub fn write_serial_output(&mut self, id: super::ConnectionId, bytes: &[u8]) -> usize {
+        self.stack.write_serial_output(id, bytes)
     }
 
-    pub fn serial_output_capacity(&self) -> usize {
-        self.stack.serial_output_capacity()
+    pub fn serial_output_capacity(&self, id: super::ConnectionId) -> usize {
+        self.stack.serial_output_capacity(id)
     }
 
     pub fn ipv4_config(&self) -> Option<super::stack::Ipv4Config> {

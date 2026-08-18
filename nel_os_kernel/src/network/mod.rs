@@ -9,5 +9,6 @@ mod stack;
 mod virtio_net;
 
 pub use crate::management::ManagementCommand;
+pub(crate) use management::ConnectionId;
 pub use stack::{CONTROL_PORT, Ipv4Config};
 pub use virtio_net::VirtioNet;

@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use spin::Mutex;
 
 #[derive(Debug)]
@@ -21,37 +22,29 @@ pub struct Subscriber {
 unsafe impl Send for Subscriber {}
 unsafe impl Sync for Subscriber {}
 
-const MAX_SUBSCRIBERS: usize = 10;
-
-static SUBSCRIBERS: Mutex<[Option<Subscriber>; MAX_SUBSCRIBERS]> =
-    Mutex::new([None; MAX_SUBSCRIBERS]);
+static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
 
 pub fn subscribe(
     callback: SubscriberCallback,
     context: *mut core::ffi::c_void,
 ) -> Result<(), &'static str> {
     let mut subscribers = SUBSCRIBERS.lock();
-
-    for slot in subscribers.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(Subscriber { callback, context });
-            return Ok(());
-        }
-    }
-
-    Err("No available subscriber slots")
+    subscribers
+        .try_reserve(1)
+        .map_err(|_| "Unable to allocate an interrupt subscriber")?;
+    subscribers.push(Subscriber { callback, context });
+    Ok(())
 }
 
 pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
     let mut subscribers = SUBSCRIBERS.lock();
 
-    for slot in subscribers.iter_mut() {
-        if let Some(subscriber) = slot {
-            if core::ptr::fn_addr_eq(subscriber.callback, callback) {
-                *slot = None;
-                return Ok(());
-            }
-        }
+    if let Some(index) = subscribers
+        .iter()
+        .position(|subscriber| core::ptr::fn_addr_eq(subscriber.callback, callback))
+    {
+        subscribers.swap_remove(index);
+        return Ok(());
     }
 
     Err("Subscriber not found")
@@ -60,7 +53,24 @@ pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
 pub fn dispatch_to_subscribers(context: &InterruptContext) {
     let subscribers = SUBSCRIBERS.lock();
 
-    for subscriber in subscribers.iter().flatten() {
+    for subscriber in subscribers.iter() {
         (subscriber.callback)(subscriber.context, context);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn callback(_context: *mut core::ffi::c_void, _interrupt: &InterruptContext) {}
+
+    #[test]
+    fn registry_grows_beyond_the_previous_fixed_limit() {
+        for _ in 0..32 {
+            subscribe(callback, core::ptr::null_mut()).unwrap();
+        }
+        for _ in 0..32 {
+            unsubscribe(callback).unwrap();
+        }
     }
 }

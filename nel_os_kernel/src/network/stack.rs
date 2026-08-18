@@ -64,7 +64,7 @@ pub struct NetworkStack {
     lease_expiry_tick: usize,
     config: Option<Ipv4Config>,
     start_requested: bool,
-    management: super::management::ManagementServer,
+    management: super::management::ManagementListener,
 }
 
 impl NetworkStack {
@@ -84,7 +84,7 @@ impl NetworkStack {
             lease_expiry_tick: 0,
             config: None,
             start_requested: false,
-            management: super::management::ManagementServer::new(),
+            management: super::management::ManagementListener::new(),
         }
     }
 
@@ -96,52 +96,66 @@ impl NetworkStack {
         core::mem::take(&mut self.start_requested)
     }
 
-    pub fn take_management_command(&mut self) -> Option<super::ManagementCommand> {
+    pub fn take_management_command(
+        &mut self,
+    ) -> Option<(super::management::ConnectionId, super::ManagementCommand)> {
         self.management.take_command()
     }
 
-    pub fn write_management(&mut self, bytes: &[u8]) -> usize {
-        self.management.write(bytes)
+    pub fn write_management(&mut self, id: super::management::ConnectionId, bytes: &[u8]) -> usize {
+        self.management.write(id, bytes)
     }
 
-    pub fn management_prompt(&mut self) {
-        self.management.prompt();
+    pub fn management_prompt(&mut self, id: super::management::ConnectionId) {
+        self.management.prompt(id);
     }
 
-    pub fn notify_management_detach_or_close(&mut self, notice: &[u8]) -> bool {
-        self.management.notify_detach_or_close(notice)
+    pub fn notify_management_detach_or_close(
+        &mut self,
+        id: super::management::ConnectionId,
+        notice: &[u8],
+    ) -> bool {
+        self.management.notify_detach_or_close(id, notice)
     }
 
-    pub fn write_management_help(&mut self) {
-        self.management.write_help();
+    pub fn write_management_help(&mut self, id: super::management::ConnectionId) {
+        self.management.write_help(id);
     }
 
-    pub fn request_management_close(&mut self) {
-        self.management.request_close();
+    pub fn request_management_close(&mut self, id: super::management::ConnectionId) {
+        self.management.request_close(id);
     }
 
-    pub fn set_serial_attached(&mut self, attached: bool) {
-        self.management.set_serial_attached(attached);
+    pub fn set_serial_attached(&mut self, id: super::management::ConnectionId, attached: bool) {
+        self.management.set_serial_attached(id, attached);
     }
 
-    pub fn serial_attached(&self) -> bool {
-        self.management.serial_attached()
+    pub fn serial_attached(&self, id: super::management::ConnectionId) -> bool {
+        self.management.serial_attached(id)
     }
 
-    pub fn take_serial_input(&mut self, output: &mut [u8]) -> usize {
-        self.management.take_serial_input(output)
+    pub fn take_serial_input(
+        &mut self,
+        id: super::management::ConnectionId,
+        output: &mut [u8],
+    ) -> usize {
+        self.management.take_serial_input(id, output)
     }
 
-    pub fn discard_serial_input(&mut self) -> usize {
-        self.management.discard_serial_input()
+    pub fn discard_serial_input(&mut self, id: super::management::ConnectionId) -> usize {
+        self.management.discard_serial_input(id)
     }
 
-    pub fn write_serial_output(&mut self, bytes: &[u8]) -> usize {
-        self.management.write_serial(bytes)
+    pub fn write_serial_output(
+        &mut self,
+        id: super::management::ConnectionId,
+        bytes: &[u8],
+    ) -> usize {
+        self.management.write_serial(id, bytes)
     }
 
-    pub fn serial_output_capacity(&self) -> usize {
-        self.management.serial_output_capacity()
+    pub fn serial_output_capacity(&self, id: super::management::ConnectionId) -> usize {
+        self.management.serial_output_capacity(id)
     }
 
     pub fn poll(&mut self, now: usize, output: &mut [u8]) -> Option<usize> {
@@ -419,7 +433,7 @@ impl NetworkStack {
                     .config
                     .is_some_and(|old_config| old_config.address != new_config.address)
                 {
-                    self.management.reset_connection();
+                    self.management.reset_connections();
                 }
                 self.config = Some(new_config);
                 self.dhcp_state = DhcpState::Bound;
@@ -443,7 +457,7 @@ impl NetworkStack {
         self.dhcp_state = DhcpState::Init;
         self.next_dhcp_tick = now;
         self.start_requested = false;
-        self.management.reset_connection();
+        self.management.reset_connections();
     }
 
     fn build_dhcp(

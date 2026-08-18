@@ -16,6 +16,8 @@ const TCP_MAX_RETRANSMITS: u8 = 5;
 const TCP_SYN_COOKIE_PERIOD_MILLIS: u64 = 30_000;
 const TCP_CLOSE_TIMEOUT_MILLIS: u64 = 10_000;
 const TCP_IDLE_TIMEOUT_MILLIS: u64 = 15 * 60 * 1000;
+pub(super) const MAX_MANAGEMENT_CONNECTIONS: usize = 4;
+pub(crate) type ConnectionId = usize;
 
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -143,6 +145,178 @@ impl CommandQueue {
         self.head = 0;
         self.len = 0;
         self.commands.fill(None);
+    }
+}
+
+pub struct ManagementListener {
+    connections: [ManagementServer; MAX_MANAGEMENT_CONNECTIONS],
+    next_command: usize,
+    next_poll: usize,
+}
+
+impl ManagementListener {
+    pub const fn new() -> Self {
+        Self {
+            connections: [const { ManagementServer::new() }; MAX_MANAGEMENT_CONNECTIONS],
+            next_command: 0,
+            next_poll: 0,
+        }
+    }
+
+    pub fn take_command(&mut self) -> Option<(ConnectionId, ManagementCommand)> {
+        for offset in 0..MAX_MANAGEMENT_CONNECTIONS {
+            let id = (self.next_command + offset) % MAX_MANAGEMENT_CONNECTIONS;
+            if let Some(command) = self.connections[id].take_command() {
+                self.next_command = (id + 1) % MAX_MANAGEMENT_CONNECTIONS;
+                return Some((id, command));
+            }
+        }
+        None
+    }
+
+    pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> usize {
+        self.connections
+            .get_mut(id)
+            .map_or(0, |connection| connection.write(bytes))
+    }
+
+    pub fn write_serial(&mut self, id: ConnectionId, bytes: &[u8]) -> usize {
+        self.connections
+            .get_mut(id)
+            .map_or(0, |connection| connection.write_serial(bytes))
+    }
+
+    pub fn serial_output_capacity(&self, id: ConnectionId) -> usize {
+        self.connections
+            .get(id)
+            .map_or(0, ManagementServer::serial_output_capacity)
+    }
+
+    pub fn take_serial_input(&mut self, id: ConnectionId, output: &mut [u8]) -> usize {
+        self.connections
+            .get_mut(id)
+            .map_or(0, |connection| connection.take_serial_input(output))
+    }
+
+    pub fn discard_serial_input(&mut self, id: ConnectionId) -> usize {
+        self.connections
+            .get_mut(id)
+            .map_or(0, ManagementServer::discard_serial_input)
+    }
+
+    pub fn set_serial_attached(&mut self, id: ConnectionId, attached: bool) {
+        if let Some(connection) = self.connections.get_mut(id) {
+            connection.set_serial_attached(attached);
+        }
+    }
+
+    pub fn serial_attached(&self, id: ConnectionId) -> bool {
+        self.connections
+            .get(id)
+            .is_some_and(ManagementServer::serial_attached)
+    }
+
+    pub fn prompt(&mut self, id: ConnectionId) {
+        if let Some(connection) = self.connections.get_mut(id) {
+            connection.prompt();
+        }
+    }
+
+    pub fn notify_detach_or_close(&mut self, id: ConnectionId, notice: &[u8]) -> bool {
+        self.connections
+            .get_mut(id)
+            .is_some_and(|connection| connection.notify_detach_or_close(notice))
+    }
+
+    pub fn write_help(&mut self, id: ConnectionId) {
+        if let Some(connection) = self.connections.get_mut(id) {
+            connection.write_help();
+        }
+    }
+
+    pub fn request_close(&mut self, id: ConnectionId) {
+        if let Some(connection) = self.connections.get_mut(id) {
+            connection.request_close();
+        }
+    }
+
+    pub(super) fn reset_connections(&mut self) {
+        for connection in &mut self.connections {
+            connection.reset();
+        }
+    }
+
+    pub fn poll(
+        &mut self,
+        local_mac: [u8; 6],
+        local_ip: [u8; 4],
+        now: usize,
+        response: &mut [u8],
+    ) -> Option<usize> {
+        for offset in 0..MAX_MANAGEMENT_CONNECTIONS {
+            let id = (self.next_poll + offset) % MAX_MANAGEMENT_CONNECTIONS;
+            if let Some(length) = self.connections[id].poll(local_mac, local_ip, now, response) {
+                self.next_poll = (id + 1) % MAX_MANAGEMENT_CONNECTIONS;
+                return Some(length);
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_ipv4(
+        &mut self,
+        frame: &[u8],
+        ip_header_len: usize,
+        ip_total_len: usize,
+        local_mac: [u8; 6],
+        local_ip: [u8; 4],
+        now: usize,
+        response: &mut [u8],
+    ) -> Option<usize> {
+        if let Some(id) = self.connections.iter().position(|connection| {
+            connection.matches_frame_peer(frame, ip_header_len, ip_total_len)
+        }) {
+            return self.connections[id].handle_ipv4(
+                frame,
+                ip_header_len,
+                ip_total_len,
+                local_mac,
+                local_ip,
+                now,
+                response,
+            );
+        }
+
+        let id = self
+            .connections
+            .iter()
+            .position(ManagementServer::is_closed)?;
+        if self.connections[id].syn_secret == 0
+            && let Some(secret) = self
+                .connections
+                .iter()
+                .map(|connection| connection.syn_secret)
+                .find(|&secret| secret != 0)
+        {
+            self.connections[id].syn_secret = secret;
+        }
+        let result = self.connections[id].handle_ipv4(
+            frame,
+            ip_header_len,
+            ip_total_len,
+            local_mac,
+            local_ip,
+            now,
+            response,
+        );
+        let secret = self.connections[id].syn_secret;
+        if secret != 0 {
+            for connection in &mut self.connections {
+                connection.syn_secret = secret;
+            }
+        }
+        result
     }
 }
 
@@ -284,10 +458,6 @@ impl ManagementServer {
     pub fn request_close(&mut self) {
         self.close_requested = true;
         self.serial_attached = false;
-    }
-
-    pub(super) fn reset_connection(&mut self) {
-        self.reset();
     }
 
     pub fn poll(
@@ -721,6 +891,31 @@ impl ManagementServer {
 
     fn matches_peer(&self, mac: [u8; 6], ip: [u8; 4], port: u16) -> bool {
         self.peer_mac == mac && self.peer_ip == ip && self.peer_port == port
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state == TcpState::Closed
+    }
+
+    fn matches_frame_peer(&self, frame: &[u8], ip_header_len: usize, ip_total_len: usize) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        let Some(tcp_offset) = ETHERNET_HEADER_LEN.checked_add(ip_header_len) else {
+            return false;
+        };
+        let Some(frame_len) = ETHERNET_HEADER_LEN.checked_add(ip_total_len) else {
+            return false;
+        };
+        let Some(tcp_header_end) = tcp_offset.checked_add(TCP_HEADER_LEN) else {
+            return false;
+        };
+        if frame.len() < frame_len || tcp_header_end > frame_len {
+            return false;
+        }
+        self.peer_mac == frame[6..12]
+            && self.peer_ip == frame[ETHERNET_HEADER_LEN + 12..ETHERNET_HEADER_LEN + 16]
+            && read_u16(frame, tcp_offset) == Some(self.peer_port)
     }
 
     fn reset(&mut self) {
@@ -1287,6 +1482,121 @@ mod tests {
             server.take_command(),
             Some(ManagementCommand::VmStatus { id: 0 })
         );
+    }
+
+    #[test]
+    fn listener_accepts_interleaved_handshakes() {
+        let mut listener = ManagementListener::new();
+        let mut response = [0u8; 1500];
+
+        let (first_syn, first_syn_len) = client_segment_from_port(PEER_PORT, 100, 0, TCP_SYN, &[]);
+        let first_syn_ack_len = listener
+            .handle_ipv4(
+                &first_syn[..first_syn_len],
+                IPV4_HEADER_LEN,
+                first_syn_len - ETHERNET_HEADER_LEN,
+                LOCAL_MAC,
+                LOCAL_IP,
+                1,
+                &mut response,
+            )
+            .unwrap();
+        let first_cookie = read_u32(
+            &response[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..first_syn_ack_len],
+            4,
+        )
+        .unwrap();
+
+        let second_port = PEER_PORT + 1;
+        let (second_syn, second_syn_len) =
+            client_segment_from_port(second_port, 200, 0, TCP_SYN, &[]);
+        let second_syn_ack_len = listener
+            .handle_ipv4(
+                &second_syn[..second_syn_len],
+                IPV4_HEADER_LEN,
+                second_syn_len - ETHERNET_HEADER_LEN,
+                LOCAL_MAC,
+                LOCAL_IP,
+                2,
+                &mut response,
+            )
+            .unwrap();
+        let second_cookie = read_u32(
+            &response[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..second_syn_ack_len],
+            4,
+        )
+        .unwrap();
+
+        let (first_ack, first_ack_len) =
+            client_segment_from_port(PEER_PORT, 101, first_cookie.wrapping_add(1), TCP_ACK, &[]);
+        assert!(
+            listener
+                .handle_ipv4(
+                    &first_ack[..first_ack_len],
+                    IPV4_HEADER_LEN,
+                    first_ack_len - ETHERNET_HEADER_LEN,
+                    LOCAL_MAC,
+                    LOCAL_IP,
+                    3,
+                    &mut response,
+                )
+                .is_some()
+        );
+
+        let (second_ack, second_ack_len) = client_segment_from_port(
+            second_port,
+            201,
+            second_cookie.wrapping_add(1),
+            TCP_ACK,
+            &[],
+        );
+        assert!(
+            listener
+                .handle_ipv4(
+                    &second_ack[..second_ack_len],
+                    IPV4_HEADER_LEN,
+                    second_ack_len - ETHERNET_HEADER_LEN,
+                    LOCAL_MAC,
+                    LOCAL_IP,
+                    4,
+                    &mut response,
+                )
+                .is_some()
+        );
+
+        assert_eq!(listener.connections[0].state, TcpState::Established);
+        assert_eq!(listener.connections[0].peer_port, PEER_PORT);
+        assert_eq!(listener.connections[1].state, TcpState::Established);
+        assert_eq!(listener.connections[1].peer_port, second_port);
+    }
+
+    #[test]
+    fn listener_keeps_commands_and_output_on_their_connections() {
+        let mut listener = ManagementListener::new();
+        for (id, port) in [PEER_PORT, PEER_PORT + 1].into_iter().enumerate() {
+            listener.connections[id].state = TcpState::Established;
+            listener.connections[id].peer_port = port;
+        }
+        listener.connections[0].consume_input(b"vm status 0\n");
+        listener.connections[1].consume_input(b"vm status 1\n");
+
+        assert_eq!(
+            listener.take_command(),
+            Some((0, ManagementCommand::VmStatus { id: 0 }))
+        );
+        assert_eq!(
+            listener.take_command(),
+            Some((1, ManagementCommand::VmStatus { id: 1 }))
+        );
+
+        assert_eq!(listener.write(0, b"first"), 5);
+        assert_eq!(listener.write(1, b"second"), 6);
+        let mut first = [0u8; 5];
+        let mut second = [0u8; 6];
+        assert_eq!(listener.connections[0].output.pop_into(&mut first), 5);
+        assert_eq!(listener.connections[1].output.pop_into(&mut second), 6);
+        assert_eq!(&first, b"first");
+        assert_eq!(&second, b"second");
     }
 
     #[test]

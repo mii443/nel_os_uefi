@@ -8,7 +8,7 @@ use crate::{
     constant::PKG_VERSION,
     cpuid, interrupt,
     memory::bitmap::BitmapMemoryTable,
-    network::{Ipv4Config, ManagementCommand, VirtioNet},
+    network::{ConnectionId, Ipv4Config, ManagementCommand, VirtioNet},
     platform, serial,
     serial_console::SerialConsole,
     time, vmm, {error, info, warn},
@@ -145,7 +145,7 @@ impl VmController {
 
         if let Err(error) = self.network.as_mut().unwrap().poll() {
             error!("Hypervisor network poll failed: {}", error);
-            if self.serial_owner == Some(SerialOwner::Network) {
+            if matches!(self.serial_owner, Some(SerialOwner::Network(_))) {
                 self.serial_owner = None;
                 serial::reset_guest_bridge();
             } else {
@@ -161,9 +161,13 @@ impl VmController {
         // following lifecycle command can clear the connection buffers.
         let start_requested = self.network.as_mut().unwrap().take_start_request();
         let command = self.network.as_mut().unwrap().take_management_command();
+        let mut network_serial_owner = match self.serial_owner {
+            Some(SerialOwner::Network(id)) => Some(id),
+            _ => None,
+        };
 
         let mut serial_bytes = [0; 256];
-        if self.serial_owner == Some(SerialOwner::Network) {
+        if let Some(id) = network_serial_owner {
             loop {
                 let guest_capacity = serial::guest_input_capacity().min(serial_bytes.len());
                 if guest_capacity == 0 {
@@ -173,7 +177,7 @@ impl VmController {
                     .network
                     .as_mut()
                     .unwrap()
-                    .take_serial_input(&mut serial_bytes[..guest_capacity]);
+                    .take_serial_input(id, &mut serial_bytes[..guest_capacity]);
                 if count == 0 {
                     break;
                 }
@@ -182,32 +186,35 @@ impl VmController {
             }
         }
 
-        let network_attached = self.network.as_ref().unwrap().serial_attached();
-        if self.serial_owner == Some(SerialOwner::Network) && !network_attached {
-            let connection_discarded = self.network.as_mut().unwrap().discard_serial_input();
+        let network_attached = network_serial_owner
+            .is_some_and(|id| self.network.as_ref().unwrap().serial_attached(id));
+        if let Some(id) = network_serial_owner
+            && !network_attached
+        {
+            let connection_discarded = self.network.as_mut().unwrap().discard_serial_input(id);
             let bridge_discarded = serial::discard_guest_input();
             if connection_discarded != 0 || bridge_discarded != 0 {
                 self.network
                     .as_mut()
                     .unwrap()
                     .notify_management_detach_or_close(
+                        id,
                         b"\r\nWARN buffered VM serial input was discarded during detach.\r\n",
                     );
             }
             self.serial_owner = None;
+            network_serial_owner = None;
             self.network_serial_overflow_reported = false;
             serial::reset_guest_bridge();
-        } else if self.serial_owner != Some(SerialOwner::Network) && network_attached {
-            self.network.as_mut().unwrap().set_serial_attached(false);
         }
 
-        if self.serial_owner == Some(SerialOwner::Network) {
+        if let Some(id) = network_serial_owner {
             serial::set_guest_capture_enabled(true);
             let device = self.network.as_mut().unwrap();
-            let output_capacity = device.serial_output_capacity().min(serial_bytes.len());
+            let output_capacity = device.serial_output_capacity(id).min(serial_bytes.len());
             let count = serial::poll_guest_output(&mut serial_bytes[..output_capacity]);
             if count != 0 {
-                let written = device.write_serial_output(&serial_bytes[..count]);
+                let written = device.write_serial_output(id, &serial_bytes[..count]);
                 debug_assert_eq!(written, count);
             }
 
@@ -217,8 +224,8 @@ impl VmController {
             {
                 const WARNING: &[u8] =
                     b"\r\nWARN guest serial output overflowed; bytes were dropped.\r\n";
-                if device.serial_output_capacity() >= WARNING.len()
-                    && device.write_serial_output(WARNING) == WARNING.len()
+                if device.serial_output_capacity(id) >= WARNING.len()
+                    && device.write_serial_output(id, WARNING) == WARNING.len()
                 {
                     self.network_serial_overflow_reported = true;
                 }
@@ -239,8 +246,8 @@ impl VmController {
                 allocator,
             );
         }
-        if let Some(command) = command {
-            self.handle_command(CommandSource::Network, command, allocator);
+        if let Some((id, command)) = command {
+            self.handle_command(CommandSource::Network(id), command, allocator);
             management_response_pending = true;
         }
 
@@ -281,11 +288,11 @@ impl VmController {
                 || (self.serial_owner == source_owner && requested_vm == Some(self.serial_vm_id)));
 
         let action = match source {
-            CommandSource::Network => {
+            CommandSource::Network(id) => {
                 let Some(device) = self.network.as_mut() else {
                     return;
                 };
-                let mut endpoint = NetworkEndpoint(device);
+                let mut endpoint = NetworkEndpoint { device, id };
                 process_management_command(
                     command,
                     &mut endpoint,
@@ -349,10 +356,10 @@ impl VmController {
 
     fn detach_serial_owner(&mut self, notice: &[u8]) {
         match self.serial_owner.take() {
-            Some(SerialOwner::Network) => {
+            Some(SerialOwner::Network(id)) => {
                 if let Some(device) = self.network.as_mut() {
-                    device.set_serial_attached(false);
-                    device.notify_management_detach_or_close(notice);
+                    device.set_serial_attached(id, false);
+                    device.notify_management_detach_or_close(id, notice);
                 }
             }
             Some(SerialOwner::Local) => {
@@ -435,7 +442,7 @@ impl VmController {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommandSource {
-    Network,
+    Network(ConnectionId),
     Serial,
     Udp,
 }
@@ -443,7 +450,7 @@ enum CommandSource {
 impl CommandSource {
     fn serial_owner(self) -> Option<SerialOwner> {
         match self {
-            Self::Network => Some(SerialOwner::Network),
+            Self::Network(id) => Some(SerialOwner::Network(id)),
             Self::Serial => Some(SerialOwner::Local),
             Self::Udp => None,
         }
@@ -452,7 +459,7 @@ impl CommandSource {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SerialOwner {
-    Network,
+    Network(ConnectionId),
     Local,
 }
 
@@ -478,7 +485,10 @@ trait ManagementEndpoint: Write {
     }
 }
 
-struct NetworkEndpoint<'a>(&'a mut VirtioNet);
+struct NetworkEndpoint<'a> {
+    device: &'a mut VirtioNet,
+    id: ConnectionId,
+}
 
 struct SilentEndpoint;
 
@@ -502,7 +512,7 @@ impl ManagementEndpoint for SilentEndpoint {
 
 impl fmt::Write for NetworkEndpoint<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        if self.0.write_management(text.as_bytes()) == text.len() {
+        if self.device.write_management(self.id, text.as_bytes()) == text.len() {
             Ok(())
         } else {
             Err(fmt::Error)
@@ -512,12 +522,12 @@ impl fmt::Write for NetworkEndpoint<'_> {
 
 impl ManagementEndpoint for NetworkEndpoint<'_> {
     fn write_bytes(&mut self, bytes: &[u8]) {
-        self.0.write_management(bytes);
+        self.device.write_management(self.id, bytes);
     }
 
     fn set_serial_attached(&mut self, attached: bool) {
-        self.0.set_serial_attached(attached);
-        serial::set_guest_capture_enabled(attached && self.0.serial_attached());
+        self.device.set_serial_attached(self.id, attached);
+        serial::set_guest_capture_enabled(attached && self.device.serial_attached(self.id));
     }
 
     fn close_supported(&self) -> bool {
@@ -525,7 +535,7 @@ impl ManagementEndpoint for NetworkEndpoint<'_> {
     }
 
     fn request_close(&mut self) {
-        self.0.request_management_close();
+        self.device.request_management_close(self.id);
     }
 }
 
@@ -893,7 +903,7 @@ fn process_management_command<E: ManagementEndpoint>(
             if let Some(vm_index) = find_vm_index(vms, vm_id) {
                 let vm = &mut vms[vm_index];
                 let result = if let Some(vcpu) = vm.vcpu.as_mut() {
-                    vcpu.reset()
+                    vcpu.reset().and_then(|()| vcpu.prepare(allocator))
                 } else {
                     Err("VM construction previously failed; reboot the hypervisor to retry")
                 };
