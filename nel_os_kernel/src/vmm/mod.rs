@@ -2,6 +2,7 @@ use ::x86_64::structures::paging::{FrameAllocator, Size4KiB};
 use alloc::boxed::Box;
 
 use crate::{
+    network::PassthroughDescriptor,
     platform,
     vmm::x86_64::{amd::vcpu::AMDVCpu, intel::vcpu::IntelVCpu},
 };
@@ -24,6 +25,7 @@ pub trait VCpu {
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
         hardware_vcpu_id: usize,
         guest_memory_size: u64,
+        passthrough: Option<PassthroughDescriptor>,
     ) -> Result<Self, &'static str>
     where
         Self: Sized;
@@ -79,12 +81,14 @@ pub fn get_vcpu(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     hardware_vcpu_id: usize,
     guest_memory_size: u64,
+    passthrough: Option<PassthroughDescriptor>,
 ) -> Result<Box<dyn VCpu>, &'static str> {
     if platform::is_amd() && AMDVCpu::is_supported() {
         Box::try_new(AMDVCpu::new(
             frame_allocator,
             hardware_vcpu_id,
             guest_memory_size,
+            passthrough,
         )?)
         .map(|vcpu| -> Box<dyn VCpu> { vcpu })
         .map_err(|_| "Management heap cannot allocate another AMD VCPU")
@@ -93,6 +97,7 @@ pub fn get_vcpu(
             frame_allocator,
             hardware_vcpu_id,
             guest_memory_size,
+            passthrough,
         )?)
         .map(|vcpu| -> Box<dyn VCpu> { vcpu })
         .map_err(|_| "Management heap cannot allocate another Intel VCPU")

@@ -1,19 +1,21 @@
 ![check](https://git.mii.dev/mii/nel_os_uefi/actions/workflows/check.yaml/badge.svg?branch=main)
 
-## Hypervisor-only network
+## Management and passthrough networks
 
-The outer kernel owns a transitional virtio-net PCI device; it is not mapped
-or enumerated in the Linux guest. The hypervisor obtains its IPv4 address,
-subnet mask, router, and lease time using DHCP, and answers ARP and ICMP echo.
+QEMU gives the hypervisor two virtio-net PCI functions. The outer kernel owns
+the first transitional device and obtains its management IPv4 configuration by
+DHCP. VM 0 exclusively owns the second, modern-only device through PCI
+passthrough. The hypervisor exposes that device's PCI configuration and MMIO
+BARs, while the QEMU Intel IOMMU translates guest DMA without exposing
+hypervisor memory.
 
-The hypervisor starts with no Linux VMs. A local-serial or network management
-command creates each VM dynamically with an explicit RAM size. There is no
-fixed VM-slot count; creation is limited by available host memory and hardware
-virtualization resources. Each VM has one virtual CPU; 128 MiB is the
-recommended size. The VCPUs are scheduled round-robin on QEMU's one hypervisor
-CPU. After DHCP succeeds, the hypervisor exposes a TCP management shell on port
-`5555`. The legacy UDP `start` command on the same numeric port starts an
-already-created VM 0 and is retained for simple automation.
+At boot the hypervisor creates and starts VM 0 with 128 MiB of RAM and one
+vCPU. Additional VMs are created dynamically with an explicit RAM size. There
+is no fixed VM-slot count; creation is limited by available host memory and
+hardware virtualization resources. VCPUs are scheduled round-robin on QEMU's
+one hypervisor CPU. After management DHCP succeeds, the hypervisor exposes a
+TCP management shell on port `5555`. The legacy UDP `start` command remains
+available and is idempotent for the already-running VM 0.
 
 ### Shared checkout and local builds
 
@@ -45,10 +47,10 @@ components are then installed automatically by the first `./run.sh` invocation.
 
 ### Default port forwarding
 
-The default `./run.sh` command gives the hypervisor 1 GiB of RAM and uses QEMU
-user-mode networking. QEMU assigns
-`10.0.2.15` to the hypervisor over DHCP and forwards both TCP and UDP host port
-`5555` to the hypervisor management port:
+The default `./run.sh` command gives the hypervisor 1 GiB of RAM and uses two
+QEMU user-mode networks. QEMU assigns `10.0.2.15` to the hypervisor and can
+assign `10.0.3.15` to VM 0's passed-through NIC. Both TCP and UDP host port
+`5555` are forwarded to the hypervisor management port:
 
 ```sh
 cd /home/mii/nas-work/nel_os_uefi
@@ -80,10 +82,11 @@ help
 exit
 ```
 
-For `vm create`, omitting `ID` selects the lowest unused ID, so the first
-`vm create 128M` normally creates VM 0 and the next creates VM 1. Other commands
-default to VM 0 when `ID` is omitted. VM creation allocates and initializes the
-requested RAM but does not execute Linux; run `vm start [ID]` separately.
+For `vm create`, omitting `ID` selects the lowest unused ID. Because VM 0 is
+created during boot, the first manual create normally selects VM 1. Other
+commands default to VM 0 when `ID` is omitted. VM creation allocates and
+initializes the requested RAM but does not execute Linux; run `vm start [ID]`
+separately.
 Stopping a VM retains its allocation and state while the other running VMs
 continue to execute. Memory may be specified in MiB by a bare number or with
 `M`, `MB`, or `MiB`; `G`, `GB`, and `GiB` are also accepted. The supported
@@ -134,12 +137,14 @@ management shell to other machines; use `0.0.0.0` only on a trusted network.
 
 Set `NEL_OS_NET_MODE=bridge` to connect the hypervisor directly to a physical
 LAN. This is an explicit mode; there is no automatic fallback between bridge
-and user-mode networking. QEMU uses `tap-nel0` attached to a Linux bridge named
-`br0`, without invoking QEMU's bridge helper. The bridge must already be
+and user-mode networking. QEMU uses `tap-nel0` for the hypervisor and
+`tap-nel1` for VM 0, both attached to a Linux bridge named `br0` without
+invoking QEMU's bridge helper. The bridge must already be
 connected to a physical LAN that provides DHCP:
 
 ```text
-virtio-net -> tap-nel0 -> br0 -> physical NIC -> LAN DHCP server
+hypervisor virtio-net -> tap-nel0 -> br0 -> physical NIC -> LAN DHCP server
+VM 0 virtio-net       -> tap-nel1 -> br0 -> physical NIC -> LAN DHCP server
 ```
 
 Configure the host's addresses and default route on `br0`, not on its member
@@ -173,8 +178,9 @@ cd /home/mii/nas-work/nel_os_uefi
 NEL_OS_NET_MODE=bridge ./run.sh
 ```
 
-The setup script only creates `tap-nel0`; it never creates `br0`, changes a
-physical interface, starts a DHCP server, or installs firewall/NAT rules. The
+The setup script only creates `tap-nel0` and `tap-nel1`; it never creates
+`br0`, changes a physical interface, starts a DHCP server, or installs
+firewall/NAT rules. The
 hypervisor obtains its address directly from the LAN DHCP server. Connect to
 the address printed in the serial console's `DHCP lease` message:
 
@@ -193,10 +199,11 @@ port forwarding in that mode. The management shell is intentionally
 unauthenticated, so only expose bridge mode or a non-loopback bind address on a
 trusted management network.
 
-`NEL_OS_NET_BRIDGE` and `NEL_OS_NET_TAP` can override the default interface
-names. `NEL_OS_NET_MAC` overrides the default `52:54:00:12:34:56` virtio-net
-address; give every simultaneously running instance on the same LAN a unique
-locally administered MAC address.
+`NEL_OS_NET_BRIDGE`, `NEL_OS_NET_TAP`, and `NEL_OS_GUEST_NET_TAP` can override
+the default bridge and interface names. `NEL_OS_NET_MAC` and
+`NEL_OS_GUEST_NET_MAC` override the default `52:54:00:12:34:56` and
+`52:54:00:12:34:57` addresses; give every simultaneously running instance on
+the same LAN unique locally administered MAC addresses.
 
 To remove a tap created by the setup script without changing the physical
 bridge:

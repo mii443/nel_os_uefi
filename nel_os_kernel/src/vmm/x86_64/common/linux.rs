@@ -114,15 +114,16 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
         .get()
         .copied()
         .ok_or("TSC frequency was not calibrated before guest setup")?;
-    // PCI devices belong to the outer nel_os instance. Passing their MMIO and
-    // DMA through to an NPT-backed L2 guest would bypass guest-RAM translation.
+    // VM 0 receives one PCI function whose DMA is translated through VT-d.
+    // Force legacy configuration mechanism one because the compact guest does
+    // not receive ACPI/MCFG tables from the outer hypervisor.
     // The guest observes the same TSC as this single-vCPU host (no SVM TSC
     // offset/scaling), so the ACPI PM-timer measurement is its exact early
     // calibration reference as well.
     let mut cmdline = StackText::<256>::new();
     write!(
         cmdline,
-        "console=ttyS0 earlyprintk=serial nokaslr pci=off tsc_early_khz={} tsc=reliable",
+        "console=ttyS0 earlyprintk=serial nokaslr pci=conf1 tsc_early_khz={} tsc=reliable",
         tsc_khz
     )
     .map_err(|_| "Linux command line exceeds its stack buffer")?;

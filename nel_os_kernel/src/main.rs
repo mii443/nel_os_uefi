@@ -186,9 +186,7 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
     ROOTFS_ADDR.call_once(|| boot_info.rootfs_addr);
     ROOTFS_SIZE.call_once(|| boot_info.rootfs_size);
 
-    // The physical NIC is owned by the outer kernel. It is initialized before
-    // guest RAM is created, and is never mapped into EPT/NPT or represented by
-    // the guest's deliberately empty PCI model.
+    // The first NIC remains owned by the outer kernel for management traffic.
     let network_device = match network::VirtioNet::probe(&mut bitmap_table) {
         Ok(device) => Some(device),
         Err(error) => {
@@ -198,14 +196,31 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
         }
     };
 
+    // The second NIC is reserved for VM 0. Its DMA is isolated through the
+    // virtual VT-d unit advertised by QEMU and mapped alongside EPT/NPT RAM.
+    let passthrough_nic = match boot_info.rsdp {
+        Some(rsdp) => match network::PassthroughDescriptor::probe(rsdp) {
+            Ok(device) => Some(device),
+            Err(error) => {
+                error!("VM 0 PCI passthrough unavailable: {}", error);
+                None
+            }
+        },
+        None => {
+            error!("VM 0 PCI passthrough unavailable: ACPI RSDP is missing");
+            None
+        }
+    };
+
     if network_device.is_some() {
         info!(
-            "No Linux VMs exist yet; management shell will listen on TCP port {} after DHCP",
+            "Boot VM 0 will start; management shell will listen on TCP port {} after DHCP",
             network::CONTROL_PORT,
         );
     } else {
-        info!("No Linux VMs exist yet; use the local serial management shell");
+        info!("Boot VM 0 will start; use the local serial management shell");
     }
 
-    vm_control::VmController::new(network_device, usable_frame, boot_tsc).run(&mut bitmap_table);
+    vm_control::VmController::new(network_device, passthrough_nic, usable_frame, boot_tsc)
+        .run(&mut bitmap_table);
 }

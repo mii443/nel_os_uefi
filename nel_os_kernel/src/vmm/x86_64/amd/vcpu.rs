@@ -6,7 +6,9 @@ use x86_64::{
 };
 
 use crate::{
-    error, info, serial,
+    error, info,
+    network::{PassthroughDescriptor, PassthroughNic},
+    serial,
     vmm::{
         VCpu,
         x86_64::{
@@ -52,6 +54,7 @@ pub struct AMDVCpu {
     guest_memory_size: u64,
     guest_memory_allocated: u64,
     guest_asid: u32,
+    passthrough: Option<PassthroughNic>,
 }
 
 struct SerialState {
@@ -740,7 +743,20 @@ impl AMDVCpu {
             }
             self.npt
                 .map_4k(gpa, frame.start_address().as_u64(), frame_allocator)?;
+            if let Some(device) = self.passthrough.as_mut() {
+                device.map_dma(gpa, frame.start_address().as_u64(), frame_allocator)?;
+            }
             gpa += PAGE_SIZE;
+        }
+
+        if let Some(device) = self.passthrough.as_ref() {
+            for (base, size) in device.mmio_regions() {
+                let mut address = base;
+                while address < base.saturating_add(size) {
+                    self.npt.map_4k(address, address, frame_allocator)?;
+                    address += PAGE_SIZE;
+                }
+            }
         }
 
         Ok(())
@@ -934,6 +950,13 @@ impl AMDVCpu {
             self.legacy_timer.pic.raise_irq(0);
         }
         self.sync_uart_irq();
+        if let Some(irq) = self
+            .passthrough
+            .as_mut()
+            .and_then(PassthroughNic::poll_interrupt)
+        {
+            self.legacy_timer.pic.raise_irq(irq);
+        }
         let next_irq = self.legacy_timer.pic.next_irq();
 
         let vmcb = self.vmcb.get_raw_vmcb();
@@ -1034,6 +1057,28 @@ impl AMDVCpu {
             4 => 4,
             _ => return Err("AMD guest attempted I/O with invalid operand size"),
         };
+
+        if self
+            .passthrough
+            .as_ref()
+            .is_some_and(|device| device.handles_port(port))
+        {
+            let device = self.passthrough.as_mut().unwrap();
+            if is_input {
+                let value = u64::from(device.io_in(port, size));
+                let mask = match size {
+                    1 => u8::MAX as u64,
+                    2 => u16::MAX as u64,
+                    _ => u64::MAX,
+                };
+                let rax = &mut self.vmcb.get_raw_vmcb().state_save_area.rax;
+                *rax = (*rax & !mask) | value;
+            } else {
+                let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u32;
+                device.io_out(port, size, value);
+            }
+            return self.advance_guest_rip();
+        }
 
         if is_input {
             let value = match (port, size) {
@@ -1406,6 +1451,9 @@ impl VCpu for AMDVCpu {
         if self.guest_memory_initialization_failed {
             return Err("Guest memory initialization previously failed");
         }
+        if let Some(device) = self.passthrough.as_mut() {
+            device.reset();
+        }
         let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
             .get()
             .copied()
@@ -1459,6 +1507,7 @@ impl VCpu for AMDVCpu {
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
         hardware_vcpu_id: usize,
         guest_memory_size: u64,
+        passthrough: Option<PassthroughDescriptor>,
     ) -> Result<Self, &'static str>
     where
         Self: Sized,
@@ -1505,6 +1554,9 @@ impl VCpu for AMDVCpu {
             .get()
             .copied()
             .ok_or("TSC frequency unavailable for AMD legacy timer")?;
+        let passthrough = passthrough
+            .map(|descriptor| PassthroughNic::new(descriptor, frame_allocator))
+            .transpose()?;
 
         Ok(AMDVCpu {
             initialized: false,
@@ -1534,6 +1586,7 @@ impl VCpu for AMDVCpu {
             // ASID zero is reserved. A unique ASID keeps cached nested
             // translations isolated when VMs are scheduled round-robin.
             guest_asid,
+            passthrough,
         })
     }
 

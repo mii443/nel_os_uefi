@@ -5,6 +5,7 @@ const CONFIG_DATA: u16 = 0x0cfc;
 
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 pub const VIRTIO_NET_LEGACY_DEVICE_ID: u16 = 0x1000;
+pub const VIRTIO_NET_MODERN_DEVICE_ID: u16 = 0x1041;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PciAddress {
@@ -14,7 +15,7 @@ pub struct PciAddress {
 }
 
 impl PciAddress {
-    fn config_address(self, offset: u8) -> u32 {
+    pub(crate) fn config_address(self, offset: u8) -> u32 {
         0x8000_0000
             | (self.bus as u32) << 16
             | (self.device as u32) << 11
@@ -49,9 +50,28 @@ impl PciAddress {
             Port::<u32>::new(CONFIG_DATA).write(new);
         }
     }
+
+    pub fn write_u32(self, offset: u8, value: u32) {
+        unsafe {
+            Port::<u32>::new(CONFIG_ADDRESS).write(self.config_address(offset));
+            Port::<u32>::new(CONFIG_DATA).write(value);
+        }
+    }
 }
 
 pub fn find_legacy_virtio_net() -> Option<PciAddress> {
+    find_nth_legacy_virtio_net(0)
+}
+
+pub fn find_nth_legacy_virtio_net(mut index: usize) -> Option<PciAddress> {
+    find_nth_virtio_net_matching(&mut index, false)
+}
+
+pub fn find_nth_virtio_net(mut index: usize) -> Option<PciAddress> {
+    find_nth_virtio_net_matching(&mut index, true)
+}
+
+fn find_nth_virtio_net_matching(index: &mut usize, include_modern: bool) -> Option<PciAddress> {
     for bus in 0..=u8::MAX {
         for device in 0..32u8 {
             let first = PciAddress {
@@ -74,15 +94,32 @@ pub fn find_legacy_virtio_net() -> Option<PciAddress> {
                     device,
                     function,
                 };
+                let device_id = address.read_u16(2);
                 if address.read_u16(0) == VIRTIO_VENDOR_ID
-                    && address.read_u16(2) == VIRTIO_NET_LEGACY_DEVICE_ID
+                    && (device_id == VIRTIO_NET_LEGACY_DEVICE_ID
+                        || include_modern && device_id == VIRTIO_NET_MODERN_DEVICE_ID)
                 {
-                    return Some(address);
+                    if *index == 0 {
+                        return Some(address);
+                    }
+                    *index -= 1;
                 }
             }
         }
     }
     None
+}
+
+pub fn bus_has_device(bus: u8) -> bool {
+    (0..32u8).any(|device| {
+        PciAddress {
+            bus,
+            device,
+            function: 0,
+        }
+        .read_u16(0)
+            != u16::MAX
+    })
 }
 
 pub fn io_bar(address: PciAddress) -> Option<u16> {

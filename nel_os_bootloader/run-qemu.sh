@@ -6,7 +6,9 @@ readonly EFI_BINARY="$(realpath -- "$1")"
 readonly NET_MODE="${NEL_OS_NET_MODE:-user}"
 readonly NET_BRIDGE="${NEL_OS_NET_BRIDGE:-br0}"
 readonly NET_TAP="${NEL_OS_NET_TAP:-tap-nel0}"
+readonly GUEST_NET_TAP="${NEL_OS_GUEST_NET_TAP:-tap-nel1}"
 readonly NET_MAC="${NEL_OS_NET_MAC:-52:54:00:12:34:56}"
+readonly GUEST_NET_MAC="${NEL_OS_GUEST_NET_MAC:-52:54:00:12:34:57}"
 readonly NET_BIND_ADDRESS="${NEL_OS_NET_BIND_ADDR:-127.0.0.1}"
 readonly NET_HOST_PORT="${NEL_OS_NET_HOST_PORT:-5555}"
 readonly LOCAL_CACHE_BASE="${NEL_OS_LOCAL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/nel_os_uefi}"
@@ -17,8 +19,14 @@ readonly RUNTIME_DIR="${RUNTIME_BASE}/${HOST_SLUG}-${NET_MODE}-${NET_HOST_PORT}"
 
 export CARGO_TARGET_DIR="${NEL_OS_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-${LOCAL_CACHE_BASE}/target}}"
 
-if [[ ! "${NET_MAC}" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
-    echo "Invalid virtio-net MAC address: ${NET_MAC}" >&2
+for mac in "${NET_MAC}" "${GUEST_NET_MAC}"; do
+    if [[ ! "${mac}" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+        echo "Invalid virtio-net MAC address: ${mac}" >&2
+        exit 2
+    fi
+done
+if [[ "${NET_MAC,,}" == "${GUEST_NET_MAC,,}" ]]; then
+    echo "Hypervisor and guest virtio-net MAC addresses must differ." >&2
     exit 2
 fi
 
@@ -35,6 +43,7 @@ is_ipv4_address() {
 }
 
 NET_ARGS=()
+GUEST_NET_ARGS=()
 case "${NET_MODE}" in
     user)
         if ! is_ipv4_address "${NET_BIND_ADDRESS}"; then
@@ -50,10 +59,15 @@ case "${NET_MODE}" in
             -netdev
             "user,id=hypervisor_net,net=10.0.2.0/24,dhcpstart=10.0.2.15,hostfwd=tcp:${NET_BIND_ADDRESS}:${NET_HOST_PORT}-10.0.2.15:5555,hostfwd=udp:${NET_BIND_ADDRESS}:${NET_HOST_PORT}-10.0.2.15:5555"
         )
+        GUEST_NET_ARGS=(
+            -netdev
+            "user,id=guest_net,net=10.0.3.0/24,dhcpstart=10.0.3.15"
+        )
         ;;
     bridge)
         if [[ ! "${NET_BRIDGE}" =~ ^[[:alnum:]_.:-]{1,15}$ ]] ||
-            [[ ! "${NET_TAP}" =~ ^[[:alnum:]_.:-]{1,15}$ ]]; then
+            [[ ! "${NET_TAP}" =~ ^[[:alnum:]_.:-]{1,15}$ ]] ||
+            [[ ! "${GUEST_NET_TAP}" =~ ^[[:alnum:]_.:-]{1,15}$ ]]; then
             echo "Invalid bridge or tap interface name." >&2
             exit 2
         fi
@@ -62,22 +76,24 @@ case "${NET_MODE}" in
             echo "Configure a physical LAN bridge, then run ${SOURCE_DIR}/setup-br0.sh up." >&2
             exit 1
         fi
-        if [[ ! -e "/sys/class/net/${NET_TAP}/tun_flags" ]]; then
-            echo "Required tap ${NET_TAP} is not configured." >&2
-            echo "Run ${SOURCE_DIR}/setup-br0.sh up before starting QEMU." >&2
-            exit 1
-        fi
-        if [[ "$(basename "$(readlink -f "/sys/class/net/${NET_TAP}/master")")" != "${NET_BRIDGE}" ]]; then
-            echo "Tap ${NET_TAP} is not attached to required bridge ${NET_BRIDGE}." >&2
-            echo "Run ${SOURCE_DIR}/setup-br0.sh up before starting QEMU." >&2
-            exit 1
-        fi
+        for tap in "${NET_TAP}" "${GUEST_NET_TAP}"; do
+            if [[ ! -e "/sys/class/net/${tap}/tun_flags" ]]; then
+                echo "Required tap ${tap} is not configured." >&2
+                echo "Run ${SOURCE_DIR}/setup-br0.sh up before starting QEMU." >&2
+                exit 1
+            fi
+            if [[ "$(basename "$(readlink -f "/sys/class/net/${tap}/master")")" != "${NET_BRIDGE}" ]]; then
+                echo "Tap ${tap} is not attached to required bridge ${NET_BRIDGE}." >&2
+                echo "Run ${SOURCE_DIR}/setup-br0.sh up before starting QEMU." >&2
+                exit 1
+            fi
+        done
 
         BRIDGE_HAS_UPLINK=false
         for port_path in "/sys/class/net/${NET_BRIDGE}/brif/"*; do
             [[ -e "${port_path}" ]] || continue
             port="$(basename "${port_path}")"
-            if [[ "${port}" != "${NET_TAP}" && ! -e "/sys/class/net/${port}/tun_flags" ]]; then
+            if [[ "${port}" != "${NET_TAP}" && "${port}" != "${GUEST_NET_TAP}" && ! -e "/sys/class/net/${port}/tun_flags" ]]; then
                 BRIDGE_HAS_UPLINK=true
                 break
             fi
@@ -87,6 +103,7 @@ case "${NET_MODE}" in
             exit 1
         fi
         NET_ARGS=(-netdev "tap,id=hypervisor_net,ifname=${NET_TAP},script=no,downscript=no")
+        GUEST_NET_ARGS=(-netdev "tap,id=guest_net,ifname=${GUEST_NET_TAP},script=no,downscript=no")
         ;;
     *)
         echo "Invalid NEL_OS_NET_MODE: ${NET_MODE} (expected user or bridge)" >&2
@@ -102,7 +119,7 @@ QEMU_ACCEL_ARGS=()
 if [[ -r /dev/kvm && -w /dev/kvm ]]; then
     QEMU_ACCEL_ARGS=(-enable-kvm -cpu host)
 else
-    QEMU_ACCEL_ARGS=(-machine accel=tcg -cpu max,+svm)
+    QEMU_ACCEL_ARGS=(-accel tcg -cpu max,+svm)
 fi
 
 run_qemu() {
@@ -113,6 +130,8 @@ run_qemu() {
 
     qemu-system-x86_64 "$@" \
         -m 1G \
+        -machine q35 \
+        -device intel-iommu \
         -serial mon:stdio \
         -nographic \
         -drive "if=pflash,format=raw,readonly=on,file=${SOURCE_DIR}/OVMF_CODE.fd" \
@@ -121,7 +140,9 @@ run_qemu() {
         -boot d \
         -smp 1 \
         "${NET_ARGS[@]}" \
-        -device "virtio-net-pci,netdev=hypervisor_net,disable-modern=on,mac=${NET_MAC}" \
+        "${GUEST_NET_ARGS[@]}" \
+        -device "virtio-net-pci,netdev=hypervisor_net,disable-modern=on,vectors=0,mac=${NET_MAC}" \
+        -device "virtio-net-pci,netdev=guest_net,disable-legacy=on,iommu_platform=on,vectors=0,mac=${GUEST_NET_MAC}" \
         "${debug_args[@]}" \
         --no-shutdown --no-reboot
 }

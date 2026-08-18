@@ -14,6 +14,7 @@ use x86_64::{
 use crate::{
     constant::PAGE_SIZE,
     info, interrupt,
+    network::{PassthroughDescriptor, PassthroughNic},
     vmm::{
         VCpu,
         x86_64::{
@@ -77,6 +78,7 @@ pub struct IntelVCpu {
     pub pic: super::io::Pic,
     io_bitmap: IOBitmap,
     preemption_timer_ticks: u32,
+    passthrough: Option<PassthroughNic>,
     pub host_xcr0: u64,
     pub guest_xcr0: XCR0,
 }
@@ -178,12 +180,36 @@ impl IntelVCpu {
                 VmxExitReason::IO_INSTRUCTION => {
                     let qual = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
                     let qual_io = QualIo::from(qual);
+                    let size = match qual_io.size() {
+                        0 => 1,
+                        1 => 2,
+                        3 => 4,
+                        _ => 0,
+                    };
+                    let passthrough_handled = size != 0
+                        && self
+                            .passthrough
+                            .as_ref()
+                            .is_some_and(|device| device.handles_port(qual_io.port()));
+                    let io_result = if passthrough_handled {
+                        let device = self.passthrough.as_mut().unwrap();
+                        if qual_io.direction() == 1 {
+                            let value = u64::from(device.io_in(qual_io.port(), size));
+                            let mask = match size {
+                                1 => u8::MAX as u64,
+                                2 => u16::MAX as u64,
+                                _ => u64::MAX,
+                            };
+                            self.guest_registers.rax = (self.guest_registers.rax & !mask) | value;
+                        } else {
+                            device.io_out(qual_io.port(), size, self.guest_registers.rax as u32);
+                        }
+                        Ok(())
+                    } else {
+                        self.pic.handle_io(&mut self.guest_registers, qual_io)
+                    };
 
-                    if self
-                        .pic
-                        .handle_io(&mut self.guest_registers, qual_io)
-                        .is_ok()
-                    {
+                    if io_result.is_ok() {
                         self.step_next_inst()?;
                     } else {
                         self.pic.inject_exception(6, None)?;
@@ -431,8 +457,21 @@ impl IntelVCpu {
                 core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE);
             }
             self.ept.map_4k(gpa, hpa, frame_allocator)?;
+            if let Some(device) = self.passthrough.as_mut() {
+                device.map_dma(gpa, hpa, frame_allocator)?;
+            }
             gpa += 0x1000;
             pages -= 1;
+        }
+
+        if let Some(device) = self.passthrough.as_ref() {
+            for (base, size) in device.mmio_regions() {
+                let mut address = base;
+                while address < base.saturating_add(size) {
+                    self.ept.map_4k(address, address, frame_allocator)?;
+                    address += PAGE_SIZE as u64;
+                }
+            }
         }
 
         let eptp = ept::Eptp::init(&self.ept.root_table);
@@ -939,6 +978,13 @@ impl VCpu for IntelVCpu {
         self.vmcs.load()?;
 
         self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
+        if let Some(irq) = self
+            .passthrough
+            .as_mut()
+            .and_then(PassthroughNic::poll_interrupt)
+        {
+            self.pic.pending_irq |= 1 << irq;
+        }
         self.pic.poll_serial_input();
         self.pic.poll_timer();
 
@@ -994,6 +1040,9 @@ impl VCpu for IntelVCpu {
         self.halted = false;
         self.halted_irq_retry = false;
         self.host_pending_irq.store(0, Ordering::Release);
+        if let Some(device) = self.passthrough.as_mut() {
+            device.reset();
+        }
         self.guest_xcr0 = XCR0::from(1);
         Ok(())
     }
@@ -1027,6 +1076,7 @@ impl VCpu for IntelVCpu {
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
         _hardware_vcpu_id: usize,
         guest_memory_size: u64,
+        passthrough: Option<PassthroughDescriptor>,
     ) -> Result<Self, &'static str>
     where
         Self: Sized,
@@ -1067,6 +1117,9 @@ impl VCpu for IntelVCpu {
             ShadowMsr::new(frame_allocator).map_err(|_| "Failed to allocate host MSR area")?;
         let guest_msr =
             ShadowMsr::new(frame_allocator).map_err(|_| "Failed to allocate guest MSR area")?;
+        let passthrough = passthrough
+            .map(|descriptor| PassthroughNic::new(descriptor, frame_allocator))
+            .transpose()?;
 
         Ok(IntelVCpu {
             launch_done: false,
@@ -1098,6 +1151,7 @@ impl VCpu for IntelVCpu {
             pic: super::io::Pic::new(tsc_khz),
             io_bitmap: IOBitmap::new(frame_allocator),
             preemption_timer_ticks: 1,
+            passthrough,
             host_xcr0: host_xsave_mask,
             guest_xcr0: XCR0::from(1),
         })

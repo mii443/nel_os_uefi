@@ -8,7 +8,7 @@ use crate::{
     constant::PKG_VERSION,
     cpuid, interrupt,
     memory::bitmap::BitmapMemoryTable,
-    network::{ConnectionId, Ipv4Config, ManagementCommand, VirtioNet},
+    network::{ConnectionId, Ipv4Config, ManagementCommand, PassthroughDescriptor, VirtioNet},
     platform, serial,
     serial_console::SerialConsole,
     time, vmm, {error, info, warn},
@@ -83,6 +83,7 @@ fn percentage_tenths(value: u64, total: u64) -> u64 {
 
 pub(crate) struct VmController {
     network: Option<VirtioNet>,
+    passthrough: Option<PassthroughDescriptor>,
     serial_console: SerialConsole,
     vms: Vec<VirtualMachine>,
     next_vm_index: usize,
@@ -95,9 +96,15 @@ pub(crate) struct VmController {
 }
 
 impl VmController {
-    pub(crate) fn new(network: Option<VirtioNet>, total_frames: usize, boot_tsc: u64) -> Self {
+    pub(crate) fn new(
+        network: Option<VirtioNet>,
+        passthrough: Option<PassthroughDescriptor>,
+        total_frames: usize,
+        boot_tsc: u64,
+    ) -> Self {
         Self {
             network,
+            passthrough,
             serial_console: SerialConsole::new(),
             vms: Vec::new(),
             next_vm_index: 0,
@@ -112,10 +119,45 @@ impl VmController {
 
     pub(crate) fn run(mut self, allocator: &mut BitmapMemoryTable) -> ! {
         self.serial_console.activate();
+        self.start_boot_vm(allocator);
         loop {
             self.poll_serial_console(allocator);
             self.poll_network(allocator);
             self.run_guest(allocator);
+        }
+    }
+
+    fn start_boot_vm(&mut self, allocator: &mut BitmapMemoryTable) {
+        self.handle_command(
+            CommandSource::Udp,
+            ManagementCommand::VmCreate {
+                id: Some(crate::management::DEFAULT_VM_ID),
+                memory_mib: vmm::DEFAULT_GUEST_MEMORY_MIB,
+            },
+            allocator,
+        );
+        self.handle_command(
+            CommandSource::Udp,
+            ManagementCommand::VmStart {
+                id: crate::management::DEFAULT_VM_ID,
+                attach: false,
+            },
+            allocator,
+        );
+        if self
+            .vms
+            .first()
+            .is_some_and(|vm| matches!(vm.state, VmState::Running))
+        {
+            info!(
+                "Boot VM 0 started with {} MiB and {} assigned PCI NIC",
+                vmm::DEFAULT_GUEST_MEMORY_MIB,
+                if self.passthrough.is_some() {
+                    "one"
+                } else {
+                    "no"
+                }
+            );
         }
     }
 
@@ -303,6 +345,7 @@ impl VmController {
                     network_config,
                     network_drops,
                     serial_drops,
+                    self.passthrough,
                     attach_allowed,
                     endpoint_owns_serial,
                 )
@@ -317,6 +360,7 @@ impl VmController {
                 network_config,
                 network_drops,
                 serial_drops,
+                self.passthrough,
                 attach_allowed,
                 endpoint_owns_serial,
             ),
@@ -332,6 +376,7 @@ impl VmController {
                     network_config,
                     network_drops,
                     serial_drops,
+                    self.passthrough,
                     false,
                     false,
                 )
@@ -733,6 +778,7 @@ fn process_management_command<E: ManagementEndpoint>(
     network_config: Option<Ipv4Config>,
     network_drops: u64,
     serial_drops: u64,
+    passthrough: Option<PassthroughDescriptor>,
     attach_allowed: bool,
     endpoint_owns_serial: bool,
 ) -> SerialAction {
@@ -789,7 +835,12 @@ fn process_management_command<E: ManagementEndpoint>(
                     // frames that cannot be reclaimed until reboot.
                     let hardware_vcpu_id = vms.len();
                     let mut vm = VirtualMachine::new(vm_id, memory_size);
-                    match vmm::get_vcpu(allocator, hardware_vcpu_id, memory_size) {
+                    let assigned_nic = if vm_id == crate::management::DEFAULT_VM_ID {
+                        passthrough
+                    } else {
+                        None
+                    };
+                    match vmm::get_vcpu(allocator, hardware_vcpu_id, memory_size, assigned_nic) {
                         Ok(mut new_vcpu) => {
                             let prepare_result = new_vcpu.prepare(allocator);
                             vm.vcpu = Some(new_vcpu);
