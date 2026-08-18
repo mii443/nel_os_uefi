@@ -43,6 +43,8 @@ enum DhcpState {
     Selecting,
     Requesting,
     Bound,
+    Renewing,
+    Rebinding,
 }
 
 #[derive(Default)]
@@ -52,6 +54,8 @@ struct DhcpOptions {
     subnet_mask: Option<[u8; 4]>,
     router: Option<[u8; 4]>,
     lease_seconds: Option<u32>,
+    renewal_seconds: Option<u32>,
+    rebinding_seconds: Option<u32>,
 }
 
 pub struct NetworkStack {
@@ -61,6 +65,8 @@ pub struct NetworkStack {
     requested_address: [u8; 4],
     dhcp_server: [u8; 4],
     next_dhcp_tick: usize,
+    lease_renewal_tick: usize,
+    lease_rebinding_tick: usize,
     lease_expiry_tick: usize,
     config: Option<Ipv4Config>,
     start_requested: bool,
@@ -81,6 +87,8 @@ impl NetworkStack {
             requested_address: IPV4_UNSPECIFIED,
             dhcp_server: IPV4_UNSPECIFIED,
             next_dhcp_tick: 0,
+            lease_renewal_tick: 0,
+            lease_rebinding_tick: 0,
             lease_expiry_tick: 0,
             config: None,
             start_requested: false,
@@ -160,39 +168,50 @@ impl NetworkStack {
 
     pub fn poll(&mut self, now: usize, output: &mut [u8]) -> Option<usize> {
         let now = network_clock_millis(now);
-        if self.dhcp_state == DhcpState::Bound && now >= self.lease_expiry_tick {
+        if self.config.is_some() && now >= self.lease_expiry_tick {
             self.lose_lease(now);
         }
 
-        if let Some(config) = self.config {
-            if let Some(length) = self.management.poll(self.mac, config.address, now, output) {
-                return Some(length);
+        if self.dhcp_state == DhcpState::Bound && now >= self.lease_renewal_tick {
+            self.dhcp_state = DhcpState::Renewing;
+            self.next_dhcp_tick = now;
+        } else if self.dhcp_state == DhcpState::Renewing && now >= self.lease_rebinding_tick {
+            self.dhcp_state = DhcpState::Rebinding;
+            self.next_dhcp_tick = now;
+        }
+
+        if now >= self.next_dhcp_tick {
+            match self.dhcp_state {
+                DhcpState::Init | DhcpState::Selecting => {
+                    let length = self.build_dhcp(DHCP_DISCOVER, None, None, None, output)?;
+                    self.dhcp_state = DhcpState::Selecting;
+                    self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
+                    return Some(length);
+                }
+                DhcpState::Requesting => {
+                    let length = self.build_dhcp(
+                        DHCP_REQUEST,
+                        Some(self.requested_address),
+                        Some(self.dhcp_server),
+                        None,
+                        output,
+                    )?;
+                    self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
+                    return Some(length);
+                }
+                DhcpState::Renewing | DhcpState::Rebinding => {
+                    let address = self.config?.address;
+                    let length =
+                        self.build_dhcp(DHCP_REQUEST, None, None, Some(address), output)?;
+                    self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
+                    return Some(length);
+                }
+                DhcpState::Bound => {}
             }
         }
 
-        if now < self.next_dhcp_tick {
-            return None;
-        }
-
-        match self.dhcp_state {
-            DhcpState::Init | DhcpState::Selecting => {
-                let length = self.build_dhcp(DHCP_DISCOVER, None, None, output)?;
-                self.dhcp_state = DhcpState::Selecting;
-                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
-                Some(length)
-            }
-            DhcpState::Requesting => {
-                let length = self.build_dhcp(
-                    DHCP_REQUEST,
-                    Some(self.requested_address),
-                    Some(self.dhcp_server),
-                    output,
-                )?;
-                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
-                Some(length)
-            }
-            DhcpState::Bound => None,
-        }
+        let config = self.config?;
+        self.management.poll(self.mac, config.address, now, output)
     }
 
     pub fn handle_frame(&mut self, frame: &[u8], response: &mut [u8], now: usize) -> Option<usize> {
@@ -404,6 +423,7 @@ impl NetworkStack {
                     DHCP_REQUEST,
                     Some(self.requested_address),
                     Some(self.dhcp_server),
+                    None,
                     response,
                 )?;
                 self.dhcp_state = DhcpState::Requesting;
@@ -420,25 +440,27 @@ impl NetworkStack {
                 } else {
                     offered
                 };
-                let lease_seconds = options.lease_seconds.unwrap_or(DEFAULT_LEASE_SECONDS);
-                let lease_millis = (lease_seconds as usize).saturating_mul(MILLIS_PER_SECOND);
-                let new_config = Ipv4Config {
-                    address,
-                    subnet_mask: options.subnet_mask.unwrap_or(IPV4_UNSPECIFIED),
-                    router: options.router.unwrap_or(IPV4_UNSPECIFIED),
-                    dhcp_server: options.server.unwrap_or(self.dhcp_server),
-                    lease_seconds,
+                self.bind_lease(address, response_server, options, now);
+                None
+            }
+            DHCP_ACK
+                if (self.dhcp_state == DhcpState::Renewing
+                    && response_server == self.dhcp_server)
+                    || self.dhcp_state == DhcpState::Rebinding =>
+            {
+                let current = self.config?;
+                let offered: [u8; 4] = message[16..20].try_into().ok()?;
+                let address = if offered == IPV4_UNSPECIFIED {
+                    current.address
+                } else {
+                    offered
                 };
-                if self
-                    .config
-                    .is_some_and(|old_config| old_config.address != new_config.address)
-                {
-                    self.management.reset_connections();
+                // A renewal is for the address already in use. Do not silently
+                // replace it and tear down live TCP sessions before expiry.
+                if address != current.address {
+                    return None;
                 }
-                self.config = Some(new_config);
-                self.dhcp_state = DhcpState::Bound;
-                self.lease_expiry_tick = now.saturating_add(lease_millis);
-                self.next_dhcp_tick = usize::MAX;
+                self.bind_lease(address, response_server, options, now);
                 None
             }
             DHCP_NAK
@@ -448,8 +470,60 @@ impl NetworkStack {
                 self.lose_lease(now);
                 None
             }
+            DHCP_NAK
+                if (self.dhcp_state == DhcpState::Renewing
+                    && response_server == self.dhcp_server)
+                    || self.dhcp_state == DhcpState::Rebinding =>
+            {
+                self.lose_lease(now);
+                None
+            }
             _ => None,
         }
+    }
+
+    fn bind_lease(
+        &mut self,
+        address: [u8; 4],
+        response_server: [u8; 4],
+        options: DhcpOptions,
+        now: usize,
+    ) {
+        let previous = self.config;
+        let lease_seconds = options
+            .lease_seconds
+            .or(previous.map(|config| config.lease_seconds))
+            .unwrap_or(DEFAULT_LEASE_SECONDS)
+            .max(1);
+        let new_config = Ipv4Config {
+            address,
+            subnet_mask: options
+                .subnet_mask
+                .or(previous.map(|config| config.subnet_mask))
+                .unwrap_or(IPV4_UNSPECIFIED),
+            router: options
+                .router
+                .or(previous.map(|config| config.router))
+                .unwrap_or(IPV4_UNSPECIFIED),
+            dhcp_server: response_server,
+            lease_seconds,
+        };
+        if previous.is_some_and(|config| config.address != new_config.address) {
+            self.management.reset_connections();
+        }
+        let (renewal, rebinding, expiry) = lease_deadlines(
+            now,
+            lease_seconds,
+            options.renewal_seconds,
+            options.rebinding_seconds,
+        );
+        self.config = Some(new_config);
+        self.dhcp_server = response_server;
+        self.dhcp_state = DhcpState::Bound;
+        self.lease_renewal_tick = renewal;
+        self.lease_rebinding_tick = rebinding;
+        self.lease_expiry_tick = expiry;
+        self.next_dhcp_tick = renewal;
     }
 
     fn lose_lease(&mut self, now: usize) {
@@ -465,6 +539,7 @@ impl NetworkStack {
         message_type: u8,
         requested_address: Option<[u8; 4]>,
         server: Option<[u8; 4]>,
+        client_address: Option<[u8; 4]>,
         output: &mut [u8],
     ) -> Option<usize> {
         let frame_len =
@@ -486,7 +561,8 @@ impl NetworkStack {
         )?;
         ip[8] = 64;
         ip[9] = 17;
-        ip[12..16].copy_from_slice(&IPV4_UNSPECIFIED);
+        let source_address = client_address.unwrap_or(IPV4_UNSPECIFIED);
+        ip[12..16].copy_from_slice(&source_address);
         ip[16..20].copy_from_slice(&IPV4_BROADCAST);
         let ip_checksum = checksum(&ip[..IPV4_HEADER_LEN]);
         write_u16(ip, 10, ip_checksum)?;
@@ -501,6 +577,7 @@ impl NetworkStack {
         dhcp[2] = 6;
         write_u32(dhcp, 4, self.xid)?;
         write_u16(dhcp, 10, 0x8000)?;
+        dhcp[12..16].copy_from_slice(&source_address);
         dhcp[28..34].copy_from_slice(&self.mac);
         dhcp[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
 
@@ -516,9 +593,9 @@ impl NetworkStack {
         if let Some(server) = server {
             put_option(dhcp, &mut option, 54, &server)?;
         }
-        put_option(dhcp, &mut option, 55, &[1, 3, 6, 51, 54])?;
+        put_option(dhcp, &mut option, 55, &[1, 3, 6, 51, 54, 58, 59])?;
         *dhcp.get_mut(option)? = 255;
-        let checksum = udp_checksum(IPV4_UNSPECIFIED, IPV4_BROADCAST, udp);
+        let checksum = udp_checksum(source_address, IPV4_BROADCAST, udp);
         write_u16(udp, 6, nonzero_udp_checksum(checksum))?;
         Some(frame_len)
     }
@@ -602,10 +679,42 @@ fn parse_dhcp_options(bytes: &[u8]) -> Option<DhcpOptions> {
             (1, 4) => result.subnet_mask = Some(value.try_into().ok()?),
             (3, length) if length >= 4 => result.router = Some(value[..4].try_into().ok()?),
             (51, 4) => result.lease_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
+            (58, 4) => result.renewal_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
+            (59, 4) => result.rebinding_seconds = Some(u32::from_be_bytes(value.try_into().ok()?)),
             _ => {}
         }
     }
     Some(result)
+}
+
+fn lease_deadlines(
+    now: usize,
+    lease_seconds: u32,
+    renewal_seconds: Option<u32>,
+    rebinding_seconds: Option<u32>,
+) -> (usize, usize, usize) {
+    let lease_millis = (lease_seconds.max(1) as usize).saturating_mul(MILLIS_PER_SECOND);
+    let default_renewal = lease_millis / 2;
+    let default_rebinding = lease_millis.saturating_mul(7) / 8;
+    let requested_renewal = renewal_seconds
+        .map(|seconds| (seconds as usize).saturating_mul(MILLIS_PER_SECOND))
+        .unwrap_or(default_renewal);
+    let requested_rebinding = rebinding_seconds
+        .map(|seconds| (seconds as usize).saturating_mul(MILLIS_PER_SECOND))
+        .unwrap_or(default_rebinding);
+    let (renewal, rebinding) = if requested_renewal > 0
+        && requested_renewal < requested_rebinding
+        && requested_rebinding < lease_millis
+    {
+        (requested_renewal, requested_rebinding)
+    } else {
+        (default_renewal, default_rebinding)
+    };
+    (
+        now.saturating_add(renewal),
+        now.saturating_add(rebinding),
+        now.saturating_add(lease_millis),
+    )
 }
 
 fn put_option(bytes: &mut [u8], index: &mut usize, code: u8, value: &[u8]) -> Option<()> {
@@ -722,6 +831,18 @@ mod tests {
         address: [u8; 4],
         server_ip: [u8; 4],
     ) -> [u8; 342] {
+        dhcp_reply_with_lease(stack, message_type, address, server_ip, 3600, None, None)
+    }
+
+    fn dhcp_reply_with_lease(
+        stack: &NetworkStack,
+        message_type: u8,
+        address: [u8; 4],
+        server_ip: [u8; 4],
+        lease_seconds: u32,
+        renewal_seconds: Option<u32>,
+        rebinding_seconds: Option<u32>,
+    ) -> [u8; 342] {
         let mut frame = [0u8; 342];
         frame[..6].copy_from_slice(&MAC);
         frame[6..12].copy_from_slice(&[0x52, 0x55, 10, 0, 2, 2]);
@@ -752,7 +873,13 @@ mod tests {
         put_option(dhcp, &mut option, 54, &server_ip).unwrap();
         put_option(dhcp, &mut option, 1, &[255, 255, 255, 0]).unwrap();
         put_option(dhcp, &mut option, 3, &server_ip).unwrap();
-        put_option(dhcp, &mut option, 51, &3600u32.to_be_bytes()).unwrap();
+        put_option(dhcp, &mut option, 51, &lease_seconds.to_be_bytes()).unwrap();
+        if let Some(seconds) = renewal_seconds {
+            put_option(dhcp, &mut option, 58, &seconds.to_be_bytes()).unwrap();
+        }
+        if let Some(seconds) = rebinding_seconds {
+            put_option(dhcp, &mut option, 59, &seconds.to_be_bytes()).unwrap();
+        }
         dhcp[option] = 255;
         frame
     }
@@ -767,6 +894,38 @@ mod tests {
         stack.handle_frame(&offer, output, 1).unwrap();
         let ack = dhcp_reply(stack, DHCP_ACK, LEASED_IP);
         assert_eq!(stack.handle_frame(&ack, output, 2), None);
+    }
+
+    fn acquire_short_lease(stack: &mut NetworkStack, output: &mut [u8]) {
+        stack.poll(0, output).unwrap();
+        let offer = dhcp_reply(stack, DHCP_OFFER, LEASED_IP);
+        stack.handle_frame(&offer, output, 1).unwrap();
+        let ack = dhcp_reply_with_lease(stack, DHCP_ACK, LEASED_IP, SERVER_IP, 8, None, None);
+        assert_eq!(stack.handle_frame(&ack, output, 2), None);
+    }
+
+    fn has_dhcp_option(mut bytes: &[u8], expected: u8) -> bool {
+        while let Some((&code, rest)) = bytes.split_first() {
+            bytes = rest;
+            match code {
+                0 => continue,
+                255 => return false,
+                _ => {
+                    let Some((&length, rest)) = bytes.split_first() else {
+                        return false;
+                    };
+                    let length = length as usize;
+                    if rest.len() < length {
+                        return false;
+                    }
+                    if code == expected {
+                        return true;
+                    }
+                    bytes = &rest[length..];
+                }
+            }
+        }
+        false
     }
 
     fn control_request(command: &[u8]) -> [u8; 64] {
@@ -849,6 +1008,81 @@ mod tests {
         let ack = dhcp_reply(&stack, DHCP_ACK, LEASED_IP);
         assert_eq!(stack.handle_frame(&ack, &mut output, 3), None);
         assert_eq!(stack.ipv4_config().unwrap().address, LEASED_IP);
+    }
+
+    #[test]
+    fn renews_lease_without_replacing_the_address() {
+        let mut stack = NetworkStack::new(MAC);
+        let mut output = [0u8; 512];
+        acquire_short_lease(&mut stack, &mut output);
+
+        assert_eq!(stack.lease_renewal_tick, 4_002);
+        assert_eq!(stack.lease_rebinding_tick, 7_002);
+        assert_eq!(stack.lease_expiry_tick, 8_002);
+        let renewal_len = stack.poll(4_002, &mut output).unwrap();
+        assert_eq!(stack.dhcp_state, DhcpState::Renewing);
+        assert_eq!(stack.ipv4_config().unwrap().address, LEASED_IP);
+        assert_eq!(&output[26..30], &LEASED_IP);
+        assert_eq!(&output[54..58], &LEASED_IP);
+        assert_eq!(
+            udp_checksum(LEASED_IP, IPV4_BROADCAST, &output[34..renewal_len]),
+            0
+        );
+        let options = &output[42 + DHCP_FIXED_LEN..renewal_len];
+        assert!(!has_dhcp_option(options, 50));
+        assert!(!has_dhcp_option(options, 54));
+
+        let changed_address = [10, 0, 2, 99];
+        let invalid_ack =
+            dhcp_reply_with_lease(&stack, DHCP_ACK, changed_address, SERVER_IP, 8, None, None);
+        assert_eq!(stack.handle_frame(&invalid_ack, &mut output, 4_003), None);
+        assert_eq!(stack.dhcp_state, DhcpState::Renewing);
+        assert_eq!(stack.ipv4_config().unwrap().address, LEASED_IP);
+
+        let ack =
+            dhcp_reply_with_lease(&stack, DHCP_ACK, IPV4_UNSPECIFIED, SERVER_IP, 8, None, None);
+        assert_eq!(stack.handle_frame(&ack, &mut output, 4_004), None);
+        assert_eq!(stack.dhcp_state, DhcpState::Bound);
+        assert_eq!(stack.ipv4_config().unwrap().address, LEASED_IP);
+        assert_eq!(stack.lease_expiry_tick, 12_004);
+    }
+
+    #[test]
+    fn keeps_lease_through_rebinding_and_drops_it_only_at_expiry() {
+        let mut stack = NetworkStack::new(MAC);
+        let mut output = [0u8; 512];
+        acquire_short_lease(&mut stack, &mut output);
+
+        stack.poll(4_002, &mut output).unwrap();
+        assert_eq!(stack.dhcp_state, DhcpState::Renewing);
+        assert!(stack.ipv4_config().is_some());
+        stack.poll(7_002, &mut output).unwrap();
+        assert_eq!(stack.dhcp_state, DhcpState::Rebinding);
+        assert!(stack.ipv4_config().is_some());
+        assert_eq!(stack.poll(8_001, &mut output), None);
+        assert!(stack.ipv4_config().is_some());
+
+        let discover_len = stack.poll(8_002, &mut output).unwrap();
+        assert_eq!(stack.dhcp_state, DhcpState::Selecting);
+        assert_eq!(stack.ipv4_config(), None);
+        let options = parse_dhcp_options(&output[42 + DHCP_FIXED_LEN..discover_len]).unwrap();
+        assert_eq!(options.message_type, Some(DHCP_DISCOVER));
+    }
+
+    #[test]
+    fn honors_server_supplied_renewal_and_rebinding_times() {
+        let mut stack = NetworkStack::new(MAC);
+        let mut output = [0u8; 512];
+        stack.poll(0, &mut output).unwrap();
+        let offer = dhcp_reply(&stack, DHCP_OFFER, LEASED_IP);
+        stack.handle_frame(&offer, &mut output, 1).unwrap();
+        let ack =
+            dhcp_reply_with_lease(&stack, DHCP_ACK, LEASED_IP, SERVER_IP, 10, Some(2), Some(8));
+        stack.handle_frame(&ack, &mut output, 2);
+
+        assert_eq!(stack.lease_renewal_tick, 2_002);
+        assert_eq!(stack.lease_rebinding_tick, 8_002);
+        assert_eq!(stack.lease_expiry_tick, 10_002);
     }
 
     #[test]

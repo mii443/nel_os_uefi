@@ -105,6 +105,10 @@ The embedded TCP server accepts up to four simultaneous management connections.
 Each client has independent command, response, retransmit, and idle-timeout
 state, so one slow or idle client does not block the other management shells.
 
+DHCP leases are renewed at T1 and rebound at T2 while the current address and
+management TCP sessions remain active. Sessions are reset only if the DHCP
+server rejects the lease or the lease actually expires without renewal.
+
 While attached to a VM serial port, press `Ctrl-]` to detach and return to
 the `nel>` prompt. Guest COM1 output is hidden by default and is sent only to
 management consoles that explicitly ran `serial attach` or
