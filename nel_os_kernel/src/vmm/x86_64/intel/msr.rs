@@ -88,14 +88,8 @@ pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
 
 pub fn _update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     info!("updating MSRs");
-    let indices_to_update: alloc::vec::Vec<u32> = vcpu
-        .host_msr
-        .saved_ents()
-        .iter()
-        .map(|entry| entry.index)
-        .collect();
-
-    for index in indices_to_update {
+    for entry_index in 0..vcpu.host_msr.saved_ents().len() {
+        let index = vcpu.host_msr.saved_ents()[entry_index].index;
         info!("{}", index);
         let value = read_msr(index);
         info!("Setting MSR {:#x} to {:#x}", index, value);

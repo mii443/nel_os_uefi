@@ -1,6 +1,37 @@
-use core::ptr::read_unaligned;
+use core::{
+    fmt::{self, Write},
+    ptr::read_unaligned,
+};
 
 use crate::{BZIMAGE_ADDR, BZIMAGE_SIZE, info, vmm::VCpu};
+
+struct StackText<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackText<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> fmt::Write for StackText<N> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
 
 pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     info!("Loading kernel into guest memory");
@@ -88,11 +119,14 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     // The guest observes the same TSC as this single-vCPU host (no SVM TSC
     // offset/scaling), so the ACPI PM-timer measurement is its exact early
     // calibration reference as well.
-    let cmdline_val = alloc::format!(
+    let mut cmdline = StackText::<256>::new();
+    write!(
+        cmdline,
         "console=ttyS0 earlyprintk=serial nokaslr pci=off tsc_early_khz={} tsc=reliable",
         tsc_khz
-    );
-    let cmdline_bytes = cmdline_val.as_bytes();
+    )
+    .map_err(|_| "Linux command line exceeds its stack buffer")?;
+    let cmdline_bytes = cmdline.as_bytes();
     if cmdline_bytes.len() >= cmdline_max_size as usize {
         return Err("Linux command line is too small for the measured TSC frequency");
     }

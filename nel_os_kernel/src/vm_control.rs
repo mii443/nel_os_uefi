@@ -1,4 +1,4 @@
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     arch::asm,
     fmt::{self, Write},
@@ -14,9 +14,12 @@ use crate::{
     time, vmm, {error, info, warn},
 };
 
+const HOST_RESERVE_MIB: usize = 128;
+const VCPU_OVERHEAD_MIB: usize = 8;
+const MANAGEMENT_HEAP_RESERVE_BYTES: usize = 16 * 1024;
+
 #[derive(Clone, Copy)]
 enum VmState {
-    NotCreated,
     Created,
     Running,
     Stopped,
@@ -24,6 +27,7 @@ enum VmState {
 }
 
 struct VirtualMachine {
+    id: usize,
     vcpu: Option<Box<dyn vmm::VCpu>>,
     state: VmState,
     configured_memory: u64,
@@ -32,19 +36,19 @@ struct VirtualMachine {
 }
 
 impl VirtualMachine {
-    fn new() -> Self {
+    fn new(id: usize, configured_memory: u64) -> Self {
         Self {
+            id,
             vcpu: None,
-            state: VmState::NotCreated,
-            configured_memory: 0,
+            state: VmState::Created,
+            configured_memory,
             cpu_cycles: 0,
-            accounting_start_tsc: 0,
+            accounting_start_tsc: unsafe { core::arch::x86_64::_rdtsc() },
         }
     }
 
     fn state_text(&self) -> &'static str {
         match self.state {
-            VmState::NotCreated => "not-created",
             VmState::Created => "created",
             VmState::Running => "running",
             VmState::Stopped => "stopped",
@@ -80,8 +84,8 @@ fn percentage_tenths(value: u64, total: u64) -> u64 {
 pub(crate) struct VmController {
     network: Option<VirtioNet>,
     serial_console: SerialConsole,
-    vms: [VirtualMachine; vmm::MAX_VMS],
-    next_vm: usize,
+    vms: Vec<VirtualMachine>,
+    next_vm_index: usize,
     serial_owner: Option<SerialOwner>,
     serial_vm_id: usize,
     network_serial_overflow_reported: bool,
@@ -95,8 +99,8 @@ impl VmController {
         Self {
             network,
             serial_console: SerialConsole::new(),
-            vms: core::array::from_fn(|_| VirtualMachine::new()),
-            next_vm: 0,
+            vms: Vec::new(),
+            next_vm_index: 0,
             serial_owner: None,
             serial_vm_id: 0,
             network_serial_overflow_reported: false,
@@ -363,9 +367,10 @@ impl VmController {
     }
 
     fn run_guest(&mut self, allocator: &mut BitmapMemoryTable) {
-        let Some(vm_id) = (0..vmm::MAX_VMS)
-            .map(|offset| (self.next_vm + offset) % vmm::MAX_VMS)
-            .find(|&vm_id| matches!(self.vms[vm_id].state, VmState::Running))
+        let vm_count = self.vms.len();
+        let Some(vm_index) = (0..vm_count)
+            .map(|offset| (self.next_vm_index + offset) % vm_count)
+            .find(|&index| matches!(self.vms[index].state, VmState::Running))
         else {
             serial::set_guest_bridge_active(false);
             // The virtio-net device is deliberately polled with INTx disabled,
@@ -381,7 +386,8 @@ impl VmController {
             return;
         };
 
-        self.next_vm = (vm_id + 1) % vmm::MAX_VMS;
+        self.next_vm_index = (vm_index + 1) % vm_count;
+        let vm_id = self.vms[vm_index].id;
         let owns_serial = self.serial_owner.is_some() && self.serial_vm_id == vm_id;
         serial::set_guest_bridge_active(owns_serial);
         // Force a bounded VMEXIT even for a compute-bound guest, including on
@@ -393,7 +399,7 @@ impl VmController {
             .copied()
             .unwrap_or(1)
             .saturating_mul(vmm::VCPU_TIME_SLICE_MILLIS);
-        let result = match self.vms[vm_id].vcpu.as_mut() {
+        let result = match self.vms[vm_index].vcpu.as_mut() {
             Some(vcpu) => loop {
                 if let Err(error) = vcpu.run(allocator) {
                     break Err(error);
@@ -406,7 +412,7 @@ impl VmController {
             None => Err("running VM has no VCPU"),
         };
         let slice_end = unsafe { core::arch::x86_64::_rdtsc() };
-        self.vms[vm_id].cpu_cycles = self.vms[vm_id]
+        self.vms[vm_index].cpu_cycles = self.vms[vm_index]
             .cpu_cycles
             .wrapping_add(slice_end.wrapping_sub(slice_start));
         serial::set_guest_bridge_active(false);
@@ -422,7 +428,7 @@ impl VmController {
                     b"\r\nVM serial detached because guest execution failed.\r\n",
                 );
             }
-            self.vms[vm_id].state = VmState::Failed(error);
+            self.vms[vm_index].state = VmState::Failed(error);
         }
     }
 }
@@ -573,15 +579,19 @@ fn write_vm_status<E: ManagementEndpoint>(endpoint: &mut E, vm_id: usize, vm: &V
     }
 }
 
-fn write_vm_list<E: ManagementEndpoint>(endpoint: &mut E, vms: &[VirtualMachine; vmm::MAX_VMS]) {
+fn write_vm_list<E: ManagementEndpoint>(endpoint: &mut E, vms: &[VirtualMachine]) {
+    if vms.is_empty() {
+        endpoint.write_bytes(b"No VMs created.\r\n");
+        return;
+    }
     let now = unsafe { core::arch::x86_64::_rdtsc() };
-    for (vm_id, vm) in vms.iter().enumerate() {
+    for vm in vms {
         let memory_usage = vm.memory_usage_tenths();
         let cpu_usage = vm.cpu_usage_tenths(now);
         let _ = write!(
             endpoint,
             "VM {}: {}, {} vCPU, memory={}/{} MiB ({}.{:01}%), cpu={}.{:01}%\r\n",
-            vm_id,
+            vm.id,
             vm.state_text(),
             vmm::VCPUS_PER_VM,
             vm.allocated_memory() / 1024 / 1024,
@@ -592,6 +602,36 @@ fn write_vm_list<E: ManagementEndpoint>(endpoint: &mut E, vms: &[VirtualMachine;
             cpu_usage % 10,
         );
     }
+}
+
+fn find_vm_index(vms: &[VirtualMachine], vm_id: usize) -> Option<usize> {
+    vms.iter().position(|vm| vm.id == vm_id)
+}
+
+fn lowest_free_vm_id(vms: &[VirtualMachine]) -> Option<usize> {
+    let mut candidate = 0usize;
+    loop {
+        if find_vm_index(vms, candidate).is_none() {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+}
+
+fn vm_registry_capacity(total_frames: usize) -> usize {
+    let total_mib = total_frames.saturating_mul(4) / 1024;
+    total_mib.saturating_sub(HOST_RESERVE_MIB)
+        / (vmm::MIN_GUEST_MEMORY_MIB as usize + VCPU_OVERHEAD_MIB)
+}
+
+fn write_missing_vm<E: ManagementEndpoint>(endpoint: &mut E, vm_id: usize) {
+    let _ = write!(
+        endpoint,
+        "ERR VM {} does not exist; use 'vm create {} {}M' first.\r\n",
+        vm_id,
+        vm_id,
+        vmm::DEFAULT_GUEST_MEMORY_MIB
+    );
 }
 
 fn write_memory_info<E: ManagementEndpoint>(
@@ -676,7 +716,7 @@ fn write_runtime_info<E: ManagementEndpoint>(
 fn process_management_command<E: ManagementEndpoint>(
     command: ManagementCommand,
     endpoint: &mut E,
-    vms: &mut [VirtualMachine; vmm::MAX_VMS],
+    vms: &mut Vec<VirtualMachine>,
     allocator: &mut BitmapMemoryTable,
     total_frames: usize,
     boot_tsc: u64,
@@ -691,15 +731,17 @@ fn process_management_command<E: ManagementEndpoint>(
     match command {
         ManagementCommand::VmList => write_vm_list(endpoint, vms),
         ManagementCommand::VmCreate { id, memory_mib } => {
-            let vm_id = id as usize;
-            if vm_id >= vmm::MAX_VMS {
-                write_invalid_vm_id(endpoint, vm_id);
-            } else if !matches!(vms[vm_id].state, VmState::NotCreated) {
+            let Some(vm_id) = id.or_else(|| lowest_free_vm_id(vms)) else {
+                endpoint.write_bytes(b"ERR no VM ID is available.\r\n");
+                endpoint.prompt();
+                return serial_action;
+            };
+            if let Some(index) = find_vm_index(vms, vm_id) {
                 let _ = write!(
                     endpoint,
                     "ERR VM {} already exists; state is {}.\r\n",
                     vm_id,
-                    vms[vm_id].state_text()
+                    vms[index].state_text()
                 );
             } else if !(vmm::MIN_GUEST_MEMORY_MIB..=vmm::MAX_GUEST_MEMORY_MIB).contains(&memory_mib)
             {
@@ -709,9 +751,18 @@ fn process_management_command<E: ManagementEndpoint>(
                     vmm::MIN_GUEST_MEMORY_MIB,
                     vmm::MAX_GUEST_MEMORY_MIB
                 );
+            } else if vms.len() >= vm_registry_capacity(total_frames) {
+                endpoint.write_bytes(
+                    b"ERR host resources cannot support another VM while retaining the management reserve.\r\n",
+                );
+            } else if vms.try_reserve(1).is_err() {
+                endpoint.write_bytes(b"ERR management heap cannot record another VM.\r\n");
+            } else if crate::memory::allocator::free_heap_bytes()
+                < vmm::MAX_VCPU_HEAP_BYTES.saturating_add(MANAGEMENT_HEAP_RESERVE_BYTES)
+            {
+                endpoint
+                    .write_bytes(b"ERR management heap cannot allocate another VCPU safely.\r\n");
             } else {
-                const HOST_RESERVE_MIB: usize = 128;
-                const VCPU_OVERHEAD_MIB: usize = 8;
                 let guest_frames = memory_mib as usize * 1024 / 4;
                 let reserved_frames = (HOST_RESERVE_MIB + VCPU_OVERHEAD_MIB) * 1024 / 4;
                 if allocator.free_frame_count() < guest_frames.saturating_add(reserved_frames) {
@@ -722,10 +773,13 @@ fn process_management_command<E: ManagementEndpoint>(
                     );
                 } else {
                     let memory_size = memory_mib as u64 * 1024 * 1024;
-                    let vm = &mut vms[vm_id];
-                    vm.configured_memory = memory_size;
-                    vm.accounting_start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
-                    match vmm::get_vcpu(allocator, vm_id, memory_size) {
+                    // External IDs may be sparse. Use the dense registry index
+                    // for hardware resources such as AMD ASIDs, and never
+                    // recycle it because failed construction may have consumed
+                    // frames that cannot be reclaimed until reboot.
+                    let hardware_vcpu_id = vms.len();
+                    let mut vm = VirtualMachine::new(vm_id, memory_size);
+                    match vmm::get_vcpu(allocator, hardware_vcpu_id, memory_size) {
                         Ok(mut new_vcpu) => {
                             let prepare_result = new_vcpu.prepare(allocator);
                             vm.vcpu = Some(new_vcpu);
@@ -764,15 +818,14 @@ fn process_management_command<E: ManagementEndpoint>(
                             );
                         }
                     }
+                    vms.push(vm);
                 }
             }
         }
         ManagementCommand::VmStart { id, attach } => {
-            let vm_id = id as usize;
-            if vm_id >= vmm::MAX_VMS {
-                write_invalid_vm_id(endpoint, vm_id);
-            } else {
-                let vm = &mut vms[vm_id];
+            let vm_id = id;
+            if let Some(vm_index) = find_vm_index(vms, vm_id) {
+                let vm = &mut vms[vm_index];
                 match vm.state {
                     VmState::Running => {
                         let _ = write!(endpoint, "VM {} is already running.\r\n", vm_id);
@@ -794,15 +847,6 @@ fn process_management_command<E: ManagementEndpoint>(
                         let _ = write!(endpoint, "VM {} resumed.\r\n", vm_id);
                         info!("VM {} resumed by management shell", vm_id);
                     }
-                    VmState::NotCreated => {
-                        let _ = write!(
-                            endpoint,
-                            "ERR VM {} does not exist; use 'vm create {} {}M' first.\r\n",
-                            vm_id,
-                            vm_id,
-                            vmm::DEFAULT_GUEST_MEMORY_MIB
-                        );
-                    }
                 }
 
                 if attach && matches!(vm.state, VmState::Running) {
@@ -822,33 +866,33 @@ fn process_management_command<E: ManagementEndpoint>(
                         );
                     }
                 }
+            } else {
+                write_missing_vm(endpoint, vm_id);
             }
         }
         ManagementCommand::VmStop { id } => {
-            let vm_id = id as usize;
-            if vm_id >= vmm::MAX_VMS {
-                write_invalid_vm_id(endpoint, vm_id);
-            } else if matches!(vms[vm_id].state, VmState::Running) {
-                vms[vm_id].state = VmState::Stopped;
-                let _ = write!(
-                    endpoint,
-                    "VM {} stopped; guest memory is retained.\r\n",
-                    vm_id
-                );
-                info!("VM {} stopped by management shell", vm_id);
+            let vm_id = id;
+            if let Some(vm_index) = find_vm_index(vms, vm_id) {
+                if matches!(vms[vm_index].state, VmState::Running) {
+                    vms[vm_index].state = VmState::Stopped;
+                    let _ = write!(
+                        endpoint,
+                        "VM {} stopped; guest memory is retained.\r\n",
+                        vm_id
+                    );
+                    info!("VM {} stopped by management shell", vm_id);
+                } else {
+                    let _ = write!(endpoint, "VM {} is not running.\r\n", vm_id);
+                }
             } else {
-                let _ = write!(endpoint, "VM {} is not running.\r\n", vm_id);
+                write_missing_vm(endpoint, vm_id);
             }
         }
         ManagementCommand::VmReset { id } => {
-            let vm_id = id as usize;
-            if vm_id >= vmm::MAX_VMS {
-                write_invalid_vm_id(endpoint, vm_id);
-            } else {
-                let vm = &mut vms[vm_id];
-                let result = if matches!(vm.state, VmState::NotCreated) {
-                    Err("VM does not exist; use 'vm create [ID] MEMORY' first")
-                } else if let Some(vcpu) = vm.vcpu.as_mut() {
+            let vm_id = id;
+            if let Some(vm_index) = find_vm_index(vms, vm_id) {
+                let vm = &mut vms[vm_index];
+                let result = if let Some(vcpu) = vm.vcpu.as_mut() {
                     vcpu.reset()
                 } else {
                     Err("VM construction previously failed; reboot the hypervisor to retry")
@@ -864,21 +908,28 @@ fn process_management_command<E: ManagementEndpoint>(
                         let _ = write!(endpoint, "ERR unable to reset VM {}: {}\r\n", vm_id, error);
                     }
                 }
+            } else {
+                write_missing_vm(endpoint, vm_id);
             }
         }
         ManagementCommand::VmStatus { id } => {
-            let vm_id = id as usize;
-            if let Some(vm) = vms.get(vm_id) {
-                write_vm_status(endpoint, vm_id, vm);
+            let vm_id = id;
+            if let Some(vm_index) = find_vm_index(vms, vm_id) {
+                write_vm_status(endpoint, vm_id, &vms[vm_index]);
             } else {
-                write_invalid_vm_id(endpoint, vm_id);
+                write_missing_vm(endpoint, vm_id);
             }
         }
         ManagementCommand::SerialAttach { id } => {
-            let vm_id = id as usize;
-            if vm_id >= vmm::MAX_VMS {
-                write_invalid_vm_id(endpoint, vm_id);
-            } else if !matches!(vms[vm_id].state, VmState::Running) {
+            let vm_id = id;
+            let Some(vm_index) = find_vm_index(vms, vm_id) else {
+                write_missing_vm(endpoint, vm_id);
+                if add_prompt {
+                    endpoint.prompt();
+                }
+                return serial_action;
+            };
+            if !matches!(vms[vm_index].state, VmState::Running) {
                 let _ = write!(
                     endpoint,
                     "ERR VM {} serial is available only while running.\r\n",
@@ -950,11 +1001,27 @@ fn process_management_command<E: ManagementEndpoint>(
     serial_action
 }
 
-fn write_invalid_vm_id<E: ManagementEndpoint>(endpoint: &mut E, vm_id: usize) {
-    let _ = write!(
-        endpoint,
-        "ERR VM ID {} is out of range; valid IDs are 0-{}.\r\n",
-        vm_id,
-        vmm::MAX_VMS - 1
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowest_free_id_handles_empty_and_sparse_registries() {
+        let mut vms = Vec::new();
+        assert_eq!(lowest_free_vm_id(&vms), Some(0));
+
+        vms.push(VirtualMachine::new(7, 128 * 1024 * 1024));
+        assert_eq!(lowest_free_vm_id(&vms), Some(0));
+
+        vms.push(VirtualMachine::new(0, 128 * 1024 * 1024));
+        vms.push(VirtualMachine::new(2, 128 * 1024 * 1024));
+        assert_eq!(lowest_free_vm_id(&vms), Some(1));
+    }
+
+    #[test]
+    fn registry_capacity_scales_with_host_memory() {
+        let one_gib_frames = 1024 * 1024 / 4;
+        assert_eq!(vm_registry_capacity(one_gib_frames), 12);
+        assert_eq!(vm_registry_capacity(0), 0);
+    }
 }

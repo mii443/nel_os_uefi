@@ -8,17 +8,21 @@ use crate::{
 
 pub mod x86_64;
 
-pub const MAX_VMS: usize = 4;
 pub const VCPUS_PER_VM: usize = 1;
 pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 128;
 pub const MIN_GUEST_MEMORY_MIB: u32 = 64;
 pub const MAX_GUEST_MEMORY_MIB: u32 = 768;
 pub const VCPU_TIME_SLICE_MILLIS: u64 = 4;
+pub const MAX_VCPU_HEAP_BYTES: usize = {
+    let amd = core::mem::size_of::<AMDVCpu>();
+    let intel = core::mem::size_of::<IntelVCpu>();
+    if amd > intel { amd } else { intel }
+};
 
 pub trait VCpu {
     fn new(
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-        vm_id: usize,
+        hardware_vcpu_id: usize,
         guest_memory_size: u64,
     ) -> Result<Self, &'static str>
     where
@@ -73,24 +77,25 @@ pub trait VCpu {
 
 pub fn get_vcpu(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    vm_id: usize,
+    hardware_vcpu_id: usize,
     guest_memory_size: u64,
 ) -> Result<Box<dyn VCpu>, &'static str> {
-    if vm_id >= MAX_VMS {
-        return Err("VM ID is out of range");
-    }
     if platform::is_amd() && AMDVCpu::is_supported() {
-        Ok(Box::new(AMDVCpu::new(
+        Box::try_new(AMDVCpu::new(
             frame_allocator,
-            vm_id,
+            hardware_vcpu_id,
             guest_memory_size,
-        )?))
+        )?)
+        .map(|vcpu| -> Box<dyn VCpu> { vcpu })
+        .map_err(|_| "Management heap cannot allocate another AMD VCPU")
     } else if platform::is_intel() && IntelVCpu::is_supported() {
-        Ok(Box::new(IntelVCpu::new(
+        Box::try_new(IntelVCpu::new(
             frame_allocator,
-            vm_id,
+            hardware_vcpu_id,
             guest_memory_size,
-        )?))
+        )?)
+        .map(|vcpu| -> Box<dyn VCpu> { vcpu })
+        .map_err(|_| "Management heap cannot allocate another Intel VCPU")
     } else {
         Err("Unsupported CPU architecture")
     }

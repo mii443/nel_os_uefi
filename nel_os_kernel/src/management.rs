@@ -1,19 +1,19 @@
 pub(crate) const BANNER: &[u8] =
     b"nel hypervisor management shell\r\nType 'help' for commands.\r\nnel> ";
 pub(crate) const PROMPT: &[u8] = b"nel> ";
-pub(crate) const HELP: &[u8] = b"Commands:\r\n  vm list\r\n  vm create [ID] MEMORY\r\n  vm start [ID] [--attach|-a]\r\n  vm stop|reset|status [ID]\r\n  serial attach [ID]\r\n  serial detach\r\n  info memory|runtime|all\r\n  info vm [ID]\r\n  help\r\n  exit\r\nVM IDs are 0-3; omitting ID selects VM 0. MEMORY is MiB unless suffixed M/MiB/G/GiB.\r\n";
+pub(crate) const HELP: &[u8] = b"Commands:\r\n  vm list\r\n  vm create [ID] MEMORY\r\n  vm start [ID] [--attach|-a]\r\n  vm stop|reset|status [ID]\r\n  serial attach [ID]\r\n  serial detach\r\n  info memory|runtime|all\r\n  info vm [ID]\r\n  help\r\n  exit\r\nVMs are created dynamically. Omitting ID from 'vm create' selects the lowest free ID; other commands default to VM 0. MEMORY is MiB unless suffixed M/MiB/G/GiB.\r\n";
 
-pub const DEFAULT_VM_ID: u8 = 0;
+pub const DEFAULT_VM_ID: usize = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagementCommand {
     VmList,
-    VmCreate { id: u8, memory_mib: u32 },
-    VmStart { id: u8, attach: bool },
-    VmStop { id: u8 },
-    VmReset { id: u8 },
-    VmStatus { id: u8 },
-    SerialAttach { id: u8 },
+    VmCreate { id: Option<usize>, memory_mib: u32 },
+    VmStart { id: usize, attach: bool },
+    VmStop { id: usize },
+    VmReset { id: usize },
+    VmStatus { id: usize },
+    SerialAttach { id: usize },
     SerialDetach,
     InfoMemory,
     InfoRuntime,
@@ -27,12 +27,12 @@ pub enum ManagementCommand {
 impl ManagementCommand {
     pub(crate) fn vm_id(self) -> Option<usize> {
         match self {
-            Self::VmCreate { id, .. }
-            | Self::VmStart { id, .. }
+            Self::VmStart { id, .. }
             | Self::VmStop { id }
             | Self::VmReset { id }
             | Self::VmStatus { id }
-            | Self::SerialAttach { id } => Some(id as usize),
+            | Self::SerialAttach { id } => Some(id),
+            Self::VmCreate { id, .. } => id,
             _ => None,
         }
     }
@@ -156,7 +156,7 @@ fn parse_start<'a>(words: impl Iterator<Item = &'a [u8]>) -> ManagementCommand {
             }
             attach = true;
         } else if !saw_id {
-            let Some(parsed) = parse_u8(word) else {
+            let Some(parsed) = parse_usize(word) else {
                 return ManagementCommand::Invalid;
             };
             id = parsed;
@@ -180,12 +180,12 @@ fn parse_create<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> ManagementComm
 
     let (id, memory) = match second {
         Some(memory) => {
-            let Some(id) = parse_u8(first) else {
+            let Some(id) = parse_usize(first) else {
                 return ManagementCommand::Invalid;
             };
-            (id, memory)
+            (Some(id), memory)
         }
-        None => (DEFAULT_VM_ID, first),
+        None => (None, first),
     };
     let Some(memory_mib) = parse_memory_mib(memory) else {
         return ManagementCommand::Invalid;
@@ -193,24 +193,24 @@ fn parse_create<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> ManagementComm
     ManagementCommand::VmCreate { id, memory_mib }
 }
 
-fn parse_vm_id<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> Option<u8> {
+fn parse_vm_id<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> Option<usize> {
     let id = match words.next() {
-        Some(word) => parse_u8(word)?,
+        Some(word) => parse_usize(word)?,
         None => DEFAULT_VM_ID,
     };
     words.next().is_none().then_some(id)
 }
 
-fn parse_u8(bytes: &[u8]) -> Option<u8> {
+fn parse_usize(bytes: &[u8]) -> Option<usize> {
     if bytes.is_empty() {
         return None;
     }
-    let mut value = 0u8;
+    let mut value = 0usize;
     for &byte in bytes {
         if !byte.is_ascii_digit() {
             return None;
         }
-        value = value.checked_mul(10)?.checked_add(byte - b'0')?;
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
     }
     Some(value)
 }
@@ -304,15 +304,22 @@ mod tests {
         assert_eq!(
             parse_command(b"vm create 2 128MiB"),
             ManagementCommand::VmCreate {
-                id: 2,
+                id: Some(2),
                 memory_mib: 128
             }
         );
         assert_eq!(
             parse_command(b"vm create 1G"),
             ManagementCommand::VmCreate {
-                id: 0,
+                id: None,
                 memory_mib: 1024
+            }
+        );
+        assert_eq!(
+            parse_command(b"vm create 4096 128M"),
+            ManagementCommand::VmCreate {
+                id: Some(4096),
+                memory_mib: 128
             }
         );
         assert_eq!(
@@ -344,6 +351,9 @@ mod tests {
     fn rejects_malformed_or_overflowing_ids() {
         assert_eq!(parse_command(b"vm start 1 2"), ManagementCommand::Invalid);
         assert_eq!(parse_command(b"vm stop -1"), ManagementCommand::Invalid);
-        assert_eq!(parse_command(b"vm reset 256"), ManagementCommand::Invalid);
+        assert_eq!(
+            parse_command(b"vm reset 18446744073709551616"),
+            ManagementCommand::Invalid
+        );
     }
 }

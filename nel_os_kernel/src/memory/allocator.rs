@@ -45,3 +45,7 @@ pub fn init_heap(
 
     Ok(())
 }
+
+pub fn free_heap_bytes() -> usize {
+    ALLOCATOR.lock().free()
+}

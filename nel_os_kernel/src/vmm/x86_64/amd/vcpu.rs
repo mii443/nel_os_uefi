@@ -1457,16 +1457,19 @@ impl VCpu for AMDVCpu {
 
     fn new(
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-        vm_id: usize,
+        hardware_vcpu_id: usize,
         guest_memory_size: u64,
     ) -> Result<Self, &'static str>
     where
         Self: Sized,
     {
-        let guest_asid = (vm_id + 1) as u32;
+        let guest_asid = hardware_vcpu_id
+            .checked_add(1)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or("AMD SVM ASID space is exhausted")?;
         let asid_count = cpuid!(0x8000_000a).ebx;
         if guest_asid >= asid_count {
-            return Err("CPU does not provide enough AMD SVM ASIDs for this VM ID");
+            return Err("CPU does not provide enough AMD SVM ASIDs for another VM");
         }
 
         // FXSAVE64/FXRSTOR64 are used around every VMRUN to isolate x87,
