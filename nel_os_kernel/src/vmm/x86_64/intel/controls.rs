@@ -3,33 +3,79 @@ use crate::vmm::x86_64::{
     intel::{vmcs, vmwrite},
 };
 
-pub fn setup_exec_controls() -> Result<(), &'static str> {
+const VMX_PREEMPTION_TIMER: u32 = 1 << 6;
+const CR8_LOAD_EXITING: u32 = 1 << 19;
+const CR8_STORE_EXITING: u32 = 1 << 20;
+const MOV_DR_EXITING: u32 = 1 << 23;
+
+fn apply_vmx_fixed_bits(value: u32, capability_msr: u64) -> u32 {
+    let must_be_one = capability_msr as u32;
+    let may_be_one = (capability_msr >> 32) as u32;
+    (value | must_be_one) & may_be_one
+}
+
+fn require_allowed_one(
+    capability_msr: u64,
+    required: u32,
+    error: &'static str,
+) -> Result<(), &'static str> {
+    let may_be_one = (capability_msr >> 32) as u32;
+    if may_be_one & required != required {
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn preemption_timer_ticks(tsc_khz: u64, slice_millis: u64, timer_shift: u8) -> u32 {
+    let tsc_cycles = tsc_khz.saturating_mul(slice_millis);
+    let timer_quantum = 1u64 << timer_shift.min(63);
+    let ticks = (tsc_cycles / timer_quantum)
+        .saturating_add(u64::from(tsc_cycles % timer_quantum != 0))
+        .max(1);
+    ticks.min(u32::MAX as u64) as u32
+}
+
+pub fn setup_exec_controls() -> Result<u8, &'static str> {
     let basic_msr = common::read_msr(0x480);
     let mut raw_pin_exec_ctrl = u32::from(vmcs::controls::PinBasedVmExecutionControls::read()?);
 
-    let reserved_bits = if basic_msr & (1 << 55) != 0 {
+    let pin_capabilities = if basic_msr & (1 << 55) != 0 {
         common::read_msr(0x48d)
     } else {
         common::read_msr(0x481)
     };
-    raw_pin_exec_ctrl |= (reserved_bits & 0xFFFFFFFF) as u32;
-    raw_pin_exec_ctrl &= (reserved_bits >> 32) as u32;
+    require_allowed_one(
+        pin_capabilities,
+        VMX_PREEMPTION_TIMER,
+        "VMX preemption timer is required but unsupported",
+    )?;
+    raw_pin_exec_ctrl = apply_vmx_fixed_bits(raw_pin_exec_ctrl, pin_capabilities);
 
     let mut pin_exec_ctrl = vmcs::controls::PinBasedVmExecutionControls::from(raw_pin_exec_ctrl);
     pin_exec_ctrl.set_external_interrupt_exiting(true);
+    pin_exec_ctrl.set_activate_vmx_preemption_timer(true);
 
     pin_exec_ctrl.write()?;
 
     let mut raw_primary_exec_ctrl =
         u32::from(vmcs::controls::PrimaryProcessorBasedVmExecutionControls::read()?);
 
-    let reserved_bits = if basic_msr & (1 << 55) != 0 {
+    let primary_capabilities = if basic_msr & (1 << 55) != 0 {
         common::read_msr(0x48e)
     } else {
         common::read_msr(0x482)
     };
-    raw_primary_exec_ctrl |= (reserved_bits & 0xFFFFFFFF) as u32;
-    raw_primary_exec_ctrl &= (reserved_bits >> 32) as u32;
+    require_allowed_one(
+        primary_capabilities,
+        CR8_LOAD_EXITING | CR8_STORE_EXITING,
+        "CR8 load/store exiting is required but unsupported",
+    )?;
+    require_allowed_one(
+        primary_capabilities,
+        MOV_DR_EXITING,
+        "MOV-DR exiting is required but unsupported",
+    )?;
+    raw_primary_exec_ctrl = apply_vmx_fixed_bits(raw_primary_exec_ctrl, primary_capabilities);
 
     let mut primary_exec_ctrl =
         vmcs::controls::PrimaryProcessorBasedVmExecutionControls::from(raw_primary_exec_ctrl);
@@ -38,19 +84,21 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     primary_exec_ctrl.set_use_msr_bitmap(false);
     primary_exec_ctrl.set_unconditional_io(false);
     primary_exec_ctrl.set_use_io_bitmap(true);
+    primary_exec_ctrl.set_cr8load(true);
+    primary_exec_ctrl.set_cr8store(true);
+    primary_exec_ctrl.set_mov_dr(true);
 
     primary_exec_ctrl.write()?;
 
     let mut raw_secondary_exec_ctrl =
         u32::from(vmcs::controls::SecondaryProcessorBasedVmExecutionControls::read()?);
 
-    let reserved_bits = if basic_msr & (1 << 55) != 0 {
+    let secondary_capabilities = if basic_msr & (1 << 55) != 0 {
         common::read_msr(x86::msr::IA32_VMX_PROCBASED_CTLS2)
     } else {
         0
     };
-    raw_secondary_exec_ctrl |= (reserved_bits & 0xFFFFFFFF) as u32;
-    raw_secondary_exec_ctrl &= (reserved_bits >> 32) as u32;
+    raw_secondary_exec_ctrl = apply_vmx_fixed_bits(raw_secondary_exec_ctrl, secondary_capabilities);
 
     let mut secondary_exec_ctrl =
         vmcs::controls::SecondaryProcessorBasedVmExecutionControls::from(raw_secondary_exec_ctrl);
@@ -63,7 +111,7 @@ pub fn setup_exec_controls() -> Result<(), &'static str> {
     vmwrite(x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK, u64::MAX)?;
     vmwrite(x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK, u64::MAX)?;
 
-    Ok(())
+    Ok((common::read_msr(x86::msr::IA32_VMX_MISC) & 0x1f) as u8)
 }
 
 pub fn setup_entry_controls() -> Result<(), &'static str> {
@@ -112,4 +160,38 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
     vmwrite(0x4004, 1u64 << x86::irq::INVALID_OPCODE_VECTOR)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_control_bits_are_applied_without_setting_disallowed_bits() {
+        let capabilities = (0b1011u64 << 32) | 0b0010;
+        assert_eq!(apply_vmx_fixed_bits(0b1100, capabilities), 0b1010);
+    }
+
+    #[test]
+    fn required_control_bits_must_all_be_allowed_one() {
+        let capabilities = (CR8_LOAD_EXITING as u64) << 32;
+        assert!(require_allowed_one(capabilities, CR8_LOAD_EXITING, "error").is_ok());
+        assert!(
+            require_allowed_one(capabilities, CR8_LOAD_EXITING | CR8_STORE_EXITING, "error")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn timer_ticks_use_vmx_misc_shift_and_never_reach_zero() {
+        assert_eq!(preemption_timer_ticks(1_000_000, 4, 0), 4_000_000);
+        assert_eq!(preemption_timer_ticks(1_000_000, 4, 10), 3_907);
+        assert_eq!(preemption_timer_ticks(1, 1, 31), 1);
+        assert_eq!(preemption_timer_ticks(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn timer_ticks_saturate_to_vmcs_field_width() {
+        assert_eq!(preemption_timer_ticks(u64::MAX, u64::MAX, 0), u32::MAX);
+    }
 }

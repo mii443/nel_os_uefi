@@ -19,7 +19,7 @@ use crate::{
         x86_64::{
             common::{self, X86VCpu, fxsave::FxState, read_msr, xsave::HostXsaveState},
             intel::{
-                auditor, controls, cpuid, ept,
+                auditor, controls, cpuid, debug, ept,
                 fpu::{self, XCR0},
                 io::{IOBitmap, vmm_interrupt_subscriber},
                 msr::{self, ShadowMsr},
@@ -49,6 +49,8 @@ pub struct IntelVCpu {
     // different VM's fault address after scheduling resumes.
     pub host_cr2: u64,
     pub guest_cr2: u64,
+    pub(super) guest_cr8: u8,
+    pub(super) guest_debug_registers: [u64; 8],
     pub host_fx_state: FxState,
     pub guest_fx_state: FxState,
     pub host_xsave_addr: u64,
@@ -74,6 +76,7 @@ pub struct IntelVCpu {
     pub ia32e_enabled: bool,
     pub pic: super::io::Pic,
     io_bitmap: IOBitmap,
+    preemption_timer_ticks: u32,
     pub host_xcr0: u64,
     pub guest_xcr0: XCR0,
 }
@@ -145,6 +148,21 @@ impl IntelVCpu {
                         self.pic.inject_exception(13, Some(0))?;
                     }
                 }
+                VmxExitReason::MOV_DR => {
+                    let qualification = vmread(vmcs::ro::EXIT_QUALIFICATION)?;
+                    match debug::handle_debug_register_access(self, qualification)? {
+                        debug::DebugAccessOutcome::Completed => self.step_next_inst()?,
+                        debug::DebugAccessOutcome::GeneralProtection => {
+                            self.pic.inject_exception(13, Some(0))?
+                        }
+                        debug::DebugAccessOutcome::InvalidOpcode => {
+                            self.pic.inject_exception(6, None)?
+                        }
+                        debug::DebugAccessOutcome::DebugException => {
+                            self.pic.inject_exception(1, None)?
+                        }
+                    }
+                }
                 VmxExitReason::XSETBV => {
                     let guest_cr4 = vmread(vmcs::guest::CR4)?;
                     let value = ((self.guest_registers.rdx & 0xffff_ffff) << 32)
@@ -184,6 +202,11 @@ impl IntelVCpu {
                 VmxExitReason::TRIPLE_FAULT => {
                     info!("Triple fault detected");
                     return Err("Triple fault");
+                }
+                VmxExitReason::VMX_PREEMPTION_TIMER_EXPIRED => {
+                    // This exit is asynchronous: guest RIP already points at
+                    // the next instruction to execute. Returning from run()
+                    // gives the outer scheduler a chance to switch VCPUs.
                 }
                 VmxExitReason::EXCEPTION => {
                     if interrupted_event {
@@ -341,7 +364,16 @@ impl IntelVCpu {
         let revision_id = common::read_msr(0x480) as u32;
         self.vmcs.write_revision_id(revision_id);
         self.vmcs.reset()?;
-        controls::setup_exec_controls()?;
+        let timer_shift = controls::setup_exec_controls()?;
+        let tsc_khz = interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .ok_or("TSC frequency unavailable for VMX preemption timer")?;
+        self.preemption_timer_ticks = controls::preemption_timer_ticks(
+            tsc_khz,
+            crate::vmm::VCPU_TIME_SLICE_MILLIS,
+            timer_shift,
+        );
         controls::setup_entry_controls()?;
         controls::setup_exit_controls()?;
         Self::setup_host_state()?;
@@ -449,7 +481,10 @@ impl IntelVCpu {
         vmwrite(vmcs::host::GDTR_BASE, gdtp.base as u64)?;
         vmwrite(vmcs::host::IDTR_BASE, idtp.base as u64)?;
         vmwrite(vmcs::host::TR_SELECTOR, tr.bits() as u64)?;
-        vmwrite(vmcs::host::TR_BASE, 0)?;
+        vmwrite(
+            vmcs::host::TR_BASE,
+            interrupt::gdt::loaded_tss_base(tr.bits())?,
+        )?;
 
         vmwrite(vmcs::host::IA32_EFER_FULL, read_msr(x86::msr::IA32_EFER))?;
 
@@ -920,6 +955,11 @@ impl VCpu for IntelVCpu {
             self.halted = false;
         }
 
+        vmwrite(
+            x86::vmx::vmcs::guest::VMX_PREEMPTION_TIMER_VALUE,
+            u64::from(self.preemption_timer_ticks.max(1)),
+        )?;
+
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
         self.vmexit_handler()?;
@@ -940,6 +980,8 @@ impl VCpu for IntelVCpu {
         self.activated = false;
         self.guest_registers = GuestRegisters::default();
         self.guest_cr2 = 0;
+        self.guest_cr8 = 0;
+        self.guest_debug_registers = debug::RESET_DEBUG_REGISTERS;
         self.guest_fx_state = FxState::guest_default();
         self.host_msr.clear();
         self.guest_msr.clear();
@@ -1031,6 +1073,8 @@ impl VCpu for IntelVCpu {
             guest_registers: GuestRegisters::default(),
             host_cr2: 0,
             guest_cr2: 0,
+            guest_cr8: 0,
+            guest_debug_registers: debug::RESET_DEBUG_REGISTERS,
             host_fx_state: FxState::zeroed(),
             guest_fx_state: FxState::guest_default(),
             host_xsave_addr,
@@ -1053,6 +1097,7 @@ impl VCpu for IntelVCpu {
             ia32e_enabled: false,
             pic: super::io::Pic::new(tsc_khz),
             io_bitmap: IOBitmap::new(frame_allocator),
+            preemption_timer_ticks: 1,
             host_xcr0: host_xsave_mask,
             guest_xcr0: XCR0::from(1),
         })

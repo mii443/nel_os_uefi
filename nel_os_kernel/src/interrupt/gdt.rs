@@ -63,3 +63,12 @@ pub fn init() {
         load_tss(GDT.1.tss_selector);
     }
 }
+
+/// Returns the base of the TSS installed by [`init`] after verifying that the
+/// caller's current task-register selector refers to that descriptor.
+pub fn loaded_tss_base(task_register: u16) -> Result<u64, &'static str> {
+    if task_register != GDT.1.tss_selector.0 {
+        return Err("Current task register does not select the kernel TSS");
+    }
+    Ok(VirtAddr::from_ptr(&*TSS).as_u64())
+}

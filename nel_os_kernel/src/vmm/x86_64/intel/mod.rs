@@ -3,6 +3,7 @@ mod auditor;
 mod controls;
 mod cpuid;
 mod cr;
+mod debug;
 mod ept;
 mod fpu;
 mod io;
