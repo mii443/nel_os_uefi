@@ -11,6 +11,7 @@ unsafe extern "C" {
         guest_fx_state: *mut FxState,
         host_xsave_addr: u64,
         host_xsave_mask: u64,
+        host_vmcb_state_phys: u64,
     );
 }
 
@@ -34,6 +35,9 @@ global_asm!(
     "jnz 1f",
     "fxsave64 [rdx]",
     "1:",
+    // Stop asynchronous delivery before loading any guest-owned processor
+    // state, including the legacy floating-point/SIMD image.
+    "clgi",
     "fxrstor64 [rcx]",
     "mov rax, rsi",
     "mov rcx, [rax + {rcx}]",
@@ -50,8 +54,27 @@ global_asm!(
     "mov r13, [rax + {r13}]",
     "mov r14, [rax + {r14}]",
     "mov r15, [rax + {r15}]",
+    // VMRUN only switches the core VMCB state. VMLOAD/VMSAVE are required
+    // for FS/GS, KERNEL_GS_BASE, STAR/LSTAR and SYSENTER state. Preserve the
+    // host's extended state in a separate physical VMCB page and keep each
+    // guest's extended state in its own VMCB across scheduler switches.
+    "mov rax, [rsp + 104]",
+    "vmsave",
     "mov rax, [rsp + 32]",
+    "vmload",
+    // V_INTR_MASKING requires host IF=1 while the guest runs. Set IF without
+    // STI's interrupt shadow while GIF remains clear; VMRUN enables GIF as
+    // part of entering the guest. CLI remains the first instruction after
+    // VMEXIT so host Rust resumes with IF clear.
+    "pushfq",
+    "or qword ptr [rsp], 0x200",
+    "popfq",
     "vmrun",
+    "cli",
+    "mov rax, [rsp + 32]",
+    "vmsave",
+    "mov rax, [rsp + 104]",
+    "vmload",
     "push rax",
     "mov rax, [rsp + 48]",
     "mov [rax + {rcx}], rcx",

@@ -8,8 +8,23 @@ use crate::{
 
 pub mod x86_64;
 
+pub const VCPUS_PER_VM: usize = 1;
+pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 128;
+pub const MIN_GUEST_MEMORY_MIB: u32 = 64;
+pub const MAX_GUEST_MEMORY_MIB: u32 = 768;
+pub const VCPU_TIME_SLICE_MILLIS: u64 = 4;
+pub const MAX_VCPU_HEAP_BYTES: usize = {
+    let amd = core::mem::size_of::<AMDVCpu>();
+    let intel = core::mem::size_of::<IntelVCpu>();
+    if amd > intel { amd } else { intel }
+};
+
 pub trait VCpu {
-    fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
+    fn new(
+        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        hardware_vcpu_id: usize,
+        guest_memory_size: u64,
+    ) -> Result<Self, &'static str>
     where
         Self: Sized;
 
@@ -22,9 +37,23 @@ pub trait VCpu {
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str>;
 
+    /// Allocates guest RAM and initializes the boot state without executing
+    /// guest instructions.
+    fn prepare(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str>;
+
     /// Returns the existing VCPU and guest RAM to its boot state. Implementors
     /// must retain already allocated guest-memory mappings.
     fn reset(&mut self) -> Result<(), &'static str>;
+
+    /// Reports that another immediate entry would only poll a halted guest.
+    /// The scheduler uses this to rotate early instead of busy-waiting for the
+    /// guest's next virtual interrupt.
+    fn is_idle(&self) -> bool {
+        false
+    }
 
     fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str>;
     fn write_memory_ranged(
@@ -43,15 +72,30 @@ pub trait VCpu {
     }
 
     fn get_guest_memory_size(&self) -> u64;
+    fn get_allocated_guest_memory_size(&self) -> u64;
 }
 
 pub fn get_vcpu(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    hardware_vcpu_id: usize,
+    guest_memory_size: u64,
 ) -> Result<Box<dyn VCpu>, &'static str> {
     if platform::is_amd() && AMDVCpu::is_supported() {
-        Ok(Box::new(AMDVCpu::new(frame_allocator)?))
+        Box::try_new(AMDVCpu::new(
+            frame_allocator,
+            hardware_vcpu_id,
+            guest_memory_size,
+        )?)
+        .map(|vcpu| -> Box<dyn VCpu> { vcpu })
+        .map_err(|_| "Management heap cannot allocate another AMD VCPU")
     } else if platform::is_intel() && IntelVCpu::is_supported() {
-        Ok(Box::new(IntelVCpu::new(frame_allocator)?))
+        Box::try_new(IntelVCpu::new(
+            frame_allocator,
+            hardware_vcpu_id,
+            guest_memory_size,
+        )?)
+        .map(|vcpu| -> Box<dyn VCpu> { vcpu })
+        .map_err(|_| "Management heap cannot allocate another Intel VCPU")
     } else {
         Err("Unsupported CPU architecture")
     }

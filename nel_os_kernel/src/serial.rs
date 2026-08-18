@@ -80,6 +80,7 @@ impl GuestSerialBridge {
 static OUTPUT_TO_SCREEN: AtomicBool = AtomicBool::new(true);
 static GUEST_SERIAL_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCAL_GUEST_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+static GUEST_SERIAL_BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static GUEST_SERIAL_OUTPUT_DROPS: AtomicU64 = AtomicU64::new(0);
 
 pub fn disable_screen_output() {
@@ -141,6 +142,9 @@ pub fn write_raw_byte(byte: u8) {
 /// attachment writes directly to COM1.
 #[inline(always)]
 pub fn write_guest_raw_byte(byte: u8) {
+    if !GUEST_SERIAL_BRIDGE_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     if LOCAL_GUEST_OUTPUT_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
         write_raw_byte(byte);
     }
@@ -165,6 +169,13 @@ pub fn set_guest_capture_enabled(enabled: bool) {
     bridge.output.clear();
 }
 
+/// Selects whether the currently executing VCPU owns the shared management
+/// serial bridge. The controller enables this only for the attached VM's time
+/// slice, so input and output cannot cross VM boundaries.
+pub fn set_guest_bridge_active(active: bool) {
+    GUEST_SERIAL_BRIDGE_ACTIVE.store(active, core::sync::atomic::Ordering::Release);
+}
+
 pub fn queue_guest_input(bytes: &[u8]) -> usize {
     let mut bridge = GUEST_SERIAL_BRIDGE.lock();
     let mut written = 0;
@@ -181,7 +192,17 @@ pub fn guest_input_capacity() -> usize {
     GUEST_SERIAL_BRIDGE.lock().input.remaining()
 }
 
+pub fn discard_guest_input() -> usize {
+    let mut bridge = GUEST_SERIAL_BRIDGE.lock();
+    let discarded = bridge.input.len;
+    bridge.input.clear();
+    discarded
+}
+
 pub fn poll_guest_input(output: &mut [u8]) -> usize {
+    if !GUEST_SERIAL_BRIDGE_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
     GUEST_SERIAL_BRIDGE.lock().input.pop_into(output)
 }
 
@@ -194,6 +215,7 @@ pub fn guest_output_drop_count() -> u64 {
 }
 
 pub fn reset_guest_bridge() {
+    GUEST_SERIAL_BRIDGE_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
     GUEST_SERIAL_CAPTURE_ENABLED.store(false, core::sync::atomic::Ordering::Release);
     LOCAL_GUEST_OUTPUT_ENABLED.store(false, core::sync::atomic::Ordering::Release);
     let mut bridge = GUEST_SERIAL_BRIDGE.lock();

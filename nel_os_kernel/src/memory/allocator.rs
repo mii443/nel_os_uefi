@@ -1,9 +1,9 @@
 use linked_list_allocator::LockedHeap;
 use x86_64::{
-    structures::paging::{
-        mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
-    },
     VirtAddr,
+    structures::paging::{
+        FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
+    },
 };
 
 use crate::{
@@ -44,4 +44,8 @@ pub fn init_heap(
     }
 
     Ok(())
+}
+
+pub fn free_heap_bytes() -> usize {
+    ALLOCATOR.lock().free()
 }

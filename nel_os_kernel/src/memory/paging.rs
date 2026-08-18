@@ -1,10 +1,10 @@
 use x86_64::{
+    PhysAddr, VirtAddr,
     registers::control::{Cr3, Cr3Flags},
     structures::paging::{
-        page_table::FrameError, FrameAllocator, PageSize, PageTable, PageTableFlags, PhysFrame,
-        Size1GiB, Size4KiB,
+        FrameAllocator, PageSize, PageTable, PageTableFlags, PhysFrame, Size1GiB, Size4KiB,
+        page_table::FrameError,
     },
-    PhysAddr, VirtAddr,
 };
 
 use crate::info;

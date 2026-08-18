@@ -20,9 +20,9 @@ const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
 const DHCP_NAK: u8 = 6;
-const DHCP_RETRY_TICKS: usize = 4 * 250;
+const DHCP_RETRY_MILLIS: usize = 4_000;
 const DEFAULT_LEASE_SECONDS: u32 = 3600;
-const TICKS_PER_SECOND: usize = 250;
+const MILLIS_PER_SECOND: usize = 1_000;
 
 const START_COMMAND: &[u8] = b"start";
 const START_RESPONSE: &[u8] = b"OK starting Linux VM\n";
@@ -145,6 +145,7 @@ impl NetworkStack {
     }
 
     pub fn poll(&mut self, now: usize, output: &mut [u8]) -> Option<usize> {
+        let now = network_clock_millis(now);
         if self.dhcp_state == DhcpState::Bound && now >= self.lease_expiry_tick {
             self.lose_lease(now);
         }
@@ -163,7 +164,7 @@ impl NetworkStack {
             DhcpState::Init | DhcpState::Selecting => {
                 let length = self.build_dhcp(DHCP_DISCOVER, None, None, output)?;
                 self.dhcp_state = DhcpState::Selecting;
-                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_TICKS);
+                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
                 Some(length)
             }
             DhcpState::Requesting => {
@@ -173,7 +174,7 @@ impl NetworkStack {
                     Some(self.dhcp_server),
                     output,
                 )?;
-                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_TICKS);
+                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
                 Some(length)
             }
             DhcpState::Bound => None,
@@ -327,6 +328,15 @@ impl NetworkStack {
         let source_ip: [u8; 4] = frame[ETHERNET_HEADER_LEN + 12..ETHERNET_HEADER_LEN + 16]
             .try_into()
             .ok()?;
+        let destination_ip: [u8; 4] = frame[ETHERNET_HEADER_LEN + 16..ETHERNET_HEADER_LEN + 20]
+            .try_into()
+            .ok()?;
+        let transmitted_checksum = read_u16(udp, 6)?;
+        if transmitted_checksum != 0
+            && udp_checksum(source_ip, destination_ip, &udp[..udp_len]) != 0
+        {
+            return None;
+        }
 
         if source_port == DHCP_SERVER_PORT && destination_port == DHCP_CLIENT_PORT {
             return self.handle_dhcp(&udp[UDP_HEADER_LEN..udp_len], source_ip, response, now);
@@ -355,6 +365,7 @@ impl NetworkStack {
         response: &mut [u8],
         now: usize,
     ) -> Option<usize> {
+        let now = network_clock_millis(now);
         if message.len() < DHCP_FIXED_LEN
             || message[0] != 2
             || message[1] != 1
@@ -366,6 +377,7 @@ impl NetworkStack {
             return None;
         }
         let options = parse_dhcp_options(&message[DHCP_FIXED_LEN..])?;
+        let response_server = options.server.unwrap_or(source_ip);
         match options.message_type? {
             DHCP_OFFER if self.dhcp_state == DhcpState::Selecting => {
                 let address: [u8; 4] = message[16..20].try_into().ok()?;
@@ -373,7 +385,7 @@ impl NetworkStack {
                     return None;
                 }
                 self.requested_address = address;
-                self.dhcp_server = options.server.unwrap_or(source_ip);
+                self.dhcp_server = response_server;
                 let length = self.build_dhcp(
                     DHCP_REQUEST,
                     Some(self.requested_address),
@@ -381,10 +393,13 @@ impl NetworkStack {
                     response,
                 )?;
                 self.dhcp_state = DhcpState::Requesting;
-                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_TICKS);
+                self.next_dhcp_tick = now.saturating_add(DHCP_RETRY_MILLIS);
                 Some(length)
             }
-            DHCP_ACK if self.dhcp_state == DhcpState::Requesting => {
+            DHCP_ACK
+                if self.dhcp_state == DhcpState::Requesting
+                    && response_server == self.dhcp_server =>
+            {
                 let offered: [u8; 4] = message[16..20].try_into().ok()?;
                 let address = if offered == IPV4_UNSPECIFIED {
                     self.requested_address
@@ -392,7 +407,7 @@ impl NetworkStack {
                     offered
                 };
                 let lease_seconds = options.lease_seconds.unwrap_or(DEFAULT_LEASE_SECONDS);
-                let lease_ticks = (lease_seconds as usize).saturating_mul(TICKS_PER_SECOND);
+                let lease_millis = (lease_seconds as usize).saturating_mul(MILLIS_PER_SECOND);
                 let new_config = Ipv4Config {
                     address,
                     subnet_mask: options.subnet_mask.unwrap_or(IPV4_UNSPECIFIED),
@@ -408,11 +423,14 @@ impl NetworkStack {
                 }
                 self.config = Some(new_config);
                 self.dhcp_state = DhcpState::Bound;
-                self.lease_expiry_tick = now.saturating_add(lease_ticks);
+                self.lease_expiry_tick = now.saturating_add(lease_millis);
                 self.next_dhcp_tick = usize::MAX;
                 None
             }
-            DHCP_NAK => {
+            DHCP_NAK
+                if self.dhcp_state == DhcpState::Requesting
+                    && response_server == self.dhcp_server =>
+            {
                 self.lose_lease(now);
                 None
             }
@@ -486,6 +504,8 @@ impl NetworkStack {
         }
         put_option(dhcp, &mut option, 55, &[1, 3, 6, 51, 54])?;
         *dhcp.get_mut(option)? = 255;
+        let checksum = udp_checksum(IPV4_UNSPECIFIED, IPV4_BROADCAST, udp);
+        write_u16(udp, 6, nonzero_udp_checksum(checksum))?;
         Some(frame_len)
     }
 
@@ -524,6 +544,8 @@ impl NetworkStack {
         write_u16(udp, 2, peer_port)?;
         write_u16(udp, 4, (UDP_HEADER_LEN + payload.len()) as u16)?;
         udp[UDP_HEADER_LEN..UDP_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        let checksum = udp_checksum(config.address, peer_ip, udp);
+        write_u16(udp, 6, nonzero_udp_checksum(checksum))?;
         Some(frame_len)
     }
 
@@ -585,6 +607,22 @@ fn put_option(bytes: &mut [u8], index: &mut usize, code: u8, value: &[u8]) -> Op
     Some(())
 }
 
+#[cfg(not(test))]
+fn network_clock_millis(fallback: usize) -> usize {
+    let Some(&tsc_khz) = crate::interrupt::apic::GUEST_TSC_KHZ.get() else {
+        return fallback;
+    };
+    if tsc_khz == 0 {
+        return fallback;
+    }
+    (unsafe { core::arch::x86_64::_rdtsc() } / tsc_khz) as usize
+}
+
+#[cfg(test)]
+fn network_clock_millis(fallback: usize) -> usize {
+    fallback
+}
+
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
         bytes = &bytes[1..];
@@ -622,14 +660,34 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Option<()> {
 }
 
 fn checksum(bytes: &[u8]) -> u16 {
+    finish_sum(add_bytes(0, bytes))
+}
+
+fn udp_checksum(source: [u8; 4], destination: [u8; 4], udp: &[u8]) -> u16 {
     let mut sum = 0u32;
+    sum = add_bytes(sum, &source);
+    sum = add_bytes(sum, &destination);
+    sum = sum.wrapping_add(17);
+    sum = sum.wrapping_add(udp.len() as u32);
+    finish_sum(add_bytes(sum, udp))
+}
+
+fn nonzero_udp_checksum(checksum: u16) -> u16 {
+    if checksum == 0 { u16::MAX } else { checksum }
+}
+
+fn add_bytes(mut sum: u32, bytes: &[u8]) -> u32 {
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
     }
     if let Some(&last) = chunks.remainder().first() {
-        sum += (last as u32) << 8;
+        sum = sum.wrapping_add((last as u32) << 8);
     }
+    sum
+}
+
+fn finish_sum(mut sum: u32) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -644,7 +702,12 @@ mod tests {
     const LEASED_IP: [u8; 4] = [10, 0, 2, 15];
     const SERVER_IP: [u8; 4] = [10, 0, 2, 2];
 
-    fn dhcp_reply(stack: &NetworkStack, message_type: u8, address: [u8; 4]) -> [u8; 342] {
+    fn dhcp_reply_from(
+        stack: &NetworkStack,
+        message_type: u8,
+        address: [u8; 4],
+        server_ip: [u8; 4],
+    ) -> [u8; 342] {
         let mut frame = [0u8; 342];
         frame[..6].copy_from_slice(&MAC);
         frame[6..12].copy_from_slice(&[0x52, 0x55, 10, 0, 2, 2]);
@@ -654,7 +717,7 @@ mod tests {
         write_u16(ip, 2, 328).unwrap();
         ip[8] = 64;
         ip[9] = 17;
-        ip[12..16].copy_from_slice(&SERVER_IP);
+        ip[12..16].copy_from_slice(&server_ip);
         ip[16..20].copy_from_slice(&IPV4_BROADCAST);
         let value = checksum(&ip[..20]);
         write_u16(ip, 10, value).unwrap();
@@ -672,12 +735,16 @@ mod tests {
         dhcp[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
         let mut option = 240;
         put_option(dhcp, &mut option, 53, &[message_type]).unwrap();
-        put_option(dhcp, &mut option, 54, &SERVER_IP).unwrap();
+        put_option(dhcp, &mut option, 54, &server_ip).unwrap();
         put_option(dhcp, &mut option, 1, &[255, 255, 255, 0]).unwrap();
-        put_option(dhcp, &mut option, 3, &SERVER_IP).unwrap();
+        put_option(dhcp, &mut option, 3, &server_ip).unwrap();
         put_option(dhcp, &mut option, 51, &3600u32.to_be_bytes()).unwrap();
         dhcp[option] = 255;
         frame
+    }
+
+    fn dhcp_reply(stack: &NetworkStack, message_type: u8, address: [u8; 4]) -> [u8; 342] {
+        dhcp_reply_from(stack, message_type, address, SERVER_IP)
     }
 
     fn acquire_lease(stack: &mut NetworkStack, output: &mut [u8]) {
@@ -722,6 +789,11 @@ mod tests {
         let mut output = [0u8; 512];
         let discover_len = stack.poll(0, &mut output).unwrap();
         assert_eq!(read_u16(&output[34..], 0), Some(DHCP_CLIENT_PORT));
+        assert_ne!(read_u16(&output[34..], 6), Some(0));
+        assert_eq!(
+            udp_checksum(IPV4_UNSPECIFIED, IPV4_BROADCAST, &output[34..discover_len]),
+            0
+        );
         assert_eq!(output[42], 1);
         assert_eq!(discover_len, 342);
 
@@ -743,6 +815,26 @@ mod tests {
                 lease_seconds: 3600,
             })
         );
+    }
+
+    #[test]
+    fn ignores_nak_from_unselected_dhcp_server() {
+        const FOREIGN_SERVER: [u8; 4] = [10, 0, 3, 1];
+
+        let mut stack = NetworkStack::new(MAC);
+        let mut output = [0u8; 512];
+        stack.poll(0, &mut output).unwrap();
+        let offer = dhcp_reply(&stack, DHCP_OFFER, LEASED_IP);
+        stack.handle_frame(&offer, &mut output, 1).unwrap();
+
+        let foreign_nak = dhcp_reply_from(&stack, DHCP_NAK, IPV4_UNSPECIFIED, FOREIGN_SERVER);
+        assert_eq!(stack.handle_frame(&foreign_nak, &mut output, 2), None);
+        assert_eq!(stack.dhcp_state, DhcpState::Requesting);
+        assert_eq!(stack.dhcp_server, SERVER_IP);
+
+        let ack = dhcp_reply(&stack, DHCP_ACK, LEASED_IP);
+        assert_eq!(stack.handle_frame(&ack, &mut output, 3), None);
+        assert_eq!(stack.ipv4_config().unwrap().address, LEASED_IP);
     }
 
     #[test]

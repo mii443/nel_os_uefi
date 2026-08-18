@@ -77,6 +77,18 @@ impl Vmcs {
         }
     }
 
+    pub fn load(&self) -> Result<(), &'static str> {
+        let vmcs_addr = self.get_vmcs_addr();
+        unsafe {
+            asm!(
+                "vmptrld ({})",
+                in(reg) &vmcs_addr,
+                options(att_syntax)
+            );
+            vmx_capture_status()
+        }
+    }
+
     pub fn write_revision_id(&mut self, revision_id: u32) {
         let vmcs_addr = self.get_vmcs_addr();
 

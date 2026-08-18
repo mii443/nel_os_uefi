@@ -8,21 +8,21 @@ use x86_64::{
 use crate::{
     error, info, serial,
     vmm::{
+        VCpu,
         x86_64::{
             amd::{
                 npt::Npt,
                 permissions::PermissionMaps,
                 register::GuestRegisters,
                 vmcb::{
-                    Flags1, InterceptVector1, InterceptVector2, InterruptShadowFlags, Vmcb,
-                    VmcbSegment,
+                    Flags1, InterceptVector1, InterceptVector2, InterruptFlags2,
+                    InterruptShadowFlags, Vmcb, VmcbSegment,
                 },
             },
             common::{
-                self, fxsave::FxState, segment::*, write_msr, xsave::HostXsaveState, X86VCpu,
+                self, X86VCpu, fxsave::FxState, segment::*, write_msr, xsave::HostXsaveState,
             },
         },
-        VCpu,
     },
 };
 
@@ -33,6 +33,7 @@ pub struct AMDVCpu {
     exit_reported: bool,
     vmcb: Vmcb,
     hsave: PhysFrame,
+    host_vmcb_state: PhysFrame,
     npt: Npt,
     permission_maps: PermissionMaps,
     serial: SerialState,
@@ -49,6 +50,8 @@ pub struct AMDVCpu {
     host_xsave_mask: u64,
     host_xsave_state: HostXsaveState,
     guest_memory_size: u64,
+    guest_memory_allocated: u64,
+    guest_asid: u32,
 }
 
 struct SerialState {
@@ -524,7 +527,6 @@ impl LegacyTimer {
     }
 }
 
-const GUEST_MEMORY_SIZE: u64 = 128 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
 impl AMDVCpu {
@@ -561,7 +563,8 @@ impl AMDVCpu {
         {
             let raw_vmcb = self.vmcb.get_raw_vmcb();
             raw_vmcb.control_area.intercept_vec1.insert(
-                InterceptVector1::CPUID
+                InterceptVector1::INTR
+                    | InterceptVector1::CPUID
                     | InterceptVector1::RDPMC
                     | InterceptVector1::INVD
                     | InterceptVector1::PAUSE
@@ -590,8 +593,12 @@ impl AMDVCpu {
             raw_vmcb.control_area.iopm_base_pa = self.permission_maps.iopm_base_pa();
             raw_vmcb.control_area.msrpm_base_pa = self.permission_maps.msrpm_base_pa();
             raw_vmcb.control_area.pause_filter_count = 4096;
+            raw_vmcb
+                .control_area
+                .interrupt_flags2
+                .insert(InterruptFlags2::V_INTR_MASKING);
 
-            raw_vmcb.control_area.guest_asid = 1;
+            raw_vmcb.control_area.guest_asid = self.guest_asid;
             raw_vmcb.control_area.flags1.set(Flags1::NP_ENABLE, true);
             raw_vmcb.control_area.nested_page_table_cr3 =
                 self.npt.root_table.start_address().as_u64();
@@ -723,6 +730,7 @@ impl AMDVCpu {
             let frame = frame_allocator
                 .allocate_frame()
                 .ok_or("No free frames for guest RAM")?;
+            self.guest_memory_allocated = self.guest_memory_allocated.saturating_add(PAGE_SIZE);
             unsafe {
                 core::ptr::write_bytes(
                     frame.start_address().as_u64() as *mut u8,
@@ -1274,16 +1282,24 @@ impl AMDVCpu {
 }
 
 impl VCpu for AMDVCpu {
+    fn prepare(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        if !self.initialized {
+            self.setup(frame_allocator)?;
+            self.initialized = true;
+        }
+        Ok(())
+    }
+
     fn run(
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
         interrupts::without_interrupts(|| {
             let result = (|| unsafe {
-                if !self.initialized {
-                    self.setup(frame_allocator)?;
-                    self.initialized = true;
-                }
+                self.prepare(frame_allocator)?;
 
                 {
                     let vmcb = self.vmcb.get_raw_vmcb();
@@ -1291,7 +1307,6 @@ impl VCpu for AMDVCpu {
                     vmcb.control_area.exit_info1 = 0;
                     vmcb.control_area.exit_info2 = 0;
                     vmcb.control_area.exit_int_info = 0;
-                    vmcb.control_area.tlb_control = 0;
                 }
 
                 self.poll_host_serial();
@@ -1316,7 +1331,13 @@ impl VCpu for AMDVCpu {
                     &mut self.guest_fx_state,
                     self.host_xsave_addr,
                     self.host_xsave_mask,
+                    self.host_vmcb_state.start_address().as_u64(),
                 );
+
+                // A setup/reset flush request must remain set until VMRUN has
+                // consumed it. Clearing this before entry can reuse stale NPT
+                // translations for a recycled ASID.
+                self.vmcb.get_raw_vmcb().control_area.tlb_control = 0;
 
                 if self.preserve_interrupted_event()? {
                     // Delivery of EXITINTINFO takes precedence over handling the
@@ -1328,7 +1349,9 @@ impl VCpu for AMDVCpu {
 
                 let vmcb = self.vmcb.get_raw_vmcb();
                 let exit_code = vmcb.control_area.exit_code;
-                if !self.exit_reported || !matches!(exit_code, 0x72 | 0x77 | 0x78 | 0x7b | 0x7c) {
+                if !self.exit_reported
+                    || !matches!(exit_code, 0x60 | 0x72 | 0x77 | 0x78 | 0x7b | 0x7c)
+                {
                     info!(
                         "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
                         exit_code,
@@ -1340,6 +1363,9 @@ impl VCpu for AMDVCpu {
                 }
 
                 match exit_code as u32 {
+                    // The pending physical vector is delivered to the host once
+                    // GIF and IF are restored below. Guest RIP is unchanged.
+                    0x60 => Ok(()),
                     0x72 => {
                         self.handle_cpuid();
                         Ok(())
@@ -1400,6 +1426,10 @@ impl VCpu for AMDVCpu {
         Ok(())
     }
 
+    fn is_idle(&self) -> bool {
+        self.halted && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
+    }
+
     fn write_memory_ranged(
         &mut self,
         addr_start: u64,
@@ -1421,10 +1451,27 @@ impl VCpu for AMDVCpu {
         self.guest_memory_size
     }
 
-    fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
+    fn get_allocated_guest_memory_size(&self) -> u64 {
+        self.guest_memory_allocated
+    }
+
+    fn new(
+        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        hardware_vcpu_id: usize,
+        guest_memory_size: u64,
+    ) -> Result<Self, &'static str>
     where
         Self: Sized,
     {
+        let guest_asid = hardware_vcpu_id
+            .checked_add(1)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or("AMD SVM ASID space is exhausted")?;
+        let asid_count = cpuid!(0x8000_000a).ebx;
+        if guest_asid >= asid_count {
+            return Err("CPU does not provide enough AMD SVM ASIDs for another VM");
+        }
+
         // FXSAVE64/FXRSTOR64 are used around every VMRUN to isolate x87,
         // MXCSR, and XMM state. Make the host prerequisite explicit before
         // the first assembly entry.
@@ -1441,6 +1488,12 @@ impl VCpu for AMDVCpu {
             .ok_or("Failed to allocate frame for VCPU HSave area")?;
         unsafe {
             core::ptr::write_bytes(hsave.start_address().as_u64() as *mut u8, 0, 4096);
+        }
+        let host_vmcb_state = frame_allocator
+            .allocate_frame()
+            .ok_or("Failed to allocate frame for AMD host VMCB state")?;
+        unsafe {
+            core::ptr::write_bytes(host_vmcb_state.start_address().as_u64() as *mut u8, 0, 4096);
         }
 
         let permission_maps = PermissionMaps::new(frame_allocator)?;
@@ -1460,6 +1513,7 @@ impl VCpu for AMDVCpu {
             exit_reported: false,
             vmcb: Vmcb::new(frame_allocator)?,
             hsave,
+            host_vmcb_state,
             npt: Npt::new(frame_allocator)?,
             permission_maps,
             serial: SerialState::default(),
@@ -1475,7 +1529,11 @@ impl VCpu for AMDVCpu {
             host_xsave_addr,
             host_xsave_mask,
             host_xsave_state,
-            guest_memory_size: GUEST_MEMORY_SIZE,
+            guest_memory_size,
+            guest_memory_allocated: 0,
+            // ASID zero is reserved. A unique ASID keeps cached nested
+            // translations isolated when VMs are scheduled round-robin.
+            guest_asid,
         })
     }
 
