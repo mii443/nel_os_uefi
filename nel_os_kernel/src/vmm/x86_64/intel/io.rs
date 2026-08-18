@@ -81,6 +81,16 @@ mod interrupt_vector_tests {
         assert_ne!(pic.pending_irq & (1 << 4), 0);
         assert_eq!(pic.serial.interrupt_identification() & 0x0f, 0x02);
     }
+
+    #[test]
+    fn pending_pic_irq_requires_another_vcpu_entry() {
+        let mut pic = Pic::new(1);
+        assert!(!pic.has_pending_interrupt());
+
+        pic.pending_irq |= 1 << 4;
+
+        assert!(pic.has_pending_interrupt());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +436,17 @@ impl Pic {
         if self.pit_channel0.poll() {
             self.pending_irq |= 1;
         }
+    }
+
+    /// Returns whether another VM entry is needed to deliver a latched IRQ.
+    ///
+    /// In particular, a guest may handle the higher-priority PIT IRQ0 and
+    /// immediately halt while UART IRQ4 is still pending. The scheduler must
+    /// keep that VCPU in the current time slice long enough to inject IRQ4;
+    /// otherwise multiple guests whose round-robin period exceeds the PIT
+    /// period can starve serial input indefinitely.
+    pub fn has_pending_interrupt(&self) -> bool {
+        self.pending_irq != 0
     }
 
     fn write_pit_control(&mut self, value: u8) {

@@ -59,6 +59,10 @@ pub struct IntelVCpu {
     guest_memory_initialization_failed: bool,
     interrupt_subscribed: bool,
     halted: bool,
+    /// Grants one immediate scheduler retry after a HLT exit leaves an IRQ.
+    /// The retry is consumed before injection is attempted, so a masked or
+    /// otherwise undeliverable IRQ cannot spin for the whole time slice.
+    halted_irq_retry: bool,
     host_pending_irq: AtomicU16,
     vmcs: vmcs::Vmcs,
     ept: ept::Ept,
@@ -461,11 +465,12 @@ impl IntelVCpu {
             & !Cr0::CR0_ENABLE_PAGING;
         vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
         vmwrite(vmcs::guest::CR3, 0)?;
+        // VMCLEAR resets the VMCS launch state but does not clear guest-state
+        // fields. Never derive boot CR4 from the previous Linux instance.
         vmwrite(
             vmcs::guest::CR4,
-            vmread(vmcs::guest::CR4)?
-                | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()
-                    & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
+            Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()
+                & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
         )?;
 
         vmwrite(vmcs::guest::CS_BASE, 0)?;
@@ -552,13 +557,29 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::FS_BASE, 0)?;
         vmwrite(vmcs::guest::GS_BASE, 0)?;
 
+        vmwrite(vmcs::guest::IA32_DEBUGCTL_FULL, 0)?;
+        vmwrite(vmcs::guest::IA32_PAT_FULL, 0x0007_0406_0007_0406)?;
         vmwrite(vmcs::guest::IA32_EFER_FULL, 0)?;
         vmwrite(vmcs::guest::IA32_EFER_HIGH, 0)?;
+        vmwrite(vmcs::guest::DR7, 0x400)?;
+        vmwrite(vmcs::guest::RSP, 0)?;
         vmwrite(vmcs::guest::RFLAGS, 0x2)?;
+        vmwrite(vmcs::guest::PENDING_DBG_EXCEPTIONS, 0)?;
+        vmwrite(vmcs::guest::INTERRUPTIBILITY_STATE, 0)?;
+        vmwrite(vmcs::guest::ACTIVITY_STATE, 0)?;
+        vmwrite(vmcs::guest::IA32_SYSENTER_CS, 0)?;
+        vmwrite(vmcs::guest::IA32_SYSENTER_ESP, 0)?;
+        vmwrite(vmcs::guest::IA32_SYSENTER_EIP, 0)?;
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
 
         vmwrite(vmcs::guest::RIP, common::linux::LAYOUT_KERNEL_BASE)?;
         self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM;
+
+        // A pending reinjection belongs to the pre-reset guest and must not
+        // leak into the new boot instance.
+        vmwrite(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, 0)?;
+        vmwrite(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, 0)?;
+        vmwrite(vmcs::control::VMENTRY_INSTRUCTION_LEN, 0)?;
 
         vmwrite(vmcs::control::CR0_READ_SHADOW, vmread(vmcs::guest::CR0)?)?;
         vmwrite(vmcs::control::CR4_READ_SHADOW, vmread(vmcs::guest::CR4)?)?;
@@ -886,6 +907,11 @@ impl VCpu for IntelVCpu {
         self.pic.poll_serial_input();
         self.pic.poll_timer();
 
+        // Consume the one retry granted after the previous HLT exit. If the
+        // IRQ cannot be injected, the early return below makes is_idle() true
+        // rather than polling this halted VCPU until its slice expires.
+        self.halted_irq_retry = false;
+
         let interrupt_injected = self.pic.inject_external_interrupt()?;
         if self.halted {
             if !interrupt_injected {
@@ -897,6 +923,7 @@ impl VCpu for IntelVCpu {
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
         self.vmexit_handler()?;
+        self.halted_irq_retry = self.halted && self.pic.has_pending_interrupt();
 
         Ok(())
     }
@@ -923,6 +950,7 @@ impl VCpu for IntelVCpu {
             .ok_or("TSC frequency unavailable for Intel VCPU reset")?;
         self.pic = super::io::Pic::new(tsc_khz);
         self.halted = false;
+        self.halted_irq_retry = false;
         self.host_pending_irq.store(0, Ordering::Release);
         self.guest_xcr0 = XCR0::from(1);
         Ok(())
@@ -950,12 +978,12 @@ impl VCpu for IntelVCpu {
     }
 
     fn is_idle(&self) -> bool {
-        self.halted
+        self.halted && !self.halted_irq_retry
     }
 
     fn new(
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-        _vm_id: usize,
+        _hardware_vcpu_id: usize,
         guest_memory_size: u64,
     ) -> Result<Self, &'static str>
     where
@@ -1013,6 +1041,7 @@ impl VCpu for IntelVCpu {
             guest_memory_initialization_failed: false,
             interrupt_subscribed: false,
             halted: false,
+            halted_irq_retry: false,
             host_pending_irq: AtomicU16::new(0),
             vmcs,
             ept,
