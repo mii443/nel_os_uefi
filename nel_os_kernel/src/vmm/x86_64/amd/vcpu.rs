@@ -950,12 +950,9 @@ impl AMDVCpu {
             self.legacy_timer.pic.raise_irq(0);
         }
         self.sync_uart_irq();
-        if let Some(irq) = self
-            .passthrough
-            .as_mut()
-            .and_then(PassthroughNic::poll_interrupt)
-        {
-            self.legacy_timer.pic.raise_irq(irq);
+        if let Some(device) = self.passthrough.as_mut() {
+            let (irq, asserted) = device.poll_interrupt_level();
+            self.legacy_timer.pic.set_irq_level(irq, asserted);
         }
         let next_irq = self.legacy_timer.pic.next_irq();
 

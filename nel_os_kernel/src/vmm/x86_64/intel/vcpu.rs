@@ -977,14 +977,15 @@ impl VCpu for IntelVCpu {
         // previous time slice (or since this VM was created).
         self.vmcs.load()?;
 
-        self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
-        if let Some(irq) = self
-            .passthrough
-            .as_mut()
-            .and_then(PassthroughNic::poll_interrupt)
-        {
-            self.pic.pending_irq |= 1 << irq;
+        if let Some(device) = self.passthrough.as_mut() {
+            let (irq, asserted) = device.poll_interrupt_level();
+            if asserted {
+                self.pic.pending_irq |= 1 << irq;
+            } else {
+                self.pic.pending_irq &= !(1 << irq);
+            }
         }
+        self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
         self.pic.poll_serial_input();
         self.pic.poll_timer();
 

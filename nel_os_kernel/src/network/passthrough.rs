@@ -178,7 +178,7 @@ impl PassthroughNic {
         }
     }
 
-    pub fn poll_interrupt(&mut self) -> Option<u8> {
+    pub fn poll_interrupt_level(&mut self) -> (u8, bool) {
         let fault_status = unsafe { mmio_read_u32(self.descriptor.iommu_base + IOMMU_FSTS) };
         if fault_status != 0 && !self.fault_reported {
             error!(
@@ -187,13 +187,12 @@ impl PassthroughNic {
             );
             self.fault_reported = true;
         }
-        if self.command & 2 == 0 {
-            return None;
-        }
-        // Reading the virtio ISR here would acknowledge it before the guest
-        // driver sees it. Inject a polled virtual INTx instead; the guest reads
-        // and filters the real ISR MMIO byte, including harmless spurious polls.
-        (self.command & 0x6 == 0x6).then_some(GUEST_IRQ)
+        // PCI Status bit 3 reflects the INTx line without acknowledging the
+        // virtio interrupt. Reading the virtio ISR here would clear it before
+        // the guest driver can determine why the device interrupted.
+        const PCI_STATUS_INTERRUPT: u16 = 1 << 3;
+        let interrupt_asserted = self.descriptor.address.read_u16(0x06) & PCI_STATUS_INTERRUPT != 0;
+        (GUEST_IRQ, self.command & 0x6 == 0x6 && interrupt_asserted)
     }
 
     pub fn reset(&mut self) {
