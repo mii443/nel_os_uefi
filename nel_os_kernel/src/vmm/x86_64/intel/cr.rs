@@ -16,6 +16,10 @@ pub fn handle_cr_access(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'sta
                 passthrough_write(vcpu, qual)?;
                 update_ia32e(vcpu)?;
             }
+            8 => {
+                let value = get_value(vcpu, qual)?;
+                vcpu.guest_cr8 = validate_cr8(value)?;
+            }
             _ => return Err("Unsupported guest CR write"),
         },
         AccessType::MovFrom => passthrough_read(vcpu, qual)?,
@@ -28,12 +32,20 @@ pub fn handle_cr_access(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'sta
 fn passthrough_read(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static str> {
     let value = match qual.index() {
         3 => vmread(x86::vmx::vmcs::guest::CR3)?,
+        8 => u64::from(vcpu.guest_cr8),
         _ => return Err("Unsupported guest CR read"),
     };
 
     set_value(vcpu, qual, value)?;
 
     Ok(())
+}
+
+fn validate_cr8(value: u64) -> Result<u8, &'static str> {
+    if value & !0xf != 0 {
+        return Err("Guest CR8 write sets reserved bits");
+    }
+    Ok(value as u8)
 }
 
 fn passthrough_write(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static str> {
@@ -159,4 +171,22 @@ fn get_value(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<u64, &'static str> {
         Register::R15 => guest_regs.r15,
         Register::Rsp => vmread(x86::vmx::vmcs::guest::RSP)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_cr8;
+
+    #[test]
+    fn cr8_accepts_all_architectural_priority_values() {
+        for value in 0..=15 {
+            assert_eq!(validate_cr8(value), Ok(value as u8));
+        }
+    }
+
+    #[test]
+    fn cr8_rejects_reserved_bits() {
+        assert!(validate_cr8(16).is_err());
+        assert!(validate_cr8(u64::MAX).is_err());
+    }
 }
