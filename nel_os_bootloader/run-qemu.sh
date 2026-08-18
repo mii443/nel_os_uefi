@@ -34,12 +34,12 @@ case "${NET_MODE}" in
         fi
         if [[ ! "${NET_HOST_PORT}" =~ ^[0-9]{1,5}$ ]] ||
             ((10#${NET_HOST_PORT} < 1 || 10#${NET_HOST_PORT} > 65535)); then
-            echo "Invalid host-forward UDP port: ${NET_HOST_PORT}" >&2
+            echo "Invalid host-forward management port: ${NET_HOST_PORT}" >&2
             exit 2
         fi
         NET_ARGS=(
             -netdev
-            "user,id=hypervisor_net,net=10.0.2.0/24,dhcpstart=10.0.2.15,hostfwd=udp:${NET_BIND_ADDRESS}:${NET_HOST_PORT}-10.0.2.15:5555"
+            "user,id=hypervisor_net,net=10.0.2.0/24,dhcpstart=10.0.2.15,hostfwd=tcp:${NET_BIND_ADDRESS}:${NET_HOST_PORT}-10.0.2.15:5555,hostfwd=udp:${NET_BIND_ADDRESS}:${NET_HOST_PORT}-10.0.2.15:5555"
         )
         ;;
     bridge)
