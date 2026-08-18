@@ -1,6 +1,6 @@
 use core::ptr::read_unaligned;
 
-use crate::{info, vmm::VCpu, BZIMAGE_ADDR, BZIMAGE_SIZE};
+use crate::{BZIMAGE_ADDR, BZIMAGE_SIZE, info, vmm::VCpu};
 
 pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     info!("Loading kernel into guest memory");
@@ -18,8 +18,36 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
 
     info!("Creating boot parameters");
     let guest_mem_size = vcpu.get_guest_memory_size();
+    if guest_mem_size <= LAYOUT_KERNEL_BASE {
+        return Err("Guest memory is too small for the Linux kernel load address");
+    }
     let mut bp = BootParams::from_bytes(kernel)?;
     bp.e820_entries = 0;
+
+    let code_offset = bp.hdr.get_protected_code_offset();
+    let protected_kernel = kernel
+        .get(code_offset..)
+        .ok_or("Linux protected-mode kernel offset is outside the image")?;
+    let kernel_image_end = LAYOUT_KERNEL_BASE
+        .checked_add(protected_kernel.len() as u64)
+        .ok_or("Linux kernel load range overflowed")?;
+    let preferred_address = bp.hdr.pref_address;
+    let runtime_base = if (LAYOUT_KERNEL_BASE..guest_mem_size).contains(&preferred_address) {
+        preferred_address
+    } else {
+        LAYOUT_KERNEL_BASE
+    };
+    let kernel_runtime_end = runtime_base
+        .checked_add(bp.hdr.init_size as u64)
+        .ok_or("Linux kernel runtime range overflowed")?;
+    let occupied_end = kernel_image_end.max(kernel_runtime_end);
+    let initrd_size = u64::try_from(initrd.len()).map_err(|_| "Initrd size does not fit in u64")?;
+    let initrd_address = choose_initrd_address(
+        guest_mem_size,
+        bp.hdr.initrd_addr_max,
+        initrd_size,
+        occupied_end,
+    )?;
 
     bp.hdr.type_of_loader = 0xFF;
     bp.hdr.ext_loader_ver = 0;
@@ -29,8 +57,10 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     bp.hdr.loadflags.set_keep_segments(true);
     bp.hdr.cmd_line_ptr = LAYOUT_CMDLINE as u32;
     bp.hdr.vid_mode = 0xFFFF;
-    bp.hdr.ramdisk_image = LAYOUT_INITRD as u32;
-    bp.hdr.ramdisk_size = initrd.len() as u32;
+    bp.hdr.ramdisk_image = u32::try_from(initrd_address)
+        .map_err(|_| "Initrd load address does not fit in Linux boot parameters")?;
+    bp.hdr.ramdisk_size = u32::try_from(initrd.len())
+        .map_err(|_| "Initrd size does not fit in Linux boot parameters")?;
 
     bp.add_e820_entry(0, LAYOUT_KERNEL_BASE, E820Type::Ram);
     bp.add_e820_entry(
@@ -80,18 +110,43 @@ pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     load_image(vcpu, bp_bytes, LAYOUT_BOOTPARAM as usize)?;
 
     info!("Loading kernel image into guest memory");
-    let code_offset = bp.hdr.get_protected_code_offset();
-    let code_size = kernel.len() - code_offset;
-    load_image(
-        vcpu,
-        &kernel[code_offset..code_offset + code_size],
-        LAYOUT_KERNEL_BASE as usize,
-    )?;
+    load_image(vcpu, protected_kernel, LAYOUT_KERNEL_BASE as usize)?;
 
     info!("Loading initrd image into guest memory");
-    load_image(vcpu, initrd, LAYOUT_INITRD as usize)?;
+    load_image(vcpu, initrd, initrd_address as usize)?;
 
     Ok(())
+}
+
+fn choose_initrd_address(
+    guest_mem_size: u64,
+    initrd_addr_max: u32,
+    initrd_size: u64,
+    occupied_end: u64,
+) -> Result<u64, &'static str> {
+    const PAGE_SIZE: u64 = 4096;
+    const BOOT_PARAM_ADDRESS_LIMIT: u64 = u32::MAX as u64 + 1;
+
+    let protocol_limit = if initrd_addr_max == 0 {
+        BOOT_PARAM_ADDRESS_LIMIT
+    } else {
+        initrd_addr_max as u64 + 1
+    };
+    let upper_bound = guest_mem_size
+        .min(protocol_limit)
+        .min(BOOT_PARAM_ADDRESS_LIMIT);
+    let unaligned_address = upper_bound
+        .checked_sub(initrd_size)
+        .ok_or("Guest memory is too small for the initrd")?;
+    let address = unaligned_address & !(PAGE_SIZE - 1);
+    let reserved_end = occupied_end
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or("Linux reserved range overflowed")?
+        & !(PAGE_SIZE - 1);
+    if address < reserved_end {
+        return Err("Guest memory is too small for the Linux kernel and initrd");
+    }
+    Ok(address)
 }
 
 fn load_image(vcpu: &mut dyn VCpu, image: &[u8], addr: usize) -> Result<(), &'static str> {
@@ -106,7 +161,6 @@ fn load_image(vcpu: &mut dyn VCpu, image: &[u8], addr: usize) -> Result<(), &'st
 pub const LAYOUT_BOOTPARAM: u64 = 0x0001_0000;
 pub const LAYOUT_CMDLINE: u64 = 0x0002_0000;
 pub const LAYOUT_KERNEL_BASE: u64 = 0x0010_0000;
-pub const LAYOUT_INITRD: u64 = 0x0800_0000;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -392,4 +446,40 @@ pub enum E820Type {
     Acpi = 3,
     Nvs = 4,
     Unusable = 5,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_initrd_address;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn places_initrd_below_128_mib_guest_limit() {
+        let size = 2_064_563;
+        let address = choose_initrd_address(128 * MIB, u32::MAX, size, 60 * MIB).unwrap();
+
+        assert_eq!(address & 0xfff, 0);
+        assert!(address >= 60 * MIB);
+        assert!(address + size <= 128 * MIB);
+    }
+
+    #[test]
+    fn honors_linux_initrd_address_limit() {
+        let size = 2 * MIB;
+        let address =
+            choose_initrd_address(128 * MIB, (64 * MIB - 1) as u32, size, 32 * MIB).unwrap();
+
+        assert_eq!(address, 62 * MIB);
+    }
+
+    #[test]
+    fn rejects_initrd_that_would_overlap_kernel_runtime() {
+        let result = choose_initrd_address(128 * MIB, u32::MAX, 2 * MIB, 127 * MIB);
+
+        assert_eq!(
+            result,
+            Err("Guest memory is too small for the Linux kernel and initrd")
+        );
+    }
 }

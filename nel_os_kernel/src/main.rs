@@ -11,11 +11,14 @@ pub mod cpuid;
 pub mod graphics;
 pub mod interrupt;
 pub mod logging;
+mod management;
 pub mod memory;
 pub mod network;
 pub mod platform;
 pub mod serial;
+mod serial_console;
 pub mod time;
+mod vm_control;
 pub mod vmm;
 
 use core::arch::asm;
@@ -84,6 +87,7 @@ fn hlt_loop() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
+    let boot_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     serial::disable_screen_output();
 
     interrupt::gdt::init();
@@ -185,71 +189,23 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
     // The physical NIC is owned by the outer kernel. It is initialized before
     // guest RAM is created, and is never mapped into EPT/NPT or represented by
     // the guest's deliberately empty PCI model.
-    let mut network_device = match network::VirtioNet::probe(&mut bitmap_table) {
-        Ok(device) => device,
+    let network_device = match network::VirtioNet::probe(&mut bitmap_table) {
+        Ok(device) => Some(device),
         Err(error) => {
             error!("Hypervisor network unavailable: {}", error);
-            error!("Linux VM will not start without a network start command");
-            hlt_loop();
+            warn!("TCP management is disabled; the local serial shell remains available");
+            None
         }
     };
 
-    info!(
-        "Linux VM is gated until DHCP completes and UDP port {} receives `start`",
-        network::CONTROL_PORT
-    );
-    loop {
-        if let Err(error) = network_device.poll() {
-            error!("Hypervisor network failed before VM start: {}", error);
-            hlt_loop();
-        }
-        if network_device.take_start_request() {
-            info!("Network start command accepted; creating Linux VM");
-            break;
-        }
-        unsafe {
-            asm!("hlt");
-        }
+    if network_device.is_some() {
+        info!(
+            "Linux VM is stopped; management shell will listen on TCP port {} after DHCP",
+            network::CONTROL_PORT
+        );
+    } else {
+        info!("Linux VM is stopped; use the local serial management shell");
     }
 
-    let mut network = Some(network_device);
-    let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
-
-    info!("Running guest VM...");
-    loop {
-        if let Some(device) = network.as_mut() {
-            if let Err(error) = device.poll() {
-                error!("Hypervisor network poll failed: {}", error);
-                network = None;
-            }
-        }
-
-        let result = vcpu.run(&mut bitmap_table);
-        if let Err(e) = result {
-            error!("VCPU run failed: {}", e);
-
-            // Host management networking remains useful even when the guest
-            // cannot start. The APIC timer wakes this polling loop without
-            // burning a core between packets.
-            if network.is_some() {
-                warn!("Guest stopped; keeping hypervisor networking online");
-                loop {
-                    if let Some(device) = network.as_mut() {
-                        if let Err(error) = device.poll() {
-                            error!("Hypervisor network poll failed: {}", error);
-                            network = None;
-                        }
-                    } else {
-                        hlt_loop();
-                    }
-                    unsafe {
-                        asm!("hlt");
-                    }
-                }
-            }
-            break;
-        }
-    }
-
-    hlt_loop();
+    vm_control::VmController::new(network_device, usable_frame, boot_tsc).run(&mut bitmap_table);
 }

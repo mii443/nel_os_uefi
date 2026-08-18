@@ -64,6 +64,7 @@ pub struct NetworkStack {
     lease_expiry_tick: usize,
     config: Option<Ipv4Config>,
     start_requested: bool,
+    management: super::management::ManagementServer,
 }
 
 impl NetworkStack {
@@ -83,6 +84,7 @@ impl NetworkStack {
             lease_expiry_tick: 0,
             config: None,
             start_requested: false,
+            management: super::management::ManagementServer::new(),
         }
     }
 
@@ -94,11 +96,63 @@ impl NetworkStack {
         core::mem::take(&mut self.start_requested)
     }
 
+    pub fn take_management_command(&mut self) -> Option<super::ManagementCommand> {
+        self.management.take_command()
+    }
+
+    pub fn write_management(&mut self, bytes: &[u8]) -> usize {
+        self.management.write(bytes)
+    }
+
+    pub fn management_prompt(&mut self) {
+        self.management.prompt();
+    }
+
+    pub fn notify_management_detach_or_close(&mut self, notice: &[u8]) -> bool {
+        self.management.notify_detach_or_close(notice)
+    }
+
+    pub fn write_management_help(&mut self) {
+        self.management.write_help();
+    }
+
+    pub fn request_management_close(&mut self) {
+        self.management.request_close();
+    }
+
+    pub fn set_serial_attached(&mut self, attached: bool) {
+        self.management.set_serial_attached(attached);
+    }
+
+    pub fn serial_attached(&self) -> bool {
+        self.management.serial_attached()
+    }
+
+    pub fn take_serial_input(&mut self, output: &mut [u8]) -> usize {
+        self.management.take_serial_input(output)
+    }
+
+    pub fn discard_serial_input(&mut self) -> usize {
+        self.management.discard_serial_input()
+    }
+
+    pub fn write_serial_output(&mut self, bytes: &[u8]) -> usize {
+        self.management.write_serial(bytes)
+    }
+
+    pub fn serial_output_capacity(&self) -> usize {
+        self.management.serial_output_capacity()
+    }
+
     pub fn poll(&mut self, now: usize, output: &mut [u8]) -> Option<usize> {
         if self.dhcp_state == DhcpState::Bound && now >= self.lease_expiry_tick {
-            self.config = None;
-            self.dhcp_state = DhcpState::Init;
-            self.next_dhcp_tick = now;
+            self.lose_lease(now);
+        }
+
+        if let Some(config) = self.config {
+            if let Some(length) = self.management.poll(self.mac, config.address, now, output) {
+                return Some(length);
+            }
         }
 
         if now < self.next_dhcp_tick {
@@ -202,6 +256,21 @@ impl NetworkStack {
                 self.handle_icmp(frame, response, header_len, total_len)
             }
             17 => self.handle_udp(frame, response, header_len, total_len, now),
+            6 if self
+                .config
+                .is_some_and(|config| ip[16..20] == config.address) =>
+            {
+                let config = self.config.unwrap();
+                self.management.handle_ipv4(
+                    frame,
+                    header_len,
+                    total_len,
+                    self.mac,
+                    config.address,
+                    now,
+                    response,
+                )
+            }
             _ => None,
         }
     }
@@ -324,26 +393,39 @@ impl NetworkStack {
                 };
                 let lease_seconds = options.lease_seconds.unwrap_or(DEFAULT_LEASE_SECONDS);
                 let lease_ticks = (lease_seconds as usize).saturating_mul(TICKS_PER_SECOND);
-                self.config = Some(Ipv4Config {
+                let new_config = Ipv4Config {
                     address,
                     subnet_mask: options.subnet_mask.unwrap_or(IPV4_UNSPECIFIED),
                     router: options.router.unwrap_or(IPV4_UNSPECIFIED),
                     dhcp_server: options.server.unwrap_or(self.dhcp_server),
                     lease_seconds,
-                });
+                };
+                if self
+                    .config
+                    .is_some_and(|old_config| old_config.address != new_config.address)
+                {
+                    self.management.reset_connection();
+                }
+                self.config = Some(new_config);
                 self.dhcp_state = DhcpState::Bound;
                 self.lease_expiry_tick = now.saturating_add(lease_ticks);
                 self.next_dhcp_tick = usize::MAX;
                 None
             }
             DHCP_NAK => {
-                self.config = None;
-                self.dhcp_state = DhcpState::Init;
-                self.next_dhcp_tick = now;
+                self.lose_lease(now);
                 None
             }
             _ => None,
         }
+    }
+
+    fn lose_lease(&mut self, now: usize) {
+        self.config = None;
+        self.dhcp_state = DhcpState::Init;
+        self.next_dhcp_tick = now;
+        self.start_requested = false;
+        self.management.reset_connection();
     }
 
     fn build_dhcp(

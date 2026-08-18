@@ -13,6 +13,7 @@ use x86_64::{
 use crate::{info, time, warn};
 
 use super::{
+    ManagementCommand,
     pci::{self, PciAddress},
     stack::{CONTROL_PORT, NetworkStack},
 };
@@ -201,6 +202,9 @@ pub struct VirtioNet {
     receive_buffer_count: usize,
     transmit_buffer: u64,
     transmit_in_flight: bool,
+    pending_transmit: [u8; MAX_ETHERNET_FRAME],
+    pending_transmit_len: usize,
+    dropped_transmits: u64,
     stack: NetworkStack,
 }
 
@@ -279,6 +283,9 @@ impl VirtioNet {
             receive_buffer_count: RX_BUFFER_COUNT,
             transmit_buffer,
             transmit_in_flight: false,
+            pending_transmit: [0; MAX_ETHERNET_FRAME],
+            pending_transmit_len: 0,
+            dropped_transmits: 0,
             stack: NetworkStack::new(mac),
         };
         info!(
@@ -295,7 +302,7 @@ impl VirtioNet {
             mac[5]
         );
         info!(
-            "Hypervisor DHCP client started; VM control is UDP port {}",
+            "Hypervisor DHCP client started; VM control is UDP/TCP port {}",
             CONTROL_PORT
         );
         Ok(device)
@@ -306,18 +313,28 @@ impl VirtioNet {
         // INTx and virtqueue interrupts are disabled for this polling driver.
         let _ = io_read_u8(self.io_base + ISR_STATUS);
         self.reap_transmit()?;
+        self.flush_pending_transmit()?;
+
+        // Do not consume protocol state when both bounded transmit slots are
+        // occupied. In particular, dropping a TCP ACK here would stall an
+        // otherwise healthy management session until retransmission.
+        if self.transmit_in_flight && self.pending_transmit_len != 0 {
+            return Ok(());
+        }
 
         let now = time::get_ticks();
         let previous_config = self.stack.ipv4_config();
         let mut response = [0u8; MAX_ETHERNET_FRAME];
         if let Some(length) = self.stack.poll(now, &mut response) {
-            if let Err(error) = self.transmit(&response[..length]) {
-                warn!("Delaying DHCP transmission: {}", error);
+            if self.transmit_or_queue(&response[..length]).is_err() {
+                self.dropped_transmits = self.dropped_transmits.saturating_add(1);
             }
         }
 
         let mut receive_buffers_requeued = false;
-        while let Some(used) = self.receive.pop_used() {
+        if (!self.transmit_in_flight || self.pending_transmit_len == 0)
+            && let Some(used) = self.receive.pop_used()
+        {
             let id = used.id as usize;
             if id >= self.receive_buffer_count {
                 return Err("virtio-net returned an invalid receive descriptor");
@@ -331,8 +348,8 @@ impl VirtioNet {
                     )
                 };
                 if let Some(length) = self.stack.handle_frame(frame, &mut response, now) {
-                    if let Err(error) = self.transmit(&response[..length]) {
-                        warn!("Dropping hypervisor network response: {}", error);
+                    if self.transmit_or_queue(&response[..length]).is_err() {
+                        self.dropped_transmits = self.dropped_transmits.saturating_add(1);
                     }
                 }
             }
@@ -365,7 +382,10 @@ impl VirtioNet {
                     config.router[3],
                     config.lease_seconds
                 );
-                info!("Waiting for UDP command `start` on port {}", CONTROL_PORT);
+                info!(
+                    "Management shell is listening on TCP port {}; UDP `start` remains available",
+                    CONTROL_PORT
+                );
             } else {
                 warn!("DHCP lease expired; restarting address discovery");
             }
@@ -375,6 +395,80 @@ impl VirtioNet {
 
     pub fn take_start_request(&mut self) -> bool {
         self.stack.take_start_request()
+    }
+
+    pub fn take_management_command(&mut self) -> Option<ManagementCommand> {
+        self.stack.take_management_command()
+    }
+
+    pub fn write_management(&mut self, bytes: &[u8]) -> usize {
+        self.stack.write_management(bytes)
+    }
+
+    pub fn management_prompt(&mut self) {
+        self.stack.management_prompt();
+    }
+
+    pub fn notify_management_detach_or_close(&mut self, notice: &[u8]) -> bool {
+        self.stack.notify_management_detach_or_close(notice)
+    }
+
+    pub fn write_management_help(&mut self) {
+        self.stack.write_management_help();
+    }
+
+    pub fn request_management_close(&mut self) {
+        self.stack.request_management_close();
+    }
+
+    pub fn set_serial_attached(&mut self, attached: bool) {
+        self.stack.set_serial_attached(attached);
+    }
+
+    pub fn serial_attached(&self) -> bool {
+        self.stack.serial_attached()
+    }
+
+    pub fn take_serial_input(&mut self, output: &mut [u8]) -> usize {
+        self.stack.take_serial_input(output)
+    }
+
+    pub fn discard_serial_input(&mut self) -> usize {
+        self.stack.discard_serial_input()
+    }
+
+    pub fn write_serial_output(&mut self, bytes: &[u8]) -> usize {
+        self.stack.write_serial_output(bytes)
+    }
+
+    pub fn serial_output_capacity(&self) -> usize {
+        self.stack.serial_output_capacity()
+    }
+
+    pub fn ipv4_config(&self) -> Option<super::stack::Ipv4Config> {
+        self.stack.ipv4_config()
+    }
+
+    pub fn dropped_transmits(&self) -> u64 {
+        self.dropped_transmits
+    }
+
+    /// Gives a freshly generated management response a chance to reach the
+    /// virtqueue before the main loop enters a stopped-state HLT. The command
+    /// packet's TCP ACK may still occupy the sole hardware TX descriptor, so
+    /// poll for a bounded period until any queued response has been promoted
+    /// to that descriptor.
+    pub fn flush_management_response(&mut self) -> Result<(), &'static str> {
+        const MAX_POLLS: usize = 256;
+
+        for _ in 0..MAX_POLLS {
+            self.poll()?;
+            if self.pending_transmit_len == 0 {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Ok(())
     }
 
     fn transmit(&mut self, frame: &[u8]) -> Result<(), &'static str> {
@@ -404,6 +498,33 @@ impl VirtioNet {
         self.transmit_in_flight = true;
         self.transmit.notify(self.io_base);
         Ok(())
+    }
+
+    fn transmit_or_queue(&mut self, frame: &[u8]) -> Result<(), &'static str> {
+        self.reap_transmit()?;
+        if !self.transmit_in_flight {
+            return self.transmit(frame);
+        }
+        if self.pending_transmit_len != 0 {
+            return Err("virtio-net pending transmit slot is busy");
+        }
+        if frame.len() > self.pending_transmit.len() {
+            return Err("network response exceeds the pending transmit slot");
+        }
+        self.pending_transmit[..frame.len()].copy_from_slice(frame);
+        self.pending_transmit_len = frame.len();
+        Ok(())
+    }
+
+    fn flush_pending_transmit(&mut self) -> Result<(), &'static str> {
+        if self.pending_transmit_len == 0 || self.transmit_in_flight {
+            return Ok(());
+        }
+        let length = self.pending_transmit_len;
+        let mut frame = [0u8; MAX_ETHERNET_FRAME];
+        frame[..length].copy_from_slice(&self.pending_transmit[..length]);
+        self.pending_transmit_len = 0;
+        self.transmit(&frame[..length])
     }
 
     fn reap_transmit(&mut self) -> Result<(), &'static str> {

@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 
 use alloc::format;
 use lazy_static::lazy_static;
@@ -13,9 +13,74 @@ lazy_static! {
         serial_port.init();
         Mutex::new(serial_port)
     };
+    static ref GUEST_SERIAL_BRIDGE: Mutex<GuestSerialBridge> = Mutex::new(GuestSerialBridge::new());
+}
+
+const GUEST_SERIAL_QUEUE_LEN: usize = 4096;
+
+struct ByteRing {
+    bytes: [u8; GUEST_SERIAL_QUEUE_LEN],
+    head: usize,
+    len: usize,
+}
+
+impl ByteRing {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; GUEST_SERIAL_QUEUE_LEN],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> bool {
+        if self.len == self.bytes.len() {
+            return false;
+        }
+        let tail = (self.head + self.len) % self.bytes.len();
+        self.bytes[tail] = byte;
+        self.len += 1;
+        true
+    }
+
+    fn pop_into(&mut self, output: &mut [u8]) -> usize {
+        let count = output.len().min(self.len);
+        for slot in &mut output[..count] {
+            *slot = self.bytes[self.head];
+            self.head = (self.head + 1) % self.bytes.len();
+        }
+        self.len -= count;
+        count
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.len
+    }
+}
+
+struct GuestSerialBridge {
+    input: ByteRing,
+    output: ByteRing,
+}
+
+impl GuestSerialBridge {
+    const fn new() -> Self {
+        Self {
+            input: ByteRing::new(),
+            output: ByteRing::new(),
+        }
+    }
 }
 
 static OUTPUT_TO_SCREEN: AtomicBool = AtomicBool::new(true);
+static GUEST_SERIAL_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+static LOCAL_GUEST_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+static GUEST_SERIAL_OUTPUT_DROPS: AtomicU64 = AtomicU64::new(0);
 
 pub fn disable_screen_output() {
     OUTPUT_TO_SCREEN.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -67,6 +132,73 @@ pub fn write_raw_byte(byte: u8) {
     interrupts::without_interrupts(|| {
         SERIAL1.lock().send_raw(byte);
     });
+}
+
+/// Routes a guest UART byte only to explicitly attached consoles.
+///
+/// The physical COM1 console is owned by the hypervisor management shell by
+/// default. A network attachment uses the bounded mirror queue, while a local
+/// attachment writes directly to COM1.
+#[inline(always)]
+pub fn write_guest_raw_byte(byte: u8) {
+    if LOCAL_GUEST_OUTPUT_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        write_raw_byte(byte);
+    }
+    if GUEST_SERIAL_CAPTURE_ENABLED.load(core::sync::atomic::Ordering::Acquire) {
+        if !GUEST_SERIAL_BRIDGE.lock().output.push(byte) {
+            GUEST_SERIAL_OUTPUT_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn set_local_guest_output_enabled(enabled: bool) {
+    LOCAL_GUEST_OUTPUT_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn set_guest_capture_enabled(enabled: bool) {
+    let previous = GUEST_SERIAL_CAPTURE_ENABLED.swap(enabled, core::sync::atomic::Ordering::AcqRel);
+    if previous == enabled {
+        return;
+    }
+
+    let mut bridge = GUEST_SERIAL_BRIDGE.lock();
+    bridge.output.clear();
+}
+
+pub fn queue_guest_input(bytes: &[u8]) -> usize {
+    let mut bridge = GUEST_SERIAL_BRIDGE.lock();
+    let mut written = 0;
+    for &byte in bytes {
+        if !bridge.input.push(byte) {
+            break;
+        }
+        written += 1;
+    }
+    written
+}
+
+pub fn guest_input_capacity() -> usize {
+    GUEST_SERIAL_BRIDGE.lock().input.remaining()
+}
+
+pub fn poll_guest_input(output: &mut [u8]) -> usize {
+    GUEST_SERIAL_BRIDGE.lock().input.pop_into(output)
+}
+
+pub fn poll_guest_output(output: &mut [u8]) -> usize {
+    GUEST_SERIAL_BRIDGE.lock().output.pop_into(output)
+}
+
+pub fn guest_output_drop_count() -> u64 {
+    GUEST_SERIAL_OUTPUT_DROPS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn reset_guest_bridge() {
+    GUEST_SERIAL_CAPTURE_ENABLED.store(false, core::sync::atomic::Ordering::Release);
+    LOCAL_GUEST_OUTPUT_ENABLED.store(false, core::sync::atomic::Ordering::Release);
+    let mut bridge = GUEST_SERIAL_BRIDGE.lock();
+    bridge.input.clear();
+    bridge.output.clear();
 }
 
 /// Non-blockingly polls the fixed host COM1 device into a bounded buffer.

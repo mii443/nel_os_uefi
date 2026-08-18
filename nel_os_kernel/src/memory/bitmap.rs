@@ -19,6 +19,7 @@ pub struct BitmapMemoryTable {
     pub used_map: &'static mut [usize],
     pub start: usize,
     pub end: usize,
+    free_frames: usize,
 }
 
 impl BitmapMemoryTable {
@@ -46,6 +47,7 @@ impl BitmapMemoryTable {
             used_map,
             start: 0,
             end: usize::MAX,
+            free_frames: 0,
         };
 
         for range in usable_memory.ranges() {
@@ -79,6 +81,10 @@ impl BitmapMemoryTable {
         (self.start..self.end).find(|&i| self.get_bit(i))
     }
 
+    pub fn free_frame_count(&self) -> usize {
+        self.free_frames
+    }
+
     pub fn set_range(&mut self, range: &memory::Range) {
         let start = Self::addr_to_pfn(range.start as usize);
         let size = (range.end - range.start) / PAGE_SIZE as u64;
@@ -91,12 +97,19 @@ impl BitmapMemoryTable {
     pub fn set_frame(&mut self, frame: usize, state: bool) {
         let index = Self::frame_to_index(frame);
         let offset = Self::frame_to_offset(frame);
+        let was_free = (self.used_map[index] & (1usize << offset)) != 0;
+
+        if was_free == state {
+            return;
+        }
 
         if state {
             self.used_map[index] |= 1usize << offset;
             self.start = self.start.min(frame);
+            self.free_frames += 1;
         } else {
             self.used_map[index] &= !(1usize << offset);
+            self.free_frames = self.free_frames.saturating_sub(1);
             if self.start == frame {
                 self.start += 1;
             }

@@ -1,23 +1,25 @@
-use core::arch::{asm, x86_64::_xgetbv};
+use core::{
+    arch::{asm, x86_64::_xgetbv},
+    sync::atomic::{AtomicU16, Ordering},
+};
 
 use raw_cpuid::cpuid;
 use x86_64::{
-    VirtAddr,
     registers::control::{Cr4, Cr4Flags},
     structures::paging::{FrameAllocator, Size4KiB},
+    VirtAddr,
 };
 
 use crate::{
     constant::PAGE_SIZE,
     info, interrupt,
     vmm::{
-        VCpu,
         x86_64::{
-            common::{self, X86VCpu, fxsave::FxState, read_msr, xsave::HostXsaveState},
+            common::{self, fxsave::FxState, read_msr, xsave::HostXsaveState, X86VCpu},
             intel::{
                 auditor, controls, cpuid, ept,
                 fpu::{self, XCR0},
-                io::{IOBitmap, vmm_interrupt_subscriber},
+                io::{vmm_interrupt_subscriber, IOBitmap},
                 msr::{self, ShadowMsr},
                 qual::{QualCr, QualIo},
                 register::GuestRegisters,
@@ -30,6 +32,7 @@ use crate::{
                 vmread, vmwrite, vmxon,
             },
         },
+        VCpu,
     },
 };
 const TEMP_STACK_SIZE: usize = 4096;
@@ -45,6 +48,10 @@ pub struct IntelVCpu {
     pub host_xsave_mask: u64,
     host_xsave_state: HostXsaveState,
     activated: bool,
+    guest_memory_initialized: bool,
+    guest_memory_initialization_failed: bool,
+    interrupt_subscribed: bool,
+    host_pending_irq: AtomicU16,
     vmxon: vmxon::Vmxon,
     vmcs: vmcs::Vmcs,
     ept: ept::Ept,
@@ -305,12 +312,26 @@ impl IntelVCpu {
         self.setup_guest_state()?;
         self.io_bitmap.setup()?;
 
-        interrupt::subscriber::subscribe(
-            vmm_interrupt_subscriber,
-            self as &mut IntelVCpu as *mut IntelVCpu as *mut core::ffi::c_void,
-        )?;
+        if !self.interrupt_subscribed {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                interrupt::subscriber::subscribe(
+                    vmm_interrupt_subscriber,
+                    &self.host_pending_irq as *const AtomicU16 as *mut core::ffi::c_void,
+                )
+            })?;
+            self.interrupt_subscribed = true;
+        }
 
-        self.init_guest_memory(frame_allocator)?;
+        if !self.guest_memory_initialized {
+            if self.guest_memory_initialization_failed {
+                return Err("Guest memory initialization previously failed");
+            }
+            if let Err(error) = self.init_guest_memory(frame_allocator) {
+                self.guest_memory_initialization_failed = true;
+                return Err(error);
+            }
+            self.guest_memory_initialized = true;
+        }
 
         common::linux::load_kernel(self)?;
 
@@ -815,6 +836,9 @@ impl VCpu for IntelVCpu {
             self.activated = true;
         }
 
+        self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
+        self.pic.poll_serial_input();
+
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
         self.vmexit_handler()?;
@@ -824,6 +848,23 @@ impl VCpu for IntelVCpu {
 
     fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str> {
         self.ept.set(addr, data)
+    }
+
+    fn reset(&mut self) -> Result<(), &'static str> {
+        if self.guest_memory_initialization_failed {
+            return Err("Guest memory initialization previously failed");
+        }
+        self.launch_done = false;
+        self.activated = false;
+        self.guest_registers = GuestRegisters::default();
+        self.guest_fx_state = FxState::guest_default();
+        self.host_msr = ShadowMsr::new();
+        self.guest_msr = ShadowMsr::new();
+        self.ia32e_enabled = false;
+        self.pic = super::io::Pic::new();
+        self.host_pending_irq.store(0, Ordering::Release);
+        self.guest_xcr0 = XCR0::from(1);
+        Ok(())
     }
 
     fn write_memory_ranged(
@@ -880,11 +921,15 @@ impl VCpu for IntelVCpu {
             host_xsave_mask,
             host_xsave_state,
             activated: false,
+            guest_memory_initialized: false,
+            guest_memory_initialization_failed: false,
+            interrupt_subscribed: false,
+            host_pending_irq: AtomicU16::new(0),
             vmxon,
             vmcs,
             ept,
             eptp,
-            guest_memory_size: 1024 * 1024 * 256, // 256 MiB
+            guest_memory_size: 1024 * 1024 * 128, // 128 MiB
             host_msr: ShadowMsr::new(),
             guest_msr: ShadowMsr::new(),
             ia32e_enabled: false,

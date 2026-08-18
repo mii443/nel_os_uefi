@@ -28,6 +28,8 @@ use crate::{
 
 pub struct AMDVCpu {
     initialized: bool,
+    guest_memory_initialized: bool,
+    guest_memory_initialization_failed: bool,
     exit_reported: bool,
     vmcb: Vmcb,
     hsave: PhysFrame,
@@ -38,6 +40,7 @@ pub struct AMDVCpu {
     legacy_timer: LegacyTimer,
     halted: bool,
     tsc_aux: u64,
+    nb_cfg: u64,
     host_patch_level: u64,
     guest_registers: GuestRegisters,
     host_fx_state: FxState,
@@ -101,6 +104,10 @@ impl SerialState {
         self.rx_head = (self.rx_head + 1) % self.rx.len();
         self.rx_len -= 1;
         value
+    }
+
+    fn rx_remaining(&self) -> usize {
+        self.rx.len() - self.rx_len
     }
 
     fn clear_rx(&mut self) {
@@ -411,9 +418,6 @@ impl PitChannel0 {
     }
 
     fn write_control(&mut self, value: u8) {
-        if value >> 6 != 0 {
-            return;
-        }
         let access_mode = (value >> 4) & 3;
         if access_mode == 0 {
             self.read_latch = Some(self.current_count());
@@ -475,11 +479,17 @@ impl PitChannel0 {
         }
         true
     }
+
+    fn output_high(&self) -> bool {
+        !self.armed || Self::rdtsc() >= self.deadline
+    }
 }
 
 struct LegacyTimer {
     pic: PicState,
     pit: PitChannel0,
+    pit_channel2: PitChannel0,
+    speaker_control: u8,
 }
 
 impl LegacyTimer {
@@ -487,11 +497,34 @@ impl LegacyTimer {
         Self {
             pic: PicState::new(),
             pit: PitChannel0::new(tsc_khz),
+            pit_channel2: PitChannel0::new(tsc_khz),
+            speaker_control: 0,
         }
+    }
+
+    fn write_pit_control(&mut self, value: u8) {
+        match value >> 6 {
+            0 => self.pit.write_control(value),
+            2 => self.pit_channel2.write_control(value),
+            _ => {}
+        }
+    }
+
+    fn speaker_status(&self) -> u8 {
+        let output = if self.speaker_control & 1 != 0 && self.pit_channel2.output_high() {
+            1 << 5
+        } else {
+            0
+        };
+        self.speaker_control | output
+    }
+
+    fn write_speaker_control(&mut self, value: u8) {
+        self.speaker_control = value & 0x03;
     }
 }
 
-const GUEST_MEMORY_SIZE: u64 = 256 * 1024 * 1024;
+const GUEST_MEMORY_SIZE: u64 = 128 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
 
 impl AMDVCpu {
@@ -512,7 +545,16 @@ impl AMDVCpu {
             return Err("SVM pause filter is required for AMD timer preemption");
         }
 
-        self.init_guest_memory(frame_allocator)?;
+        if !self.guest_memory_initialized {
+            if self.guest_memory_initialization_failed {
+                return Err("Guest memory initialization previously failed");
+            }
+            if let Err(error) = self.init_guest_memory(frame_allocator) {
+                self.guest_memory_initialization_failed = true;
+                return Err(error);
+            }
+            self.guest_memory_initialized = true;
+        }
         common::linux::load_kernel(self)?;
         self.setup_linux_segments();
 
@@ -865,7 +907,8 @@ impl AMDVCpu {
         // outer UART until the guest completes 8250 auto-configuration.
         if self.serial.mcr & 0x10 == 0 {
             let mut input = [0; 16];
-            let received = serial::poll_input(&mut input);
+            let capacity = self.serial.rx_remaining().min(input.len());
+            let received = serial::poll_guest_input(&mut input[..capacity]);
             for &value in &input[..received] {
                 self.serial.enqueue_rx(value);
             }
@@ -987,6 +1030,8 @@ impl AMDVCpu {
         if is_input {
             let value = match (port, size) {
                 (0x40, 1) => self.legacy_timer.pit.read() as u32,
+                (0x42, 1) => self.legacy_timer.pit_channel2.read() as u32,
+                (0x61, 1) => self.legacy_timer.speaker_status() as u32,
                 (0x70, 1) => self.rtc.read_selector() as u32,
                 (0x71, 1) => self.rtc.read_data() as u32,
                 (0x20 | 0x21 | 0xa0 | 0xa1, 1) => self.legacy_timer.pic.read(port) as u32,
@@ -1008,9 +1053,15 @@ impl AMDVCpu {
         } else if size == 1 && port == 0x40 {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.legacy_timer.pit.write(value);
+        } else if size == 1 && port == 0x42 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.legacy_timer.pit_channel2.write(value);
         } else if size == 1 && port == 0x43 {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
-            self.legacy_timer.pit.write_control(value);
+            self.legacy_timer.write_pit_control(value);
+        } else if size == 1 && port == 0x61 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
+            self.legacy_timer.write_speaker_control(value);
         } else if size == 1 && port == 0x70 {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.rtc.select(value);
@@ -1055,7 +1106,7 @@ impl AMDVCpu {
                 if self.serial.mcr & 0x10 != 0 {
                     self.serial.enqueue_rx(value);
                 } else {
-                    serial::write_raw_byte(value);
+                    serial::write_guest_raw_byte(value);
                 }
                 self.serial.thre_interrupt_pending = self.serial.ier & 0x02 != 0;
             }
@@ -1084,6 +1135,7 @@ impl AMDVCpu {
         const PAT: u32 = 0x277;
         const PATCH_LEVEL: u32 = 0x8b;
         const TSC_AUX: u32 = 0xc000_0103;
+        const AMD64_NB_CFG: u32 = 0xc001_001f;
 
         let is_write = self.vmcb.get_raw_vmcb().control_area.exit_info1 & 1 != 0;
         let index = self.guest_registers.rcx as u32;
@@ -1105,6 +1157,10 @@ impl AMDVCpu {
                 SYSENTER_EIP => state.sysenter_eip = value,
                 PAT => state.g_pat = value,
                 TSC_AUX => self.tsc_aux = value,
+                // Linux uses bit 46 to enable extended CF8 PCI config-space
+                // addressing on AMD systems. PCI is hidden from this guest,
+                // but preserving the virtual bit avoids an unchecked #GP.
+                AMD64_NB_CFG => self.nb_cfg = value & (1 << 46),
                 _ => {
                     info!(
                         "Unsupported AMD guest WRMSR: index={:#x} value={:#x}",
@@ -1135,6 +1191,7 @@ impl AMDVCpu {
                 // created; guest accesses never pass through to the host MSR.
                 PATCH_LEVEL => self.host_patch_level,
                 TSC_AUX => self.tsc_aux,
+                AMD64_NB_CFG => self.nb_cfg,
                 _ => {
                     info!("Unsupported AMD guest RDMSR: {:#x}", index);
                     self.inject_exception(13, Some(0));
@@ -1221,90 +1278,126 @@ impl VCpu for AMDVCpu {
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
-        interrupts::without_interrupts(|| unsafe {
-            if !self.initialized {
-                self.setup(frame_allocator)?;
-                self.initialized = true;
-            }
+        interrupts::without_interrupts(|| {
+            let result = (|| unsafe {
+                if !self.initialized {
+                    self.setup(frame_allocator)?;
+                    self.initialized = true;
+                }
 
-            {
-                let vmcb = self.vmcb.get_raw_vmcb();
-                vmcb.control_area.exit_code = 0;
-                vmcb.control_area.exit_info1 = 0;
-                vmcb.control_area.exit_info2 = 0;
-                vmcb.control_area.exit_int_info = 0;
-                vmcb.control_area.tlb_control = 0;
-            }
+                {
+                    let vmcb = self.vmcb.get_raw_vmcb();
+                    vmcb.control_area.exit_code = 0;
+                    vmcb.control_area.exit_info1 = 0;
+                    vmcb.control_area.exit_info2 = 0;
+                    vmcb.control_area.exit_int_info = 0;
+                    vmcb.control_area.tlb_control = 0;
+                }
 
-            self.poll_host_serial();
-            self.prepare_device_interrupt()?;
-            if self.halted && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
-            {
-                // Avoid repeatedly entering an intercepted HLT while no event
-                // is deliverable. Returning restores host interrupts between
-                // bounded device polls.
-                return Ok(());
-            }
+                self.poll_host_serial();
+                self.prepare_device_interrupt()?;
+                if self.halted
+                    && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
+                {
+                    // Avoid repeatedly entering an intercepted HLT while no event
+                    // is deliverable. Returning restores host interrupts between
+                    // bounded device polls.
+                    return Ok(());
+                }
 
-            write_msr(0xC001_0117, self.hsave.start_address().as_u64());
+                write_msr(0xC001_0117, self.hsave.start_address().as_u64());
 
-            self.host_xsave_state.save_host_and_load_guest(3)?;
+                self.host_xsave_state.save_host_and_load_guest(3)?;
 
-            super::asm::asm_vmrun(
-                self.vmcb.frame.start_address().as_u64(),
-                &mut self.guest_registers,
-                &mut self.host_fx_state,
-                &mut self.guest_fx_state,
-                self.host_xsave_addr,
-                self.host_xsave_mask,
-            );
-
-            if self.preserve_interrupted_event()? {
-                // Delivery of EXITINTINFO takes precedence over handling the
-                // coincident VMEXIT. Leave RIP and the intercepted instruction
-                // untouched; after the event handler returns, that instruction
-                // executes again and produces a fresh exit to handle normally.
-                return Ok(());
-            }
-
-            let vmcb = self.vmcb.get_raw_vmcb();
-            let exit_code = vmcb.control_area.exit_code;
-            if !self.exit_reported || !matches!(exit_code, 0x72 | 0x77 | 0x78 | 0x7b | 0x7c) {
-                info!(
-                    "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
-                    exit_code,
-                    vmcb.control_area.exit_info1,
-                    vmcb.control_area.exit_info2,
-                    vmcb.control_area.next_rip
+                super::asm::asm_vmrun(
+                    self.vmcb.frame.start_address().as_u64(),
+                    &mut self.guest_registers,
+                    &mut self.host_fx_state,
+                    &mut self.guest_fx_state,
+                    self.host_xsave_addr,
+                    self.host_xsave_mask,
                 );
-                self.exit_reported = true;
-            }
 
-            match exit_code as u32 {
-                0x72 => {
-                    self.handle_cpuid();
-                    Ok(())
+                if self.preserve_interrupted_event()? {
+                    // Delivery of EXITINTINFO takes precedence over handling the
+                    // coincident VMEXIT. Leave RIP and the intercepted instruction
+                    // untouched; after the event handler returns, that instruction
+                    // executes again and produces a fresh exit to handle normally.
+                    return Ok(());
                 }
-                0x77 => self.advance_guest_rip(),
-                0x78 => {
-                    // Poll on the intercepted HLT until an interrupt is
-                    // deliverable. IRQ injection advances to NRIP.
-                    self.halted = true;
-                    Ok(())
+
+                let vmcb = self.vmcb.get_raw_vmcb();
+                let exit_code = vmcb.control_area.exit_code;
+                if !self.exit_reported || !matches!(exit_code, 0x72 | 0x77 | 0x78 | 0x7b | 0x7c) {
+                    info!(
+                        "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
+                        exit_code,
+                        vmcb.control_area.exit_info1,
+                        vmcb.control_area.exit_info2,
+                        vmcb.control_area.next_rip
+                    );
+                    self.exit_reported = true;
                 }
-                0x7b => self.handle_io(),
-                0x7c => self.handle_msr(),
-                0x8c => Err("AMD guest attempted unsupported XSETBV"),
-                0x7f => Err("AMD guest shutdown (likely a triple fault)"),
-                0x400 => Err("AMD nested page fault"),
-                u32::MAX => Err("VMRUN rejected the VMCB guest state"),
-                _ => Err("Unhandled AMD VMEXIT"),
+
+                match exit_code as u32 {
+                    0x72 => {
+                        self.handle_cpuid();
+                        Ok(())
+                    }
+                    0x77 => self.advance_guest_rip(),
+                    0x78 => {
+                        // Poll on the intercepted HLT until an interrupt is
+                        // deliverable. IRQ injection advances to NRIP.
+                        self.halted = true;
+                        Ok(())
+                    }
+                    0x7b => self.handle_io(),
+                    0x7c => self.handle_msr(),
+                    0x8c => Err("AMD guest attempted unsupported XSETBV"),
+                    0x7f => Err("AMD guest shutdown (likely a triple fault)"),
+                    0x400 => Err("AMD nested page fault"),
+                    u32::MAX => Err("VMRUN rejected the VMCB guest state"),
+                    _ => Err("Unhandled AMD VMEXIT"),
+                }
+            })();
+
+            // VMRUN sets GIF while the guest executes and VMEXIT clears it.
+            // Restore GIF before `without_interrupts` restores IF: enabling IF
+            // first leaves a window where a pending LAPIC timer cannot be
+            // delivered and can strand the management loop after `vm stop`.
+            unsafe {
+                core::arch::asm!("stgi", options(nomem, nostack, preserves_flags));
             }
+            result
         })
     }
 
     fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str> {
         self.npt.set(addr, data)
+    }
+
+    fn reset(&mut self) -> Result<(), &'static str> {
+        if self.guest_memory_initialization_failed {
+            return Err("Guest memory initialization previously failed");
+        }
+        let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .ok_or("TSC frequency unavailable for AMD VCPU reset")?;
+        self.initialized = false;
+        self.exit_reported = false;
+        self.serial = SerialState::default();
+        self.rtc = RtcState::new();
+        self.legacy_timer = LegacyTimer::new(tsc_khz);
+        self.halted = false;
+        self.tsc_aux = 0;
+        self.nb_cfg = 0;
+        self.guest_registers = GuestRegisters::default();
+        self.guest_fx_state = FxState::guest_default();
+        unsafe {
+            core::ptr::write_bytes(self.vmcb.frame.start_address().as_u64() as *mut u8, 0, 4096);
+        }
+        Ok(())
     }
 
     fn write_memory_ranged(
@@ -1362,6 +1455,8 @@ impl VCpu for AMDVCpu {
 
         Ok(AMDVCpu {
             initialized: false,
+            guest_memory_initialized: false,
+            guest_memory_initialization_failed: false,
             exit_reported: false,
             vmcb: Vmcb::new(frame_allocator)?,
             hsave,
@@ -1372,6 +1467,7 @@ impl VCpu for AMDVCpu {
             legacy_timer: LegacyTimer::new(tsc_khz),
             halted: false,
             tsc_aux: 0,
+            nb_cfg: 0,
             host_patch_level,
             guest_registers: GuestRegisters::default(),
             host_fx_state: FxState::zeroed(),
@@ -1439,8 +1535,11 @@ mod tests {
         }
         uart.enqueue_rx(0xaa);
         assert_eq!(uart.rx_len, 256);
+        assert_eq!(uart.rx_remaining(), 0);
         assert!(uart.overrun);
-        for value in 0..=u8::MAX {
+        assert_eq!(uart.dequeue_rx(), 0);
+        assert_eq!(uart.rx_remaining(), 1);
+        for value in 1..=u8::MAX {
             assert_eq!(uart.dequeue_rx(), value);
         }
         assert_eq!(uart.rx_len, 0);
