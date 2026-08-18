@@ -7,6 +7,7 @@ use crate::{info, interrupt::idt::IRQ_TIMER};
 
 pub static LAPIC: Once<LocalApic> = Once::new();
 pub static GUEST_TSC_KHZ: Once<u64> = Once::new();
+static HOST_TIMER_INITIAL_COUNT: Once<u32> = Once::new();
 
 pub fn disable_pic_8259() {
     unsafe {
@@ -130,9 +131,11 @@ pub fn init_local_apic(platform_info: PlatformInfo<'_, Global>) {
         info!("TSC calibrated at {} kHz using ACPI PM timer", tsc_khz);
     }
 
+    let timer_initial_count = (local_apic_freq / 250).max(1);
+    HOST_TIMER_INITIAL_COUNT.call_once(|| timer_initial_count);
     local_apic.write(TDCR, X1);
     local_apic.write(TIMER, PERIODIC | IRQ_TIMER);
-    local_apic.write(TICR, local_apic_freq / 250);
+    local_apic.write(TICR, timer_initial_count);
 
     local_apic.write(LINT0, MASKED);
     local_apic.write(LINT1, MASKED);
@@ -149,4 +152,22 @@ pub fn init_local_apic(platform_info: PlatformInfo<'_, Global>) {
     while local_apic.read(ICRLO) & DELIVS != 0 {}
 
     local_apic.write(TPR, 0);
+}
+
+/// Restores the periodic host timer before an idle HLT. Nested virtualization
+/// can leave the L1 LAPIC timer stopped after an L2 run even though its LVT
+/// configuration still looks valid, so do not rely on the old current count.
+pub fn rearm_management_timer() {
+    let (Some(local_apic), Some(initial_count)) = (LAPIC.get(), HOST_TIMER_INITIAL_COUNT.get())
+    else {
+        return;
+    };
+    // An L0 hypervisor can acknowledge the physical timer while L1 is in
+    // VMRUN, then return to L1 without running its timer handler.  Clear that
+    // stale in-service entry before HLT; otherwise the equal-priority periodic
+    // timer remains in IRR and the stopped management loop never wakes again.
+    local_apic.write(EOI, 0);
+    local_apic.write(TDCR, X1);
+    local_apic.write(TIMER, PERIODIC | IRQ_TIMER);
+    local_apic.write(TICR, *initial_count);
 }

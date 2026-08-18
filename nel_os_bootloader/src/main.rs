@@ -4,10 +4,11 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, vec, vec::Vec};
-use core::{arch::asm, slice};
+use core::slice;
 use goblin::elf;
 use nel_os_common::{gop, memory};
 use uefi::{
+    CStr16,
     allocator::Allocator,
     boot::{AllocateType, MemoryType, ScopedProtocol},
     mem::memory_map::MemoryMap,
@@ -20,19 +21,10 @@ use uefi::{
             fs::SimpleFileSystem,
         },
     },
-    CStr16,
 };
 
 #[global_allocator]
 static ALLOCATOR: Allocator = Allocator;
-
-fn hlt_loop() -> ! {
-    loop {
-        unsafe {
-            asm!("hlt");
-        }
-    }
-}
 
 fn get_fs() -> Directory {
     let mut fs: ScopedProtocol<SimpleFileSystem> =
@@ -190,7 +182,7 @@ fn main() -> Status {
 
     println!("Entry point: {:#x}", entry_point);
 
-    let entry: extern "sysv64" fn(&nel_os_common::BootInfo) =
+    let entry: extern "sysv64" fn(&nel_os_common::BootInfo) -> ! =
         unsafe { core::mem::transmute(entry_point) };
 
     let frame_buffer = get_frame_buffer();
@@ -241,6 +233,4 @@ fn main() -> Status {
         rootfs_addr,
         rootfs_size,
     });
-
-    hlt_loop();
 }

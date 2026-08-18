@@ -11,10 +11,14 @@ pub mod cpuid;
 pub mod graphics;
 pub mod interrupt;
 pub mod logging;
+mod management;
 pub mod memory;
+pub mod network;
 pub mod platform;
 pub mod serial;
+mod serial_console;
 pub mod time;
+mod vm_control;
 pub mod vmm;
 
 use core::arch::asm;
@@ -23,12 +27,12 @@ use core::ptr::addr_of;
 
 use ::acpi::AcpiTables;
 use spin::Once;
-use x86_64::{registers::control::Cr3, structures::paging::OffsetPageTable, VirtAddr};
+use x86_64::{VirtAddr, registers::control::Cr3, structures::paging::OffsetPageTable};
 
 use crate::{
     acpi::KernelAcpiHandler,
     constant::{KERNEL_STACK_SIZE, PKG_VERSION},
-    graphics::{FrameBuffer, FRAME_BUFFER},
+    graphics::{FRAME_BUFFER, FrameBuffer},
     interrupt::apic,
     memory::{allocator, bitmap::BitmapMemoryTable, paging},
 };
@@ -49,7 +53,7 @@ static mut KERNEL_STACK: AlignedStack = AlignedStack {
 };
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn asm_main() -> ! {
+pub extern "sysv64" fn asm_main(boot_info: &nel_os_common::BootInfo) -> ! {
     unsafe {
         let stack_base = addr_of!(KERNEL_STACK.stack) as *const u8;
         let stack_top = stack_base.add(KERNEL_STACK_SIZE);
@@ -58,11 +62,12 @@ pub extern "sysv64" fn asm_main() -> ! {
             "mov rsp, {stack_top}",
             "call {main}",
             stack_top = in(reg) stack_top,
-            main = sym main
+            main = sym main,
+            in("rdi") boot_info,
+            clobber_abi("sysv64"),
+            options(noreturn),
         )
     }
-
-    hlt_loop();
 }
 
 #[panic_handler]
@@ -81,7 +86,8 @@ fn hlt_loop() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
+pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
+    let boot_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     serial::disable_screen_output();
 
     interrupt::gdt::init();
@@ -180,16 +186,26 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) {
     ROOTFS_ADDR.call_once(|| boot_info.rootfs_addr);
     ROOTFS_SIZE.call_once(|| boot_info.rootfs_size);
 
-    let mut vcpu = vmm::get_vcpu(&mut bitmap_table).unwrap();
-
-    info!("Running guest VM...");
-    loop {
-        let result = vcpu.run(&mut bitmap_table);
-        if let Err(e) = result {
-            error!("VCPU run failed: {}", e);
-            break;
+    // The physical NIC is owned by the outer kernel. It is initialized before
+    // guest RAM is created, and is never mapped into EPT/NPT or represented by
+    // the guest's deliberately empty PCI model.
+    let network_device = match network::VirtioNet::probe(&mut bitmap_table) {
+        Ok(device) => Some(device),
+        Err(error) => {
+            error!("Hypervisor network unavailable: {}", error);
+            warn!("TCP management is disabled; the local serial shell remains available");
+            None
         }
+    };
+
+    if network_device.is_some() {
+        info!(
+            "Linux VM is stopped; management shell will listen on TCP port {} after DHCP",
+            network::CONTROL_PORT
+        );
+    } else {
+        info!("Linux VM is stopped; use the local serial management shell");
     }
 
-    hlt_loop();
+    vm_control::VmController::new(network_device, usable_frame, boot_tsc).run(&mut bitmap_table);
 }

@@ -22,6 +22,10 @@ pub trait VCpu {
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str>;
 
+    /// Returns the existing VCPU and guest RAM to its boot state. Implementors
+    /// must retain already allocated guest-memory mappings.
+    fn reset(&mut self) -> Result<(), &'static str>;
+
     fn write_memory(&mut self, addr: u64, data: u8) -> Result<(), &'static str>;
     fn write_memory_ranged(
         &mut self,

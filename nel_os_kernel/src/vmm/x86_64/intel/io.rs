@@ -1,26 +1,68 @@
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use x86::vmx::{self, vmcs};
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
 use super::qual::QualIo;
 use crate::{
     info,
-    interrupt::subscriber::InterruptContext,
+    interrupt::{idt::IRQ_TIMER, subscriber::InterruptContext},
     serial,
     vmm::x86_64::intel::{
         register::GuestRegisters, vmcs::controls::EntryIntrInfo, vmread, vmwrite,
     },
 };
 
-pub fn vmm_interrupt_subscriber(vcpu_ptr: *mut core::ffi::c_void, context: &InterruptContext) {
-    if vcpu_ptr.is_null() {
+fn interrupt_vector_to_irq(vector: u8) -> Option<u8> {
+    if vector == IRQ_TIMER as u8 {
+        return Some(0);
+    }
+
+    if (0x20..0x30).contains(&vector) {
+        return Some(vector - 0x20);
+    }
+
+    None
+}
+
+pub fn vmm_interrupt_subscriber(pending_ptr: *mut core::ffi::c_void, context: &InterruptContext) {
+    if pending_ptr.is_null() {
         return;
     }
 
-    let vcpu = unsafe { &mut *(vcpu_ptr as *mut super::vcpu::IntelVCpu) };
+    let Some(irq) = interrupt_vector_to_irq(context.vector) else {
+        return;
+    };
+    debug_assert!(irq < u16::BITS as u8);
 
-    if 0x20 <= context.vector && context.vector <= 0x20 + 16 {
-        let irq = context.vector - 0x20;
-        vcpu.pic.pending_irq |= 1 << irq;
+    // The callback may preempt normal VCPU work. Only touch this atomic
+    // interrupt latch here; materializing `&mut IntelVCpu` from the subscriber
+    // context would alias the main loop's mutable reference.
+    let pending = unsafe { &*(pending_ptr as *const AtomicU16) };
+    pending.fetch_or(1u16 << irq, Ordering::Release);
+}
+
+#[cfg(test)]
+mod interrupt_vector_tests {
+    use super::{Serial, interrupt_vector_to_irq};
+
+    #[test]
+    fn maps_pic_and_host_timer_vectors_without_overflow() {
+        assert_eq!(interrupt_vector_to_irq(0x20), Some(0));
+        assert_eq!(interrupt_vector_to_irq(0x2f), Some(15));
+        assert_eq!(interrupt_vector_to_irq(0x30), Some(0));
+        assert_eq!(interrupt_vector_to_irq(0x31), None);
+    }
+
+    #[test]
+    fn uart_rx_capacity_tracks_dequeues() {
+        let mut uart = Serial::default();
+        for value in 0..=u8::MAX {
+            uart.enqueue(value);
+        }
+        assert_eq!(uart.remaining(), 0);
+        assert_eq!(uart.dequeue(), 0);
+        assert_eq!(uart.remaining(), 1);
     }
 }
 
@@ -38,10 +80,61 @@ pub enum ReadSel {
     Isr,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Serial {
     pub ier: u8,
     pub mcr: u8,
+    lcr: u8,
+    scratch: u8,
+    divisor_low: u8,
+    divisor_high: u8,
+    rx: [u8; 256],
+    rx_head: usize,
+    rx_len: usize,
+    overrun: bool,
+}
+
+impl Default for Serial {
+    fn default() -> Self {
+        Self {
+            ier: 0,
+            mcr: 0,
+            lcr: 0,
+            scratch: 0,
+            divisor_low: 0,
+            divisor_high: 0,
+            rx: [0; 256],
+            rx_head: 0,
+            rx_len: 0,
+            overrun: false,
+        }
+    }
+}
+
+impl Serial {
+    fn enqueue(&mut self, byte: u8) {
+        if self.rx_len == self.rx.len() {
+            self.overrun = true;
+            return;
+        }
+        let tail = (self.rx_head + self.rx_len) % self.rx.len();
+        self.rx[tail] = byte;
+        self.rx_len += 1;
+    }
+
+    fn dequeue(&mut self) -> u8 {
+        if self.rx_len == 0 {
+            return 0;
+        }
+        let byte = self.rx[self.rx_head];
+        self.rx_head = (self.rx_head + 1) % self.rx.len();
+        self.rx_len -= 1;
+        byte
+    }
+
+    fn remaining(&self) -> usize {
+        self.rx.len() - self.rx_len
+    }
 }
 
 pub struct Pic {
@@ -104,6 +197,20 @@ impl Pic {
         }
 
         Ok(())
+    }
+
+    pub fn poll_serial_input(&mut self) {
+        if self.serial.mcr & 0x10 == 0 {
+            let mut input = [0; 16];
+            let capacity = self.serial.remaining().min(input.len());
+            let received = serial::poll_guest_input(&mut input[..capacity]);
+            for &byte in &input[..received] {
+                self.serial.enqueue(byte);
+            }
+        }
+        if self.serial.mcr & 0x08 != 0 && self.serial.ier & 1 != 0 && self.serial.rx_len != 0 {
+            self.pending_irq |= 1 << 4;
+        }
     }
 
     pub fn inject_external_interrupt(&mut self) -> Result<bool, &'static str> {
@@ -202,10 +309,14 @@ impl Pic {
         Ok(())
     }
 
-    fn handle_io_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
+    fn handle_io_in(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x0CF8..=0x0CFF => regs.rax = 0,
-            0xC000..=0xCFFF => {} //ignore
+            // The outer kernel owns physical PCI and virtio I/O. Config-data
+            // reads return the architectural "no device" value and physical
+            // device BARs are never forwarded into the guest.
+            0x0CF8..=0x0CFB => regs.rax = 0,
+            0x0CFC..=0x0CFF => regs.rax = u32::MAX as u64,
+            0xC000..=0xCFFF => regs.rax = u32::MAX as u64,
             0x20..=0x21 => self.handle_pic_in(regs, qual),
             0xA0..=0xA1 => self.handle_pic_in(regs, qual),
             0x0070..=0x0071 => regs.rax = 0,
@@ -226,17 +337,36 @@ impl Pic {
         }
     }
 
-    fn handle_serial_in(&self, regs: &mut GuestRegisters, qual: QualIo) {
+    fn handle_serial_in(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            // No emulated receive FIFO is currently connected.
-            0x3F8 => regs.rax = 0,
+            0x3F8 if self.serial.lcr & 0x80 != 0 => {
+                regs.rax = self.serial.divisor_low as u64
+            }
+            0x3F8 => regs.rax = self.serial.dequeue() as u64,
+            0x3F9 if self.serial.lcr & 0x80 != 0 => {
+                regs.rax = self.serial.divisor_high as u64
+            }
             0x3F9 => regs.rax = self.serial.ier as u64,
-            0x3FA => {}
-            0x3FB => {} //regs.rax = 0,
-            0x3FC => {} //regs.rax = 0, //self.serial.mcr as u64,
+            0x3FA => {
+                regs.rax = if self.serial.rx_len != 0 && self.serial.ier & 1 != 0 {
+                    0x04
+                } else {
+                    0x01
+                }
+            }
+            0x3FB => regs.rax = self.serial.lcr as u64,
+            0x3FC => regs.rax = self.serial.mcr as u64,
             0x3FD => {
                 if qual.size() == 1 {
-                    regs.rax = 0x60
+                    let mut status = 0x60;
+                    if self.serial.rx_len != 0 {
+                        status |= 1;
+                    }
+                    if self.serial.overrun {
+                        status |= 2;
+                        self.serial.overrun = false;
+                    }
+                    regs.rax = status;
                 }
             }
             0x3FE => {
@@ -244,25 +374,43 @@ impl Pic {
                     regs.rax = 0xb0
                 }
             }
-            0x3FF => {} //regs.rax = 0,
+            0x3FF => regs.rax = self.serial.scratch as u64,
             _ => regs.rax = 0,
         }
     }
 
     fn handle_serial_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x3F8 => serial::write_byte(regs.rax as u8),
+            0x3F8 if self.serial.lcr & 0x80 != 0 => {
+                self.serial.divisor_low = regs.rax as u8
+            }
+            0x3F8 => {
+                let byte = regs.rax as u8;
+                if self.serial.mcr & 0x10 != 0 {
+                    self.serial.enqueue(byte);
+                } else {
+                    serial::write_guest_raw_byte(byte);
+                }
+            }
+            0x3F9 if self.serial.lcr & 0x80 != 0 => {
+                self.serial.divisor_high = regs.rax as u8
+            }
             0x3F9 => {
                 self.serial.ier = regs.rax as u8;
                 if regs.rax & 0b10 != 0 {
                     self.pending_irq |= 1 << 4;
                 }
             }
-            0x3FA => {}
-            0x3FB => {}
+            0x3FA => {
+                if regs.rax as u8 & 0x02 != 0 {
+                    self.serial.rx_head = 0;
+                    self.serial.rx_len = 0;
+                }
+            }
+            0x3FB => self.serial.lcr = regs.rax as u8,
             0x3FC => self.serial.mcr = regs.rax as u8,
             0x3FD => {}
-            0x3FF => {}
+            0x3FF => self.serial.scratch = regs.rax as u8,
             _ => {}
         }
     }
