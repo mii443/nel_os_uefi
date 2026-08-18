@@ -128,7 +128,9 @@ fn check_ept_violation_exception_info() -> Result<(), &'static str> {
         let exception_info = vmread(vmcs::control::VIRT_EXCEPTION_INFO_ADDR_FULL)?;
 
         if is_valid_page_aligned_phys_addr(exception_info) {
-            return Err("VMCS Ept violation exception info address is not a valid page-aligned physical address");
+            return Err(
+                "VMCS Ept violation exception info address is not a valid page-aligned physical address",
+            );
         }
     }
 

@@ -3,8 +3,8 @@
 use core::convert::TryFrom;
 use core::fmt::Debug;
 
-use modular_bitfield::prelude::{B1, B16, B3, B32, B4, B9};
-use modular_bitfield::{bitfield, Specifier};
+use modular_bitfield::prelude::{B1, B3, B4, B9, B16, B32};
+use modular_bitfield::{Specifier, bitfield};
 
 #[repr(u8)]
 #[derive(Specifier, Debug, Clone, Copy, PartialEq, Eq)]

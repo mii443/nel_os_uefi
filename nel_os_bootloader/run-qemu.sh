@@ -102,7 +102,7 @@ run_qemu() {
     fi
 
     qemu-system-x86_64 "$@" \
-        -m 512M \
+        -m 1G \
         -serial mon:stdio \
         -nographic \
         -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd \

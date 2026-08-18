@@ -4,22 +4,24 @@ use core::{
 };
 
 use raw_cpuid::cpuid;
+use spin::Once;
 use x86_64::{
+    VirtAddr,
     registers::control::{Cr4, Cr4Flags},
     structures::paging::{FrameAllocator, Size4KiB},
-    VirtAddr,
 };
 
 use crate::{
     constant::PAGE_SIZE,
     info, interrupt,
     vmm::{
+        VCpu,
         x86_64::{
-            common::{self, fxsave::FxState, read_msr, xsave::HostXsaveState, X86VCpu},
+            common::{self, X86VCpu, fxsave::FxState, read_msr, xsave::HostXsaveState},
             intel::{
                 auditor, controls, cpuid, ept,
                 fpu::{self, XCR0},
-                io::{vmm_interrupt_subscriber, IOBitmap},
+                io::{IOBitmap, vmm_interrupt_subscriber},
                 msr::{self, ShadowMsr},
                 qual::{QualCr, QualIo},
                 register::GuestRegisters,
@@ -32,16 +34,21 @@ use crate::{
                 vmread, vmwrite, vmxon,
             },
         },
-        VCpu,
     },
 };
 const TEMP_STACK_SIZE: usize = 4096;
 static mut TEMP_STACK: [u8; TEMP_STACK_SIZE + 0x10] = [0; TEMP_STACK_SIZE + 0x10];
+static VMXON_REGION: Once<Result<vmxon::Vmxon, &'static str>> = Once::new();
 
 #[repr(C)]
 pub struct IntelVCpu {
     pub launch_done: bool,
     pub guest_registers: GuestRegisters,
+    // CR2 is not part of VMCS guest/host state.  Preserve it explicitly so
+    // that a page fault interrupted by a time-slice VMEXIT cannot observe a
+    // different VM's fault address after scheduling resumes.
+    pub host_cr2: u64,
+    pub guest_cr2: u64,
     pub host_fx_state: FxState,
     pub guest_fx_state: FxState,
     pub host_xsave_addr: u64,
@@ -51,12 +58,13 @@ pub struct IntelVCpu {
     guest_memory_initialized: bool,
     guest_memory_initialization_failed: bool,
     interrupt_subscribed: bool,
+    halted: bool,
     host_pending_irq: AtomicU16,
-    vmxon: vmxon::Vmxon,
     vmcs: vmcs::Vmcs,
     ept: ept::Ept,
     eptp: ept::Eptp,
     guest_memory_size: u64,
+    guest_memory_allocated: u64,
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
     pub ia32e_enabled: bool,
@@ -93,23 +101,17 @@ impl IntelVCpu {
             let exit_reason: VmxExitReason = basic_reason
                 .try_into()
                 .map_err(|_| "Unknown VMX exit reason")?;
+            let interrupted_event = self.preserve_interrupted_event()?;
 
             match exit_reason {
                 VmxExitReason::HLT => {
-                    let injected = self.pic.inject_external_interrupt().unwrap_or(false);
-
-                    if !injected {
-                        unsafe {
-                            asm!("sti");
-                            asm!("nop");
-                            asm!("cli");
-                        }
-                    }
-
+                    // VMX reports the intercepted HLT at the instruction RIP.
+                    // Retire it once, then keep the VCPU out of VM entry until
+                    // its own emulated device has a deliverable interrupt.
+                    self.step_next_inst()?;
                     vmwrite(vmcs::guest::ACTIVITY_STATE, 0)?;
                     vmwrite(vmcs::guest::INTERRUPTIBILITY_STATE, 0)?;
-
-                    self.step_next_inst()?;
+                    self.halted = true;
                 }
                 VmxExitReason::CPUID => {
                     cpuid::handle_cpuid_vmexit(self);
@@ -165,17 +167,11 @@ impl IntelVCpu {
                         self.pic.inject_exception(6, None)?;
                     }
                 }
-                VmxExitReason::EXTERNAL_INTERRUPT => {
-                    vmwrite(vmcs::ro::VMEXIT_INTERRUPTION_INFO, 0)?;
-
-                    unsafe {
-                        asm!("sti");
-                        asm!("nop");
-                        asm!("cli");
-                    }
-
-                    self.pic.inject_external_interrupt()?;
-                }
+                VmxExitReason::EXTERNAL_INTERRUPT => unsafe {
+                    asm!("sti");
+                    asm!("nop");
+                    asm!("cli");
+                },
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
                     info!("Ept Violation at guest address: {:#x}", guest_address);
@@ -186,6 +182,9 @@ impl IntelVCpu {
                     return Err("Triple fault");
                 }
                 VmxExitReason::EXCEPTION => {
+                    if interrupted_event {
+                        return Err("VMX exception collided with interrupted event delivery");
+                    }
                     let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO)?;
                     let vector = (vmexit_intr_info & 0xFF) as u32;
                     let has_error_code = (vmexit_intr_info & (1 << 11)) != 0;
@@ -241,6 +240,39 @@ impl IntelVCpu {
         }
 
         Ok(())
+    }
+
+    fn preserve_interrupted_event(&mut self) -> Result<bool, &'static str> {
+        use x86::vmx::vmcs;
+
+        let vectoring = vmread(vmcs::ro::IDT_VECTORING_INFO)?;
+        if vectoring & (1 << 31) == 0 {
+            return Ok(false);
+        }
+
+        let entry_info = vmread(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)?;
+        let reinjection = vectoring & 0x8000_0fff;
+        if entry_info & (1 << 31) != 0 && entry_info != reinjection {
+            return Err("VMX event delivery collided with a pending entry event");
+        }
+        vmwrite(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, reinjection)?;
+
+        if vectoring & (1 << 11) != 0 {
+            vmwrite(
+                vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
+                vmread(vmcs::ro::IDT_VECTORING_ERR_CODE)?,
+            )?;
+        }
+
+        let event_type = (vectoring >> 8) & 7;
+        if matches!(event_type, 4..=6) {
+            vmwrite(
+                vmcs::control::VMENTRY_INSTRUCTION_LEN,
+                vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN)?,
+            )?;
+        }
+
+        Ok(true)
     }
 
     fn load_guest_xcr0(&mut self) -> Result<(), &'static str> {
@@ -336,6 +368,7 @@ impl IntelVCpu {
         common::linux::load_kernel(self)?;
 
         msr::register_msrs(self).map_err(|_| "MSR error")?;
+        msr::_update_msrs(self).map_err(|_| "MSR error")?;
 
         let cr4 = Cr4::read() | Cr4Flags::OSFXSR;
         unsafe {
@@ -355,6 +388,8 @@ impl IntelVCpu {
         while pages > 0 {
             let frame = frame_allocator.allocate_frame().ok_or("No free frames")?;
             let hpa = frame.start_address().as_u64();
+            self.guest_memory_allocated =
+                self.guest_memory_allocated.saturating_add(PAGE_SIZE as u64);
 
             unsafe {
                 core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE);
@@ -826,7 +861,7 @@ impl IntelVCpu {
 }
 
 impl VCpu for IntelVCpu {
-    fn run(
+    fn prepare(
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
@@ -835,9 +870,29 @@ impl VCpu for IntelVCpu {
             self.dump_vmcs_settings()?;
             self.activated = true;
         }
+        Ok(())
+    }
+
+    fn run(
+        &mut self,
+        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        self.prepare(frame_allocator)?;
+        // A different VM may have made its VMCS current since this VM's
+        // previous time slice (or since this VM was created).
+        self.vmcs.load()?;
 
         self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
         self.pic.poll_serial_input();
+        self.pic.poll_timer();
+
+        let interrupt_injected = self.pic.inject_external_interrupt()?;
+        if self.halted {
+            if !interrupt_injected {
+                return Ok(());
+            }
+            self.halted = false;
+        }
 
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
@@ -857,11 +912,17 @@ impl VCpu for IntelVCpu {
         self.launch_done = false;
         self.activated = false;
         self.guest_registers = GuestRegisters::default();
+        self.guest_cr2 = 0;
         self.guest_fx_state = FxState::guest_default();
-        self.host_msr = ShadowMsr::new();
-        self.guest_msr = ShadowMsr::new();
+        self.host_msr.clear();
+        self.guest_msr.clear();
         self.ia32e_enabled = false;
-        self.pic = super::io::Pic::new();
+        let tsc_khz = interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .ok_or("TSC frequency unavailable for Intel VCPU reset")?;
+        self.pic = super::io::Pic::new(tsc_khz);
+        self.halted = false;
         self.host_pending_irq.store(0, Ordering::Release);
         self.guest_xcr0 = XCR0::from(1);
         Ok(())
@@ -884,7 +945,19 @@ impl VCpu for IntelVCpu {
         self.guest_memory_size
     }
 
-    fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str>
+    fn get_allocated_guest_memory_size(&self) -> u64 {
+        self.guest_memory_allocated
+    }
+
+    fn is_idle(&self) -> bool {
+        self.halted
+    }
+
+    fn new(
+        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        _vm_id: usize,
+        guest_memory_size: u64,
+    ) -> Result<Self, &'static str>
     where
         Self: Sized,
     {
@@ -900,9 +973,14 @@ impl VCpu for IntelVCpu {
             return Err("VMX is not enabled in the BIOS");
         }
 
-        let mut vmxon = vmxon::Vmxon::new(frame_allocator)?;
-
-        vmxon.activate()?;
+        match VMXON_REGION.call_once(|| {
+            let mut vmxon = vmxon::Vmxon::new(frame_allocator)?;
+            vmxon.activate()?;
+            Ok(vmxon)
+        }) {
+            Ok(_) => {}
+            Err(error) => return Err(*error),
+        }
 
         let vmcs = vmcs::Vmcs::new(frame_allocator)?;
 
@@ -911,10 +989,20 @@ impl VCpu for IntelVCpu {
         let host_xsave_state = HostXsaveState::new(frame_allocator)?;
         let host_xsave_addr = host_xsave_state.addr();
         let host_xsave_mask = host_xsave_state.mask();
+        let tsc_khz = interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .ok_or("TSC frequency unavailable for Intel VCPU")?;
+        let host_msr =
+            ShadowMsr::new(frame_allocator).map_err(|_| "Failed to allocate host MSR area")?;
+        let guest_msr =
+            ShadowMsr::new(frame_allocator).map_err(|_| "Failed to allocate guest MSR area")?;
 
         Ok(IntelVCpu {
             launch_done: false,
             guest_registers: GuestRegisters::default(),
+            host_cr2: 0,
+            guest_cr2: 0,
             host_fx_state: FxState::zeroed(),
             guest_fx_state: FxState::guest_default(),
             host_xsave_addr,
@@ -924,16 +1012,17 @@ impl VCpu for IntelVCpu {
             guest_memory_initialized: false,
             guest_memory_initialization_failed: false,
             interrupt_subscribed: false,
+            halted: false,
             host_pending_irq: AtomicU16::new(0),
-            vmxon,
             vmcs,
             ept,
             eptp,
-            guest_memory_size: 1024 * 1024 * 128, // 128 MiB
-            host_msr: ShadowMsr::new(),
-            guest_msr: ShadowMsr::new(),
+            guest_memory_size,
+            guest_memory_allocated: 0,
+            host_msr,
+            guest_msr,
             ia32e_enabled: false,
-            pic: super::io::Pic::new(),
+            pic: super::io::Pic::new(tsc_khz),
             io_bitmap: IOBitmap::new(frame_allocator),
             host_xcr0: host_xsave_mask,
             guest_xcr0: XCR0::from(1),

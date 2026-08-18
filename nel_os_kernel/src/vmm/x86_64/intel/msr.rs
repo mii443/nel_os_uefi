@@ -1,7 +1,8 @@
-use alloc::vec;
-use alloc::vec::Vec;
 use x86::vmx::vmcs;
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::{
+    PhysAddr,
+    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
+};
 
 use crate::info;
 use crate::vmm::x86_64::common::read_msr;
@@ -10,10 +11,12 @@ use crate::vmm::x86_64::intel::{vmread, vmwrite};
 
 type MsrIndex = u32;
 
-const MAX_NUM_ENTS: usize = 512;
+const MAX_NUM_ENTS: usize = 4096 / core::mem::size_of::<SavedMsr>();
 
 #[derive(Debug, Clone, Copy, Default)]
-#[repr(C, packed)]
+// Intel requires VM-entry/VM-exit MSR areas to be 16-byte aligned and each
+// entry to occupy exactly 16 bytes.
+#[repr(C, align(16))]
 pub struct SavedMsr {
     pub index: MsrIndex,
     pub reserved: u32,
@@ -22,13 +25,14 @@ pub struct SavedMsr {
 
 #[derive(Debug)]
 pub struct ShadowMsr {
-    ents: Vec<SavedMsr>,
+    frame: PhysFrame,
+    len: usize,
 }
 
 #[derive(Debug)]
 pub enum MsrError {
     TooManyEntries,
-    BitmapAllocationFailed,
+    AreaAllocationFailed,
 }
 
 pub fn register_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
@@ -116,17 +120,30 @@ pub fn _update_msrs(vcpu: &mut IntelVCpu) -> Result<(), MsrError> {
     Ok(())
 }
 
-impl Default for ShadowMsr {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ShadowMsr {
-    pub fn new() -> Self {
-        let ents = vec![];
+    pub fn new(frame_allocator: &mut dyn FrameAllocator<Size4KiB>) -> Result<Self, MsrError> {
+        let frame = frame_allocator
+            .allocate_frame()
+            .ok_or(MsrError::AreaAllocationFailed)?;
+        unsafe {
+            core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 4096);
+        }
+        Ok(Self { frame, len: 0 })
+    }
 
-        ShadowMsr { ents }
+    fn entries_ptr(&self) -> *mut SavedMsr {
+        self.frame.start_address().as_u64() as *mut SavedMsr
+    }
+
+    fn saved_ents_mut(&mut self) -> &mut [SavedMsr] {
+        unsafe { core::slice::from_raw_parts_mut(self.entries_ptr(), self.len) }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+        unsafe {
+            core::ptr::write_bytes(self.entries_ptr() as *mut u8, 0, 4096);
+        }
     }
 
     pub fn set(&mut self, index: MsrIndex, data: u64) -> Result<(), MsrError> {
@@ -134,32 +151,35 @@ impl ShadowMsr {
     }
 
     pub fn set_by_index(&mut self, index: MsrIndex, data: u64) -> Result<(), MsrError> {
-        if let Some(entry) = self.ents.iter_mut().find(|e| e.index == index) {
+        if let Some(entry) = self.saved_ents_mut().iter_mut().find(|e| e.index == index) {
             entry.data = data;
             return Ok(());
         }
 
-        if self.ents.len() >= MAX_NUM_ENTS {
+        if self.len >= MAX_NUM_ENTS {
             return Err(MsrError::TooManyEntries);
         }
-        self.ents.push(SavedMsr {
-            index,
-            reserved: 0,
-            data,
-        });
+        unsafe {
+            self.entries_ptr().add(self.len).write(SavedMsr {
+                index,
+                reserved: 0,
+                data,
+            });
+        }
+        self.len += 1;
         Ok(())
     }
 
     pub fn saved_ents(&self) -> &[SavedMsr] {
-        &self.ents
+        unsafe { core::slice::from_raw_parts(self.entries_ptr(), self.len) }
     }
 
     pub fn find(&self, index: MsrIndex) -> Option<&SavedMsr> {
-        self.ents.iter().find(|e| e.index == index)
+        self.saved_ents().iter().find(|e| e.index == index)
     }
 
     pub fn phys(&self) -> PhysAddr {
-        PhysAddr::new(VirtAddr::from_ptr(&self.ents).as_u64())
+        self.frame.start_address()
     }
 
     pub fn concat(r1: u64, r2: u64) -> u64 {
@@ -185,7 +205,7 @@ impl ShadowMsr {
         let value = Self::concat(regs.rdx, regs.rax);
         if let Some(msr) = vcpu
             .guest_msr
-            .ents
+            .saved_ents_mut()
             .iter_mut()
             .find(|entry| entry.index == msr_kind)
         {

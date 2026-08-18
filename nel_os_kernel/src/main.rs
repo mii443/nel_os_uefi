@@ -200,11 +200,15 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
 
     if network_device.is_some() {
         info!(
-            "Linux VM is stopped; management shell will listen on TCP port {} after DHCP",
-            network::CONTROL_PORT
+            "{} Linux VM slots are stopped; management shell will listen on TCP port {} after DHCP",
+            vmm::MAX_VMS,
+            network::CONTROL_PORT,
         );
     } else {
-        info!("Linux VM is stopped; use the local serial management shell");
+        info!(
+            "{} Linux VM slots are stopped; use the local serial management shell",
+            vmm::MAX_VMS
+        );
     }
 
     vm_control::VmController::new(network_device, usable_frame, boot_tsc).run(&mut bitmap_table);

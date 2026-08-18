@@ -965,12 +965,24 @@ mod tests {
         let mut server = ManagementServer::new();
         server.state = TcpState::Established;
         server.consume_input(b"vm start\r\nvm start --attach\nvm info\ninfo memory\n");
-        assert_eq!(server.take_command(), Some(ManagementCommand::VmStart));
         assert_eq!(
             server.take_command(),
-            Some(ManagementCommand::VmStartAttach)
+            Some(ManagementCommand::VmStart {
+                id: 0,
+                attach: false
+            })
         );
-        assert_eq!(server.take_command(), Some(ManagementCommand::VmStatus));
+        assert_eq!(
+            server.take_command(),
+            Some(ManagementCommand::VmStart {
+                id: 0,
+                attach: true
+            })
+        );
+        assert_eq!(
+            server.take_command(),
+            Some(ManagementCommand::VmStatus { id: 0 })
+        );
         assert_eq!(server.take_command(), Some(ManagementCommand::InfoMemory));
     }
 
@@ -1006,7 +1018,10 @@ mod tests {
         server.state = TcpState::Established;
         server.consume_input(b"serial attach\r\nlogin\n");
 
-        assert_eq!(server.take_command(), Some(ManagementCommand::SerialAttach));
+        assert_eq!(
+            server.take_command(),
+            Some(ManagementCommand::SerialAttach { id: 0 })
+        );
         server.set_serial_attached(true);
         assert_eq!(server.take_command(), None);
 
@@ -1020,7 +1035,10 @@ mod tests {
         let mut server = ManagementServer::new();
         server.state = TcpState::Established;
         server.consume_input(b"serial attach\nvm reset\n");
-        assert_eq!(server.take_command(), Some(ManagementCommand::SerialAttach));
+        assert_eq!(
+            server.take_command(),
+            Some(ManagementCommand::SerialAttach { id: 0 })
+        );
 
         server.set_serial_attached(true);
         server.set_serial_attached(false);
@@ -1265,7 +1283,10 @@ mod tests {
         let response_tcp = &response[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..ack_len];
         assert_eq!(response_tcp[13], TCP_ACK);
         assert_eq!(read_u32(response_tcp, 8), Some(101 + command.len() as u32));
-        assert_eq!(server.take_command(), Some(ManagementCommand::VmStatus));
+        assert_eq!(
+            server.take_command(),
+            Some(ManagementCommand::VmStatus { id: 0 })
+        );
     }
 
     #[test]
@@ -1294,7 +1315,10 @@ mod tests {
                 .is_some()
         );
         assert_eq!(server.state, TcpState::CloseWait);
-        assert_eq!(server.take_command(), Some(ManagementCommand::VmStatus));
+        assert_eq!(
+            server.take_command(),
+            Some(ManagementCommand::VmStatus { id: 0 })
+        );
     }
 
     #[test]

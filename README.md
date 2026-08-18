@@ -6,14 +6,18 @@ The outer kernel owns a transitional virtio-net PCI device; it is not mapped
 or enumerated in the Linux guest. The hypervisor obtains its IPv4 address,
 subnet mask, router, and lease time using DHCP, and answers ARP and ICMP echo.
 
-The Linux VM remains uncreated until a local-serial or network management
-command starts it. After DHCP succeeds, the hypervisor exposes a TCP management
-shell on port `5555`. The legacy UDP `start` command on the same numeric port is
-retained for simple automation.
+Four Linux VM slots (IDs `0` through `3`) remain uncreated until a local-serial
+or network management command creates them with an explicit RAM size. Each VM
+has one virtual CPU; 128 MiB is the recommended size. The VCPUs are scheduled
+round-robin on QEMU's one hypervisor CPU. After DHCP succeeds, the hypervisor
+exposes a TCP management shell on port `5555`. The legacy UDP `start` command
+on the same numeric port starts an already-created VM 0 and is retained for
+simple automation.
 
 ### Default port forwarding
 
-The default `cargo r -r` command uses QEMU user-mode networking. QEMU assigns
+The default `cargo r -r` command gives the hypervisor 1 GiB of RAM and uses
+QEMU user-mode networking. QEMU assigns
 `10.0.2.15` to the hypervisor over DHCP and forwards both TCP and UDP host port
 `5555` to the hypervisor management port:
 
@@ -31,19 +35,34 @@ nc 127.0.0.1 5555
 The shell supports:
 
 ```text
-vm start               create and run the VM, or resume a stopped VM
-vm start --attach      start/resume the VM and attach its serial (`-a` also works)
-vm stop                stop VCPU execution while retaining guest memory
-vm reset               reset in place and start the VM
-vm status              show the current VM state and guest memory size (`vm info` also works)
-serial attach          attach the connection to the guest COM1 byte stream
+vm list                show all four VM slots
+vm create [ID] MEMORY  create a VM and allocate its RAM (`128M`, `256MiB`, etc.)
+vm start [ID]          start a created VM, or resume it when stopped
+vm start [ID] -a       start/resume and attach its serial (`--attach` also works)
+vm stop [ID]           stop one VCPU while retaining its guest memory
+vm reset [ID]          reset one VM in place and start it
+vm status [ID]         show one VM (`vm info` and `info vm` also work)
+serial attach [ID]     attach to one VM's COM1 byte stream
 serial detach          explicitly detach while at the management prompt
 info memory            show current host physical-memory use
 info runtime           show kernel, CPU, virtualization, uptime, and IPv4 data
-info all               show runtime, memory, and VM information
+info all               show runtime, memory, and all VM information
 help
 exit
 ```
+
+`ID` defaults to `0` when omitted, so `vm create 128M` creates VM 0. VM creation
+allocates and initializes the requested RAM but does not execute Linux; run
+`vm start [ID]` separately. Stopping a VM retains its allocation and state while
+the other running VMs continue to execute. Memory may be specified in MiB by a
+bare number or with `M`, `MB`, or `MiB`; `G`, `GB`, and `GiB` are also accepted.
+The supported per-VM range is 64-768 MiB, subject to available host memory and
+a 128 MiB management reserve.
+
+`vm list` and `info vm [ID]` report each VM's allocated/configured RAM ratio and
+cumulative CPU usage since creation. CPU usage is measured from TSC cycles spent
+executing that VCPU. Memory usage is the host-side guest-RAM allocation ratio,
+not Linux's internal free-page percentage.
 
 The same `nel>` management shell is available on the hypervisor's physical
 COM1 console as soon as kernel initialization completes. This local console
@@ -54,14 +73,16 @@ Enter on an empty line also redraws `nel>`.
 The embedded TCP server accepts one management connection at a time. Close or
 `exit` the current session before connecting another client.
 
-While attached to the VM serial port, press `Ctrl-]` to detach and return to
+While attached to a VM serial port, press `Ctrl-]` to detach and return to
 the `nel>` prompt. Guest COM1 output is hidden by default and is sent only to
 management consoles that explicitly ran `serial attach` or
 `vm start --attach`; in particular, a TCP attachment does not expose guest
-output on the physical hypervisor console. Only one console can own the guest
-serial stream at a time; another console's attach request is rejected until the
-owner detaches. `info runtime` reports any guest-output bytes dropped because a
-slow TCP client exhausted the bounded serial buffers.
+output on the physical hypervisor console. Only one console can own one VM
+serial stream at a time; another console or a request for another VM is rejected
+until the owner detaches. The shared bridge is activated only during that VM's
+time slice so serial bytes cannot cross VM boundaries. `info runtime` reports
+any guest-output bytes dropped because a slow TCP client exhausted the bounded
+serial buffers.
 
 The UDP start command remains available:
 

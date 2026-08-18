@@ -1,12 +1,12 @@
 use lazy_static::lazy_static;
 use x86_64::{
+    VirtAddr,
     instructions::tables::load_tss,
-    registers::segmentation::{Segment, CS, DS, ES, FS, GS, SS},
+    registers::segmentation::{CS, DS, ES, FS, GS, SS, Segment},
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
         tss::TaskStateSegment,
     },
-    VirtAddr,
 };
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;

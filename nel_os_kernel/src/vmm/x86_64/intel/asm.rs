@@ -47,8 +47,17 @@ global_asm!(
 "push rbx", // push *guest_regs
 "push rdi", // push *VCpu
 "lea rdi, [rsp + 8]", // rdi = rsp + 8 = *guest_regs
+// SysV requires RSP to be 16-byte aligned immediately before CALL.
+"sub rsp, 8",
 "call intel_set_host_stack",
+"add rsp, 8",
 "pop rdi", // rdi = *VCpu
+// VMX does not switch CR2.  Save the host value and restore this VCPU's
+// page-fault address before loading guest GPRs.
+"mov rax, cr2",
+"mov [rdi + {host_cr2_offset}], rax",
+"mov rax, [rdi + {guest_cr2_offset}]",
+"mov cr2, rax",
 "test byte ptr [rdi + {launch_done_offset}], 1", // flag = launch_done ? 1 : 0
 "fxrstor64 [rdi + {guest_fx_state_offset}]",
 /*
@@ -118,6 +127,10 @@ global_asm!(
 "vmlaunch",
 "mov rax, [rsp]", // rax = *guest_regs
 "sub rax, {guest_regs_offset}", // rax = *VCpu
+// VM-entry failed after guest CR2 was installed, so restore host CR2 before
+// returning to Rust even though no normal VMEXIT occurred.
+"mov rcx, [rax + {host_cr2_offset}]",
+"mov cr2, rcx",
 "mov rdi, rax",
 "call 4f",
 "mov ax, 1",
@@ -161,8 +174,16 @@ global_asm!(
    RAX = guest CPU's rax
    */
 "push rax",
-"mov rax, qword ptr [rsp + 0x8]", // rax = *guest_regs
+"push rcx",
+"mov rax, qword ptr [rsp + 0x10]", // rax = *guest_regs
 "sub rax, {guest_regs_offset}", // rax = *VCpu
+// Capture the guest fault address before any host work can change CR2, then
+// restore the value that was active before this VCPU entered VMX non-root.
+"mov rcx, cr2",
+"mov [rax + {guest_cr2_offset}], rcx",
+"mov rcx, [rax + {host_cr2_offset}]",
+"mov cr2, rcx",
+"pop rcx",
 "fxsave64 [rax + {guest_fx_state_offset}]",
 "add rax, {guest_regs_offset}", // rax = *guest_regs
 /*
@@ -273,6 +294,8 @@ global_asm!(
 ".size asm_vmexit_handler, . - asm_vmexit_handler",
 
 guest_regs_offset = const offset_of!(IntelVCpu, guest_registers),
+host_cr2_offset = const offset_of!(IntelVCpu, host_cr2),
+guest_cr2_offset = const offset_of!(IntelVCpu, guest_cr2),
 host_fx_state_offset = const offset_of!(IntelVCpu, host_fx_state),
 guest_fx_state_offset = const offset_of!(IntelVCpu, guest_fx_state),
 host_xsave_addr_offset = const offset_of!(IntelVCpu, host_xsave_addr),

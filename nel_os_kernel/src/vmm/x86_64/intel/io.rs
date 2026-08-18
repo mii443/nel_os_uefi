@@ -15,7 +15,9 @@ use crate::{
 
 fn interrupt_vector_to_irq(vector: u8) -> Option<u8> {
     if vector == IRQ_TIMER as u8 {
-        return Some(0);
+        // The host timer only preempts the current VM. Each guest receives
+        // IRQ0 from its own emulated PIT, not from the host LAPIC cadence.
+        return None;
     }
 
     if (0x20..0x30).contains(&vector) {
@@ -44,13 +46,14 @@ pub fn vmm_interrupt_subscriber(pending_ptr: *mut core::ffi::c_void, context: &I
 
 #[cfg(test)]
 mod interrupt_vector_tests {
-    use super::{Serial, interrupt_vector_to_irq};
+    use super::{Pic, QualIo, Serial, interrupt_vector_to_irq};
+    use crate::vmm::x86_64::intel::register::GuestRegisters;
 
     #[test]
     fn maps_pic_and_host_timer_vectors_without_overflow() {
         assert_eq!(interrupt_vector_to_irq(0x20), Some(0));
         assert_eq!(interrupt_vector_to_irq(0x2f), Some(15));
-        assert_eq!(interrupt_vector_to_irq(0x30), Some(0));
+        assert_eq!(interrupt_vector_to_irq(0x30), None);
         assert_eq!(interrupt_vector_to_irq(0x31), None);
     }
 
@@ -63,6 +66,20 @@ mod interrupt_vector_tests {
         assert_eq!(uart.remaining(), 0);
         assert_eq!(uart.dequeue(), 0);
         assert_eq!(uart.remaining(), 1);
+    }
+
+    #[test]
+    fn uart_transmit_reasserts_thre_interrupt() {
+        let mut pic = Pic::new(1);
+        let mut registers = GuestRegisters::default();
+        registers.rax = b'x' as u64;
+        pic.serial.ier = 0b10;
+        pic.serial.mcr = 0b1000;
+
+        pic.handle_serial_out(&mut registers, QualIo::from(0x03f8u64 << 16));
+
+        assert_ne!(pic.pending_irq & (1 << 4), 0);
+        assert_eq!(pic.serial.interrupt_identification() & 0x0f, 0x02);
     }
 }
 
@@ -88,6 +105,8 @@ pub struct Serial {
     scratch: u8,
     divisor_low: u8,
     divisor_high: u8,
+    fifo_enabled: bool,
+    thre_interrupt_pending: bool,
     rx: [u8; 256],
     rx_head: usize,
     rx_len: usize,
@@ -103,6 +122,8 @@ impl Default for Serial {
             scratch: 0,
             divisor_low: 0,
             divisor_high: 0,
+            fifo_enabled: false,
+            thre_interrupt_pending: false,
             rx: [0; 256],
             rx_head: 0,
             rx_len: 0,
@@ -135,6 +156,225 @@ impl Serial {
     fn remaining(&self) -> usize {
         self.rx.len() - self.rx_len
     }
+
+    fn write_ier(&mut self, value: u8) {
+        let old_ier = self.ier;
+        self.ier = value & 0x0f;
+        if old_ier & 0x02 == 0 && self.ier & 0x02 != 0 {
+            self.thre_interrupt_pending = true;
+        }
+    }
+
+    fn write_fcr(&mut self, value: u8) {
+        self.fifo_enabled = value & 1 != 0;
+        if value & 0x02 != 0 {
+            self.rx_head = 0;
+            self.rx_len = 0;
+            self.overrun = false;
+        }
+        if value & 0x04 != 0 && self.ier & 0x02 != 0 {
+            self.thre_interrupt_pending = true;
+        }
+    }
+
+    fn interrupt_identification(&mut self) -> u8 {
+        let fifo = if self.fifo_enabled { 0xc0 } else { 0 };
+        let reason = if self.overrun && self.ier & 0x04 != 0 {
+            0x06
+        } else if self.rx_len != 0 && self.ier & 0x01 != 0 {
+            0x04
+        } else if self.thre_interrupt_pending && self.ier & 0x02 != 0 {
+            self.thre_interrupt_pending = false;
+            0x02
+        } else {
+            0x01
+        };
+        fifo | reason
+    }
+
+    fn interrupt_pending(&self) -> bool {
+        (self.overrun && self.ier & 0x04 != 0)
+            || (self.rx_len != 0 && self.ier & 0x01 != 0)
+            || (self.thre_interrupt_pending && self.ier & 0x02 != 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RtcState {
+    selector: u8,
+    registers: [u8; 128],
+}
+
+impl RtcState {
+    fn new() -> Self {
+        let mut registers = [0; 128];
+        // Fixed, valid BCD timestamp: 2000-01-01 00:00:00 (Saturday).
+        registers[0x06] = 0x07;
+        registers[0x07] = 0x01;
+        registers[0x08] = 0x01;
+        registers[0x09] = 0x00;
+        registers[0x0a] = 0x26; // UIP clear, 32-kHz divider.
+        registers[0x0b] = 0x02; // BCD, 24-hour mode, interrupts disabled.
+        registers[0x0c] = 0x00;
+        registers[0x0d] = 0x80; // Valid RAM/time (VRT).
+        registers[0x32] = 0x20; // Conventional BCD century byte.
+        Self {
+            selector: 0,
+            registers,
+        }
+    }
+
+    fn read_data(&self) -> u8 {
+        match self.selector & 0x7f {
+            0x0a => self.registers[0x0a] & 0x7f,
+            0x0c => 0,
+            0x0d => self.registers[0x0d] | 0x80,
+            index => self.registers[index as usize],
+        }
+    }
+
+    fn write_data(&mut self, value: u8) {
+        let index = (self.selector & 0x7f) as usize;
+        self.registers[index] = match index {
+            0x0a => value & 0x7f,
+            0x0c => 0,
+            0x0d => value | 0x80,
+            _ => value,
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PitChannel {
+    tsc_hz: u64,
+    access_mode: u8,
+    mode: u8,
+    reload_low: u8,
+    reload: u32,
+    deadline: u64,
+    armed: bool,
+    write_high: bool,
+    read_high: bool,
+    read_latch: Option<u16>,
+}
+
+impl PitChannel {
+    const PIT_HZ: u64 = 1_193_182;
+
+    fn new(tsc_khz: u64) -> Self {
+        Self {
+            tsc_hz: tsc_khz.saturating_mul(1_000),
+            access_mode: 3,
+            mode: 3,
+            reload_low: 0,
+            reload: 0x1_0000,
+            deadline: 0,
+            armed: false,
+            write_high: false,
+            read_high: false,
+            read_latch: None,
+        }
+    }
+
+    fn rdtsc() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    fn period_cycles(&self) -> u64 {
+        ((self.reload as u128 * self.tsc_hz as u128 / Self::PIT_HZ as u128) as u64).max(1)
+    }
+
+    fn program(&mut self, value: u16) {
+        self.reload = if value == 0 { 0x1_0000 } else { value as u32 };
+        self.deadline = Self::rdtsc().wrapping_add(self.period_cycles());
+        self.armed = true;
+        self.read_latch = None;
+        self.read_high = false;
+    }
+
+    fn write(&mut self, value: u8) {
+        match self.access_mode {
+            1 => self.program(value as u16),
+            2 => self.program((value as u16) << 8),
+            3 if !self.write_high => {
+                self.reload_low = value;
+                self.write_high = true;
+            }
+            3 => {
+                self.write_high = false;
+                self.program(u16::from_le_bytes([self.reload_low, value]));
+            }
+            _ => {}
+        }
+    }
+
+    fn write_control(&mut self, value: u8) {
+        let access_mode = (value >> 4) & 3;
+        if access_mode == 0 {
+            self.read_latch = Some(self.current_count());
+            self.read_high = false;
+            return;
+        }
+        self.access_mode = access_mode;
+        self.mode = (value >> 1) & 7;
+        if self.mode >= 6 {
+            self.mode -= 4;
+        }
+        self.write_high = false;
+        self.read_high = false;
+        self.read_latch = None;
+    }
+
+    fn current_count(&self) -> u16 {
+        if !self.armed {
+            return self.reload as u16;
+        }
+        let remaining_cycles = self.deadline.saturating_sub(Self::rdtsc());
+        let ticks = (remaining_cycles as u128 * Self::PIT_HZ as u128 / self.tsc_hz as u128)
+            .min(self.reload as u128) as u32;
+        ticks as u16
+    }
+
+    fn read(&mut self) -> u8 {
+        if self.access_mode == 3 && !self.read_high && self.read_latch.is_none() {
+            self.read_latch = Some(self.current_count());
+        }
+        let count = self.read_latch.unwrap_or_else(|| self.current_count());
+        let value = match self.access_mode {
+            1 => count as u8,
+            2 => (count >> 8) as u8,
+            _ if self.read_high => (count >> 8) as u8,
+            _ => count as u8,
+        };
+        if self.access_mode == 3 {
+            self.read_high = !self.read_high;
+            if !self.read_high {
+                self.read_latch = None;
+            }
+        }
+        value
+    }
+
+    fn poll(&mut self) -> bool {
+        let now = Self::rdtsc();
+        if !self.armed || now < self.deadline {
+            return false;
+        }
+        if matches!(self.mode, 2 | 3) {
+            let period = self.period_cycles();
+            let elapsed = now.wrapping_sub(self.deadline);
+            self.deadline = self
+                .deadline
+                .wrapping_add((elapsed / period + 1).saturating_mul(period));
+        } else {
+            self.armed = false;
+        }
+        true
+    }
+
+    fn output_high(&self) -> bool {
+        !self.armed || Self::rdtsc() >= self.deadline
+    }
 }
 
 pub struct Pic {
@@ -152,10 +392,14 @@ pub struct Pic {
     pub secondary_read_sel: ReadSel,
     pub serial: Serial,
     pub pending_irq: u16,
+    pit_channel0: PitChannel,
+    pit_channel2: PitChannel,
+    speaker_control: u8,
+    rtc: RtcState,
 }
 
 impl Pic {
-    pub fn new() -> Self {
+    pub fn new(tsc_khz: u64) -> Self {
         Self {
             primary_mask: 0xFF,
             secondary_mask: 0xFF,
@@ -171,7 +415,34 @@ impl Pic {
             secondary_read_sel: ReadSel::Irr,
             serial: Serial::default(),
             pending_irq: 0,
+            pit_channel0: PitChannel::new(tsc_khz),
+            pit_channel2: PitChannel::new(tsc_khz),
+            speaker_control: 0,
+            rtc: RtcState::new(),
         }
+    }
+
+    pub fn poll_timer(&mut self) {
+        if self.pit_channel0.poll() {
+            self.pending_irq |= 1;
+        }
+    }
+
+    fn write_pit_control(&mut self, value: u8) {
+        match value >> 6 {
+            0 => self.pit_channel0.write_control(value),
+            2 => self.pit_channel2.write_control(value),
+            _ => {}
+        }
+    }
+
+    fn speaker_status(&self) -> u8 {
+        let output = if self.speaker_control & 1 != 0 && self.pit_channel2.output_high() {
+            1 << 5
+        } else {
+            0
+        };
+        self.speaker_control | output
     }
 
     pub fn handle_io(
@@ -208,7 +479,7 @@ impl Pic {
                 self.serial.enqueue(byte);
             }
         }
-        if self.serial.mcr & 0x08 != 0 && self.serial.ier & 1 != 0 && self.serial.rx_len != 0 {
+        if self.serial.mcr & 0x08 != 0 && self.serial.interrupt_pending() {
             self.pending_irq |= 1 << 4;
         }
     }
@@ -217,6 +488,12 @@ impl Pic {
         let pending = self.pending_irq;
 
         if pending == 0 {
+            return Ok(false);
+        }
+
+        // Do not overwrite an exception or another event queued by the
+        // previous VM-exit handler for the next VM entry.
+        if vmread(vmx::vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)? & (1 << 31) != 0 {
             return Ok(false);
         }
 
@@ -319,7 +596,11 @@ impl Pic {
             0xC000..=0xCFFF => regs.rax = u32::MAX as u64,
             0x20..=0x21 => self.handle_pic_in(regs, qual),
             0xA0..=0xA1 => self.handle_pic_in(regs, qual),
-            0x0070..=0x0071 => regs.rax = 0,
+            0x0040 if qual.size() == 0 => regs.rax = self.pit_channel0.read() as u64,
+            0x0042 if qual.size() == 0 => regs.rax = self.pit_channel2.read() as u64,
+            0x0061 if qual.size() == 0 => regs.rax = self.speaker_status() as u64,
+            0x0070 if qual.size() == 0 => regs.rax = self.rtc.selector as u64,
+            0x0071 if qual.size() == 0 => regs.rax = self.rtc.read_data() as u64,
             0x03F8..=0x03FF => self.handle_serial_in(regs, qual),
             _ => regs.rax = 0,
         }
@@ -331,33 +612,28 @@ impl Pic {
             0xC000..=0xCFFF => {} //ignore
             0x20..=0x21 => self.handle_pic_out(regs, qual),
             0xA0..=0xA1 => self.handle_pic_out(regs, qual),
+            0x0040 if qual.size() == 0 => self.pit_channel0.write(regs.rax as u8),
+            0x0042 if qual.size() == 0 => self.pit_channel2.write(regs.rax as u8),
+            0x0043 if qual.size() == 0 => self.write_pit_control(regs.rax as u8),
+            0x0061 if qual.size() == 0 => self.speaker_control = regs.rax as u8 & 0x03,
+            0x0070 if qual.size() == 0 => self.rtc.selector = regs.rax as u8,
+            0x0071 if qual.size() == 0 => self.rtc.write_data(regs.rax as u8),
             0x03F8..=0x03FF => self.handle_serial_out(regs, qual),
-            0x0070..=0x0071 => {} //ignore
             _ => {}
         }
     }
 
     fn handle_serial_in(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x3F8 if self.serial.lcr & 0x80 != 0 => {
-                regs.rax = self.serial.divisor_low as u64
-            }
+            0x3F8 if self.serial.lcr & 0x80 != 0 => regs.rax = self.serial.divisor_low as u64,
             0x3F8 => regs.rax = self.serial.dequeue() as u64,
-            0x3F9 if self.serial.lcr & 0x80 != 0 => {
-                regs.rax = self.serial.divisor_high as u64
-            }
+            0x3F9 if self.serial.lcr & 0x80 != 0 => regs.rax = self.serial.divisor_high as u64,
             0x3F9 => regs.rax = self.serial.ier as u64,
-            0x3FA => {
-                regs.rax = if self.serial.rx_len != 0 && self.serial.ier & 1 != 0 {
-                    0x04
-                } else {
-                    0x01
-                }
-            }
+            0x3FA => regs.rax = self.serial.interrupt_identification() as u64,
             0x3FB => regs.rax = self.serial.lcr as u64,
             0x3FC => regs.rax = self.serial.mcr as u64,
             0x3FD => {
-                if qual.size() == 1 {
+                if qual.size() == 0 {
                     let mut status = 0x60;
                     if self.serial.rx_len != 0 {
                         status |= 1;
@@ -370,20 +646,21 @@ impl Pic {
                 }
             }
             0x3FE => {
-                if qual.size() == 1 {
+                if qual.size() == 0 {
                     regs.rax = 0xb0
                 }
             }
             0x3FF => regs.rax = self.serial.scratch as u64,
             _ => regs.rax = 0,
         }
+        if self.serial.mcr & 0x08 != 0 && self.serial.interrupt_pending() {
+            self.pending_irq |= 1 << 4;
+        }
     }
 
     fn handle_serial_out(&mut self, regs: &mut GuestRegisters, qual: QualIo) {
         match qual.port() {
-            0x3F8 if self.serial.lcr & 0x80 != 0 => {
-                self.serial.divisor_low = regs.rax as u8
-            }
+            0x3F8 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_low = regs.rax as u8,
             0x3F8 => {
                 let byte = regs.rax as u8;
                 if self.serial.mcr & 0x10 != 0 {
@@ -391,27 +668,22 @@ impl Pic {
                 } else {
                     serial::write_guest_raw_byte(byte);
                 }
+                // The emulated transmitter drains immediately. Its THRE edge
+                // is acknowledged through IIR and raised again after every
+                // subsequent THR write.
+                self.serial.thre_interrupt_pending = self.serial.ier & 0x02 != 0;
             }
-            0x3F9 if self.serial.lcr & 0x80 != 0 => {
-                self.serial.divisor_high = regs.rax as u8
-            }
-            0x3F9 => {
-                self.serial.ier = regs.rax as u8;
-                if regs.rax & 0b10 != 0 {
-                    self.pending_irq |= 1 << 4;
-                }
-            }
-            0x3FA => {
-                if regs.rax as u8 & 0x02 != 0 {
-                    self.serial.rx_head = 0;
-                    self.serial.rx_len = 0;
-                }
-            }
+            0x3F9 if self.serial.lcr & 0x80 != 0 => self.serial.divisor_high = regs.rax as u8,
+            0x3F9 => self.serial.write_ier(regs.rax as u8),
+            0x3FA => self.serial.write_fcr(regs.rax as u8),
             0x3FB => self.serial.lcr = regs.rax as u8,
-            0x3FC => self.serial.mcr = regs.rax as u8,
+            0x3FC => self.serial.mcr = regs.rax as u8 & 0x1f,
             0x3FD => {}
             0x3FF => self.serial.scratch = regs.rax as u8,
             _ => {}
+        }
+        if self.serial.mcr & 0x08 != 0 && self.serial.interrupt_pending() {
+            self.pending_irq |= 1 << 4;
         }
     }
 
