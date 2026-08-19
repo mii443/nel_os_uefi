@@ -9,4 +9,6 @@ pub struct BootInfo {
     pub usable_memory: UsableMemory,
     pub frame_buffer: Option<FrameBuffer>,
     pub rsdp: Option<u64>,
+    pub guest_firmware_addr: u64,
+    pub guest_firmware_size: u64,
 }

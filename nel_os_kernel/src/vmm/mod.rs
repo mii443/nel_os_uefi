@@ -4,13 +4,14 @@ use alloc::boxed::Box;
 use crate::{
     network::PassthroughDescriptor,
     platform,
+    storage::VirtioBlock,
     vmm::x86_64::{amd::vcpu::AMDVCpu, intel::vcpu::IntelVCpu},
 };
 
 pub mod x86_64;
 
 pub const VCPUS_PER_VM: usize = 1;
-pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 128;
+pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 256;
 pub const MIN_GUEST_MEMORY_MIB: u32 = 64;
 pub const MAX_GUEST_MEMORY_MIB: u32 = 768;
 pub const VCPU_TIME_SLICE_MILLIS: u64 = 4;
@@ -37,6 +38,7 @@ pub trait VCpu {
     fn run(
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str>;
 
     /// Allocates guest RAM and initializes the boot state without executing

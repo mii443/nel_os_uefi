@@ -9,6 +9,8 @@ use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
+use crate::storage::GuestMemory;
+
 pub struct Ept {
     pub root_table: PhysFrame,
 }
@@ -264,10 +266,41 @@ impl Ept {
         Ok(())
     }
 
+    pub fn set_slice(&mut self, gpa_start: u64, data: &[u8]) -> Result<(), &'static str> {
+        let mut gpa = gpa_start;
+        let mut offset = 0;
+        while offset < data.len() {
+            let hpa = self
+                .get_phys_addr(gpa)
+                .ok_or("Failed to get physical address")?;
+            let bytes = (0x1000 - (gpa as usize & 0xfff)).min(data.len() - offset);
+            unsafe {
+                core::ptr::copy_nonoverlapping(data[offset..].as_ptr(), hpa as *mut u8, bytes)
+            };
+            gpa += bytes as u64;
+            offset += bytes;
+        }
+        Ok(())
+    }
+
     fn frame_to_table_ptr(frame: &PhysFrame) -> &'static mut [EntryBase; 512] {
         let table_ptr = frame.start_address().as_u64();
 
         unsafe { &mut *(table_ptr as *mut [EntryBase; 512]) }
+    }
+}
+
+impl GuestMemory for Ept {
+    fn read_u8(&mut self, address: u64) -> Result<u8, &'static str> {
+        self.get(address)
+    }
+
+    fn write_u8(&mut self, address: u64, value: u8) -> Result<(), &'static str> {
+        self.set(address, value)
+    }
+
+    fn write_slice(&mut self, address: u64, input: &[u8]) -> Result<(), &'static str> {
+        self.set_slice(address, input)
     }
 }
 

@@ -120,13 +120,9 @@ if [[ -n "${NEL_OS_BLOCK_IMAGE:-}" ]]; then
         exit 2
     fi
     BLOCK_IMAGE="$(realpath -- "${NEL_OS_BLOCK_IMAGE}")"
-    if [[ "$(dd if="${BLOCK_IMAGE}" bs=1 count=8 status=none)" != "NELBOOT1" ]]; then
-        echo "Host block image is not a NEL Linux boot bundle: ${BLOCK_IMAGE}" >&2
-        exit 2
-    fi
 else
     if [[ ! "${BLOCK_SIZE_MIB}" =~ ^[0-9]+$ ]] ||
-        ((10#${BLOCK_SIZE_MIB} < 1 || 10#${BLOCK_SIZE_MIB} > 1048576)); then
+        ((10#${BLOCK_SIZE_MIB} < 32 || 10#${BLOCK_SIZE_MIB} > 1048576)); then
         echo "Invalid NEL_OS_BLOCK_SIZE_MIB: ${BLOCK_SIZE_MIB}" >&2
         exit 2
     fi

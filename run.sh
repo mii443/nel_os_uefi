@@ -10,9 +10,9 @@ if [[ ! -x "${CARGO_BIN}" ]]; then
     exit 1
 fi
 
-for required_command in qemu-system-x86_64 xorriso mformat mmd mcopy; do
+for required_command in qemu-system-x86_64 xorriso mformat mmd mcopy sgdisk; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
-        echo "${required_command} is required. On Ubuntu, install qemu-system-x86, ovmf, xorriso, and mtools." >&2
+        echo "${required_command} is required. On Ubuntu, install qemu-system-x86, ovmf, xorriso, mtools, gdisk, and systemd-boot-efi." >&2
         exit 1
     fi
 done

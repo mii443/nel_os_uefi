@@ -70,7 +70,7 @@ mod interrupt_vector_tests {
 
     #[test]
     fn uart_transmit_reasserts_thre_interrupt() {
-        let mut pic = Pic::new(1);
+        let mut pic = Pic::new(1, 256 * 1024 * 1024);
         let mut registers = GuestRegisters::default();
         registers.rax = b'x' as u64;
         pic.serial.ier = 0b10;
@@ -84,7 +84,7 @@ mod interrupt_vector_tests {
 
     #[test]
     fn pending_pic_irq_requires_another_vcpu_entry() {
-        let mut pic = Pic::new(1);
+        let mut pic = Pic::new(1, 256 * 1024 * 1024);
         assert!(!pic.has_pending_interrupt());
 
         pic.pending_irq |= 1 << 4;
@@ -216,7 +216,7 @@ struct RtcState {
 }
 
 impl RtcState {
-    fn new() -> Self {
+    fn new(guest_memory_size: u64) -> Self {
         let mut registers = [0; 128];
         // Fixed, valid BCD timestamp: 2000-01-01 00:00:00 (Saturday).
         registers[0x06] = 0x07;
@@ -228,6 +228,18 @@ impl RtcState {
         registers[0x0c] = 0x00;
         registers[0x0d] = 0x80; // Valid RAM/time (VRT).
         registers[0x32] = 0x20; // Conventional BCD century byte.
+        registers[0x15] = 0x80; // 640 KiB, little-endian.
+        registers[0x16] = 0x02;
+        registers[0x17] = 0x00; // 15 MiB between 1 MiB and 16 MiB.
+        registers[0x18] = 0x3c;
+        registers[0x30] = registers[0x17];
+        registers[0x31] = registers[0x18];
+        let above_16m = guest_memory_size
+            .saturating_sub(16 * 1024 * 1024)
+            .div_ceil(64 * 1024)
+            .min(u16::MAX as u64) as u16;
+        registers[0x34] = above_16m as u8;
+        registers[0x35] = (above_16m >> 8) as u8;
         Self {
             selector: 0,
             registers,
@@ -409,7 +421,7 @@ pub struct Pic {
 }
 
 impl Pic {
-    pub fn new(tsc_khz: u64) -> Self {
+    pub fn new(tsc_khz: u64, guest_memory_size: u64) -> Self {
         Self {
             primary_mask: 0xFF,
             secondary_mask: 0xFF,
@@ -428,7 +440,7 @@ impl Pic {
             pit_channel0: PitChannel::new(tsc_khz),
             pit_channel2: PitChannel::new(tsc_khz),
             speaker_control: 0,
-            rtc: RtcState::new(),
+            rtc: RtcState::new(guest_memory_size),
         }
     }
 

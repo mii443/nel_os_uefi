@@ -464,7 +464,7 @@ impl VmController {
             .saturating_mul(vmm::VCPU_TIME_SLICE_MILLIS);
         let result = match self.vms[vm_index].vcpu.as_mut() {
             Some(vcpu) => loop {
-                if let Err(error) = vcpu.run(allocator) {
+                if let Err(error) = vcpu.run(allocator, self.block.as_mut()) {
                     break Err(error);
                 }
                 let now = unsafe { core::arch::x86_64::_rdtsc() };

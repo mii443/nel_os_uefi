@@ -15,6 +15,7 @@ use crate::{
     constant::PAGE_SIZE,
     info, interrupt,
     network::{PassthroughDescriptor, PassthroughNic},
+    storage::{GuestVirtioBlock, VirtioBlock},
     vmm::{
         VCpu,
         x86_64::{
@@ -79,6 +80,9 @@ pub struct IntelVCpu {
     io_bitmap: IOBitmap,
     preemption_timer_ticks: u32,
     passthrough: Option<PassthroughNic>,
+    guest_block: GuestVirtioBlock,
+    fw_cfg: common::fw_cfg::FwCfg,
+    pm_timer: u32,
     pub host_xcr0: u64,
     pub guest_xcr0: XCR0,
 }
@@ -89,7 +93,7 @@ impl IntelVCpu {
         vmwrite(x86::vmx::vmcs::host::RSP, rsp).unwrap();
     }
 
-    fn vmexit_handler(&mut self) -> Result<(), &'static str> {
+    fn vmexit_handler(&mut self, block: Option<&mut VirtioBlock>) -> Result<(), &'static str> {
         use x86::vmx::vmcs;
         let exit_reason_raw = vmread(vmcs::ro::EXIT_REASON)? as u32;
 
@@ -186,12 +190,94 @@ impl IntelVCpu {
                         3 => 4,
                         _ => 0,
                     };
+                    let is_config_address = (0x0cf8..=0x0cfb).contains(&qual_io.port());
+                    let guest_block_handled = size != 0
+                        && !is_config_address
+                        && self.guest_block.handles_port(qual_io.port());
                     let passthrough_handled = size != 0
+                        && !is_config_address
+                        && !guest_block_handled
                         && self
                             .passthrough
                             .as_ref()
                             .is_some_and(|device| device.handles_port(qual_io.port()));
-                    let io_result = if passthrough_handled {
+                    let io_result = if size == 0 {
+                        Err("Invalid I/O operand size")
+                    } else if qual_io.string() != 0 || qual_io.rep() != 0 {
+                        if qual_io.direction() != 1 || qual_io.port() != 0x511 || size != 1 {
+                            Err("String/REP guest I/O is unsupported")
+                        } else {
+                            let count = if qual_io.rep() != 0 {
+                                self.guest_registers.rcx
+                            } else {
+                                1
+                            };
+                            if count > self.guest_memory_size {
+                                Err("Intel guest fw_cfg transfer is too large")
+                            } else {
+                                let es_base = vmread(vmcs::guest::ES_BASE)?;
+                                let decrement = vmread(vmcs::guest::RFLAGS)? & (1 << 10) != 0;
+                                for _ in 0..count {
+                                    let address = es_base.wrapping_add(self.guest_registers.rdi);
+                                    let value = self.fw_cfg.read_u8(self.guest_memory_size);
+                                    self.ept.set(address, value)?;
+                                    self.guest_registers.rdi = if decrement {
+                                        self.guest_registers.rdi.wrapping_sub(1)
+                                    } else {
+                                        self.guest_registers.rdi.wrapping_add(1)
+                                    };
+                                }
+                                if qual_io.rep() != 0 {
+                                    self.guest_registers.rcx = 0;
+                                }
+                                Ok(())
+                            }
+                        }
+                    } else if is_config_address {
+                        if qual_io.direction() == 1 {
+                            let value = u64::from(self.guest_block.io_in(qual_io.port(), size, 0));
+                            let mask = match size {
+                                1 => u8::MAX as u64,
+                                2 => u16::MAX as u64,
+                                _ => u64::MAX,
+                            };
+                            self.guest_registers.rax = (self.guest_registers.rax & !mask) | value;
+                        } else {
+                            let value = self.guest_registers.rax as u32;
+                            self.guest_block
+                                .write_config_address(qual_io.port(), size, value);
+                            if let Some(device) = self.passthrough.as_mut() {
+                                device.io_out(qual_io.port(), size, value);
+                            }
+                        }
+                        Ok(())
+                    } else if guest_block_handled {
+                        let Some(block) = block else {
+                            return Err("VM virtio-blk backend is unavailable");
+                        };
+                        if qual_io.direction() == 1 {
+                            let value = u64::from(self.guest_block.io_in(
+                                qual_io.port(),
+                                size,
+                                block.capacity_sectors(),
+                            ));
+                            let mask = match size {
+                                1 => u8::MAX as u64,
+                                2 => u16::MAX as u64,
+                                _ => u64::MAX,
+                            };
+                            self.guest_registers.rax = (self.guest_registers.rax & !mask) | value;
+                            Ok(())
+                        } else {
+                            self.guest_block.io_out(
+                                qual_io.port(),
+                                size,
+                                self.guest_registers.rax as u32,
+                                &mut self.ept,
+                                block,
+                            )
+                        }
+                    } else if passthrough_handled {
                         let device = self.passthrough.as_mut().unwrap();
                         if qual_io.direction() == 1 {
                             let value = u64::from(device.io_in(qual_io.port(), size));
@@ -204,6 +290,21 @@ impl IntelVCpu {
                         } else {
                             device.io_out(qual_io.port(), size, self.guest_registers.rax as u32);
                         }
+                        Ok(())
+                    } else if qual_io.direction() == 1 && qual_io.port() == 0x511 && size == 1 {
+                        self.guest_registers.rax = (self.guest_registers.rax & !0xff)
+                            | u64::from(self.fw_cfg.read_u8(self.guest_memory_size));
+                        Ok(())
+                    } else if qual_io.direction() == 0 && qual_io.port() == 0x510 && size == 2 {
+                        self.fw_cfg.select(self.guest_registers.rax as u16);
+                        Ok(())
+                    } else if qual_io.direction() == 1
+                        && matches!(qual_io.port(), 0x608 | 0xb008)
+                        && size == 4
+                    {
+                        self.pm_timer = self.pm_timer.wrapping_add(357_954);
+                        self.guest_registers.rax = (self.guest_registers.rax & !(u32::MAX as u64))
+                            | u64::from(self.pm_timer);
                         Ok(())
                     } else {
                         self.pic.handle_io(&mut self.guest_registers, qual_io)
@@ -427,7 +528,8 @@ impl IntelVCpu {
             self.guest_memory_initialized = true;
         }
 
-        common::linux::load_kernel(self)?;
+        self.ept
+            .set_slice(common::uefi::FIRMWARE_BASE, common::uefi::firmware_image()?)?;
 
         msr::register_msrs(self).map_err(|_| "MSR error")?;
         msr::_update_msrs(self).map_err(|_| "MSR error")?;
@@ -462,6 +564,31 @@ impl IntelVCpu {
             }
             gpa += 0x1000;
             pages -= 1;
+        }
+
+        let firmware = common::uefi::firmware_image()?;
+        for (index, page) in firmware.chunks(PAGE_SIZE).enumerate() {
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or("No free frames for guest UEFI firmware")?;
+            let hpa = frame.start_address().as_u64();
+            unsafe {
+                core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE);
+                core::ptr::copy_nonoverlapping(page.as_ptr(), hpa as *mut u8, page.len());
+            }
+            self.ept.map_4k(
+                common::uefi::FIRMWARE_BASE + index as u64 * PAGE_SIZE as u64,
+                hpa,
+                frame_allocator,
+            )?;
+        }
+        for gpa in common::uefi::PLATFORM_MMIO_PAGES {
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or("No free frames for guest UEFI platform MMIO")?;
+            let hpa = frame.start_address().as_u64();
+            unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE) };
+            self.ept.map_4k(gpa, hpa, frame_allocator)?;
         }
 
         if let Some(device) = self.passthrough.as_ref() {
@@ -532,11 +659,7 @@ impl IntelVCpu {
 
     fn setup_guest_state(&mut self) -> Result<(), &'static str> {
         use x86::{controlregs::*, vmx::vmcs};
-        let cr0 = (Cr0::empty()
-            | Cr0::CR0_PROTECTED_MODE
-            | Cr0::CR0_NUMERIC_ERROR
-            | Cr0::CR0_EXTENSION_TYPE)
-            & !Cr0::CR0_ENABLE_PAGING;
+        let cr0 = Cr0::CR0_EXTENSION_TYPE;
         vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
         vmwrite(vmcs::guest::CR3, 0)?;
         // VMCLEAR resets the VMCS launch state but does not clear guest-state
@@ -547,7 +670,7 @@ impl IntelVCpu {
                 & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
         )?;
 
-        vmwrite(vmcs::guest::CS_BASE, 0)?;
+        vmwrite(vmcs::guest::CS_BASE, common::uefi::RESET_VECTOR_CS_BASE)?;
         vmwrite(vmcs::guest::SS_BASE, 0)?;
         vmwrite(vmcs::guest::DS_BASE, 0)?;
         vmwrite(vmcs::guest::ES_BASE, 0)?;
@@ -556,12 +679,12 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::IDTR_BASE, 0)?;
         vmwrite(vmcs::guest::LDTR_BASE, 0xDEAD00)?;
 
-        vmwrite(vmcs::guest::CS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::SS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::DS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::ES_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::FS_LIMIT, u32::MAX as u64)?;
-        vmwrite(vmcs::guest::GS_LIMIT, u32::MAX as u64)?;
+        vmwrite(vmcs::guest::CS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::SS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::DS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::ES_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::FS_LIMIT, 0xffff)?;
+        vmwrite(vmcs::guest::GS_LIMIT, 0xffff)?;
         vmwrite(vmcs::guest::TR_LIMIT, 0)?;
         vmwrite(vmcs::guest::GDTR_LIMIT, 0)?;
         vmwrite(vmcs::guest::IDTR_LIMIT, 0)?;
@@ -573,9 +696,9 @@ impl IntelVCpu {
             .with_executable(true)
             .with_desc_type(DescriptorType::Code)
             .with_dpl(0)
-            .with_granularity(Granularity::KByte)
+            .with_granularity(Granularity::Byte)
             .with_long(false)
-            .with_db(true);
+            .with_db(false);
 
         let ds_right = SegmentRights::default()
             .with_rw(true)
@@ -583,9 +706,9 @@ impl IntelVCpu {
             .with_executable(false)
             .with_desc_type(DescriptorType::Code)
             .with_dpl(0)
-            .with_granularity(Granularity::KByte)
+            .with_granularity(Granularity::Byte)
             .with_long(false)
-            .with_db(true);
+            .with_db(false);
 
         let tr_right = SegmentRights::default()
             .with_rw(true)
@@ -620,7 +743,10 @@ impl IntelVCpu {
             u32::from(ldtr_right) as u64,
         )?;
 
-        vmwrite(vmcs::guest::CS_SELECTOR, 0)?;
+        vmwrite(
+            vmcs::guest::CS_SELECTOR,
+            u64::from(common::uefi::RESET_VECTOR_CS),
+        )?;
         vmwrite(vmcs::guest::SS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::DS_SELECTOR, 0)?;
         vmwrite(vmcs::guest::ES_SELECTOR, 0)?;
@@ -646,8 +772,8 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::IA32_SYSENTER_EIP, 0)?;
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
 
-        vmwrite(vmcs::guest::RIP, common::linux::LAYOUT_KERNEL_BASE)?;
-        self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM;
+        vmwrite(vmcs::guest::RIP, common::uefi::RESET_VECTOR_IP)?;
+        self.guest_registers = GuestRegisters::default();
 
         // A pending reinjection belongs to the pre-reset guest and must not
         // leak into the new boot instance.
@@ -971,6 +1097,7 @@ impl VCpu for IntelVCpu {
     fn run(
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str> {
         self.prepare(frame_allocator)?;
         // A different VM may have made its VMCS current since this VM's
@@ -984,6 +1111,12 @@ impl VCpu for IntelVCpu {
             } else {
                 self.pic.pending_irq &= !(1 << irq);
             }
+        }
+        let (irq, asserted) = self.guest_block.interrupt_level();
+        if asserted {
+            self.pic.pending_irq |= 1 << irq;
+        } else {
+            self.pic.pending_irq &= !(1 << irq);
         }
         self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
         self.pic.poll_serial_input();
@@ -1009,7 +1142,7 @@ impl VCpu for IntelVCpu {
 
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
-        self.vmexit_handler()?;
+        self.vmexit_handler(block)?;
         self.halted_irq_retry = self.halted && self.pic.has_pending_interrupt();
 
         Ok(())
@@ -1037,13 +1170,16 @@ impl VCpu for IntelVCpu {
             .get()
             .copied()
             .ok_or("TSC frequency unavailable for Intel VCPU reset")?;
-        self.pic = super::io::Pic::new(tsc_khz);
+        self.pic = super::io::Pic::new(tsc_khz, self.guest_memory_size);
         self.halted = false;
         self.halted_irq_retry = false;
         self.host_pending_irq.store(0, Ordering::Release);
         if let Some(device) = self.passthrough.as_mut() {
             device.reset();
         }
+        self.guest_block.reset();
+        self.fw_cfg.reset();
+        self.pm_timer = 0;
         self.guest_xcr0 = XCR0::from(1);
         Ok(())
     }
@@ -1149,10 +1285,13 @@ impl VCpu for IntelVCpu {
             host_msr,
             guest_msr,
             ia32e_enabled: false,
-            pic: super::io::Pic::new(tsc_khz),
+            pic: super::io::Pic::new(tsc_khz, guest_memory_size),
             io_bitmap: IOBitmap::new(frame_allocator),
             preemption_timer_ticks: 1,
             passthrough,
+            guest_block: GuestVirtioBlock::new(),
+            fw_cfg: common::fw_cfg::FwCfg::new(),
+            pm_timer: 0,
             host_xcr0: host_xsave_mask,
             guest_xcr0: XCR0::from(1),
         })

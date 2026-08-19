@@ -9,7 +9,7 @@ passthrough. The hypervisor exposes that device's PCI configuration and MMIO
 BARs, while the QEMU Intel IOMMU translates guest DMA without exposing
 hypervisor memory.
 
-At boot the hypervisor creates and starts VM 0 with 128 MiB of RAM and one
+At boot the hypervisor creates and starts VM 0 with 256 MiB of RAM and one
 vCPU. Additional VMs are created dynamically with an explicit RAM size. There
 is no fixed VM-slot count; creation is limited by available host memory and
 hardware virtualization resources. VCPUs are scheduled round-robin on QEMU's
@@ -37,13 +37,18 @@ Intel hosts can build and run independently. `NEL_OS_LOCAL_CACHE_DIR`,
 ### Host virtio block device
 
 QEMU also gives the outer hypervisor one transitional virtio-blk device. The
-Linux `bzImage` and initramfs used by VM 0 live on this device instead of the
-UEFI ISO. During boot, the outer kernel reads both payloads through its legacy
-virtqueue and then loads them into guest RAM. The block device is retained by
-the hypervisor rather than passed through to VM 0. `info runtime` and `info
-all` report its capacity.
+block device is retained by the hypervisor and is never passed through to VM
+0. Instead, the outer kernel implements a separate legacy virtio-blk PCI
+device for the VM and services its virtqueue from the host-owned backing
+device. `info runtime` and `info all` report the backing device capacity.
 
-By default, `./run.sh` regenerates a 64 MiB raw boot bundle named
+VM 0 starts at the architectural x86 reset vector in its own OVMF firmware.
+That firmware discovers the emulated virtio-blk device, reads a normal GPT
+disk and EFI System Partition, starts systemd-boot, and finally launches the
+Linux EFI stub. The hypervisor therefore does not parse or directly load a
+Linux kernel from the disk image.
+
+By default, `./run.sh` regenerates a 64 MiB GPT disk named
 `host-block.img` in the host-local runtime directory from
 `nel_os_bootloader/bzImage` and `rootfs-n.cpio.gz`. Set
 `NEL_OS_BLOCK_SIZE_MIB` to choose its size. To build and attach another boot
@@ -55,14 +60,15 @@ bundle explicitly:
 NEL_OS_BLOCK_IMAGE=/tmp/linux.img ./run.sh
 ```
 
-An explicit image must already exist and use the NEL boot-bundle format; it is
-attached without being modified. `NEL_OS_BLOCK_SIZE_MIB` applies only when the
-default bundle is generated.
+An explicit image must already exist and be UEFI bootable; it is attached
+without being modified. This allows another Linux distribution or another
+UEFI-capable operating system image to use the same virtual disk interface.
+`NEL_OS_BLOCK_SIZE_MIB` applies only when the default image is generated.
 
 On a new Ubuntu host, install the host tools and rustup once:
 
 ```sh
-sudo apt-get install qemu-system-x86 ovmf xorriso mtools curl ca-certificates
+sudo apt-get install qemu-system-x86 ovmf xorriso mtools gdisk systemd-boot-efi curl ca-certificates
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
 sudo usermod -aG kvm "$USER"
 ```

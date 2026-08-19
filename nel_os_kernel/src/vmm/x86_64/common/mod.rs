@@ -1,6 +1,7 @@
+pub mod fw_cfg;
 pub mod fxsave;
-pub mod linux;
 pub mod segment;
+pub mod uefi;
 pub mod xsave;
 
 use core::arch::asm;

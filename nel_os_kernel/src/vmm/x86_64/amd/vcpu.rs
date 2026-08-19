@@ -9,6 +9,8 @@ use crate::{
     error, info,
     network::{PassthroughDescriptor, PassthroughNic},
     serial,
+    storage::{GuestVirtioBlock, VirtioBlock},
+    time,
     vmm::{
         VCpu,
         x86_64::{
@@ -43,6 +45,7 @@ pub struct AMDVCpu {
     legacy_timer: LegacyTimer,
     halted: bool,
     tsc_aux: u64,
+    apic_base: u64,
     nb_cfg: u64,
     host_patch_level: u64,
     guest_registers: GuestRegisters,
@@ -55,6 +58,9 @@ pub struct AMDVCpu {
     guest_memory_allocated: u64,
     guest_asid: u32,
     passthrough: Option<PassthroughNic>,
+    guest_block: GuestVirtioBlock,
+    fw_cfg: common::fw_cfg::FwCfg,
+    pm_timer: u32,
 }
 
 struct SerialState {
@@ -196,7 +202,7 @@ struct RtcState {
 }
 
 impl RtcState {
-    fn new() -> Self {
+    fn new(guest_memory_size: u64) -> Self {
         let mut registers = [0; 128];
         // Fixed, valid BCD timestamp: 2000-01-01 00:00:00 (Saturday).
         registers[0x06] = 0x07;
@@ -208,6 +214,20 @@ impl RtcState {
         registers[0x0c] = 0x00;
         registers[0x0d] = 0x80; // Valid RAM/time (VRT).
         registers[0x32] = 0x20; // Conventional BCD century byte.
+        // Conventional PC CMOS memory-size fields used by OVMF's QEMU
+        // platform PEI code before it has constructed a UEFI memory map.
+        registers[0x15] = 0x80; // 640 KiB, little-endian.
+        registers[0x16] = 0x02;
+        registers[0x17] = 0x00; // 15 MiB between 1 MiB and 16 MiB.
+        registers[0x18] = 0x3c;
+        registers[0x30] = registers[0x17];
+        registers[0x31] = registers[0x18];
+        let above_16m = guest_memory_size
+            .saturating_sub(16 * 1024 * 1024)
+            .div_ceil(64 * 1024)
+            .min(u16::MAX as u64) as u16;
+        registers[0x34] = above_16m as u8;
+        registers[0x35] = (above_16m >> 8) as u8;
         Self {
             selector: 0,
             registers,
@@ -257,9 +277,12 @@ struct PicState {
     slave_base: u8,
     master_phase: PicInitPhase,
     slave_phase: PicInitPhase,
-    read_isr: bool,
+    master_read_isr: bool,
+    slave_read_isr: bool,
     master_irr: u8,
     master_isr: u8,
+    slave_irr: u8,
+    slave_isr: u8,
 }
 
 impl PicState {
@@ -271,18 +294,22 @@ impl PicState {
             slave_base: 0x28,
             master_phase: PicInitPhase::Ready,
             slave_phase: PicInitPhase::Ready,
-            read_isr: false,
+            master_read_isr: false,
+            slave_read_isr: false,
             master_irr: 0,
             master_isr: 0,
+            slave_irr: 0,
+            slave_isr: 0,
         }
     }
 
     fn read(&self, port: u16) -> u8 {
         match port {
-            0x20 if self.read_isr => self.master_isr,
+            0x20 if self.master_read_isr => self.master_isr,
             0x20 => self.master_irr,
             0x21 => self.master_mask,
-            0xa0 => 0,
+            0xa0 if self.slave_read_isr => self.slave_isr,
+            0xa0 => self.slave_irr,
             0xa1 => self.slave_mask,
             _ => u8::MAX,
         }
@@ -299,15 +326,25 @@ impl PicState {
             0xa0 if value & 0x10 != 0 => {
                 self.slave_phase = PicInitPhase::Icw2;
                 self.slave_mask = u8::MAX;
+                self.slave_irr = 0;
+                self.slave_isr = 0;
             }
-            0x20 if value == 0x0a => self.read_isr = false,
-            0x20 if value == 0x0b => self.read_isr = true,
+            0x20 if value == 0x0a => self.master_read_isr = false,
+            0x20 if value == 0x0b => self.master_read_isr = true,
+            0xa0 if value == 0x0a => self.slave_read_isr = false,
+            0xa0 if value == 0x0b => self.slave_read_isr = true,
             0x20 if value == 0x20 => {
                 if self.master_isr != 0 {
                     self.master_isr &= !(1 << self.master_isr.trailing_zeros());
                 }
             }
             0x20 if value & 0xf8 == 0x60 => self.master_isr &= !(1 << (value & 7)),
+            0xa0 if value == 0x20 => {
+                if self.slave_isr != 0 {
+                    self.slave_isr &= !(1 << self.slave_isr.trailing_zeros());
+                }
+            }
+            0xa0 if value & 0xf8 == 0x60 => self.slave_isr &= !(1 << (value & 7)),
             0x21 => match self.master_phase {
                 PicInitPhase::Icw2 => {
                     self.master_base = value & 0xf8;
@@ -331,14 +368,24 @@ impl PicState {
     }
 
     fn raise_irq(&mut self, irq: u8) {
-        self.master_irr |= 1 << irq;
+        if irq < 8 {
+            self.master_irr |= 1 << irq;
+        } else if irq < 16 {
+            self.slave_irr |= 1 << (irq - 8);
+            self.master_irr |= 1 << 2;
+        }
     }
 
     fn set_irq_level(&mut self, irq: u8, asserted: bool) {
         if asserted {
             self.raise_irq(irq);
-        } else {
+        } else if irq < 8 {
             self.master_irr &= !(1 << irq);
+        } else if irq < 16 {
+            self.slave_irr &= !(1 << (irq - 8));
+            if self.slave_irr == 0 {
+                self.master_irr &= !(1 << 2);
+            }
         }
     }
 
@@ -351,12 +398,32 @@ impl PicState {
             let in_service = self.master_isr.trailing_zeros() as u8;
             pending &= (1u8 << in_service).wrapping_sub(1);
         }
-        (pending != 0).then(|| pending.trailing_zeros() as u8)
+        if pending == 0 {
+            return None;
+        }
+        let master_irq = pending.trailing_zeros() as u8;
+        if master_irq != 2 {
+            return Some(master_irq);
+        }
+        let mut slave_pending = self.slave_irr & !self.slave_mask;
+        if self.slave_isr != 0 {
+            let in_service = self.slave_isr.trailing_zeros() as u8;
+            slave_pending &= (1u8 << in_service).wrapping_sub(1);
+        }
+        (slave_pending != 0).then(|| 8 + slave_pending.trailing_zeros() as u8)
     }
 
     fn acknowledge(&mut self, irq: u8) {
-        self.master_irr &= !(1 << irq);
-        self.master_isr |= 1 << irq;
+        if irq < 8 {
+            self.master_irr &= !(1 << irq);
+            self.master_isr |= 1 << irq;
+        } else {
+            let slave_irq = irq - 8;
+            self.slave_irr &= !(1 << slave_irq);
+            self.slave_isr |= 1 << slave_irq;
+            self.master_irr &= !(1 << 2);
+            self.master_isr |= 1 << 2;
+        }
     }
 }
 
@@ -540,7 +607,7 @@ impl AMDVCpu {
     where
         Self: X86VCpu,
     {
-        info!("Setting up AMD VCPU for a Linux guest");
+        info!("Setting up AMD VCPU for a UEFI guest");
 
         // Without the hardware pause filter, intercepting every PAUSE turns
         // normal spin loops into a VMEXIT storm. Require the architectural
@@ -560,8 +627,9 @@ impl AMDVCpu {
             }
             self.guest_memory_initialized = true;
         }
-        common::linux::load_kernel(self)?;
-        self.setup_linux_segments();
+        self.npt
+            .set_slice(common::uefi::FIRMWARE_BASE, common::uefi::firmware_image()?)?;
+        self.setup_uefi_reset_segments();
 
         {
             let raw_vmcb = self.vmcb.get_raw_vmcb();
@@ -606,17 +674,14 @@ impl AMDVCpu {
             raw_vmcb.control_area.nested_page_table_cr3 =
                 self.npt.root_table.start_address().as_u64();
 
-            // Linux's 32-bit boot entry starts with paging and long mode off.
-            // SVME remains set because it is required by SVM guest-state
-            // validation; nested VMRUN is intercepted above.
+            // Start at the architectural x86 reset vector. SVME remains set
+            // because SVM requires it in the guest EFER.
             raw_vmcb.state_save_area.efer = 1 << 12;
-            raw_vmcb.state_save_area.rip = common::linux::LAYOUT_KERNEL_BASE;
+            raw_vmcb.state_save_area.rip = common::uefi::RESET_VECTOR_IP;
             raw_vmcb.state_save_area.rsp = 0;
             info!("Guest RIP set to {:x}", raw_vmcb.state_save_area.rip);
 
-            // PE | ET | NE, with paging disabled as required by the Linux
-            // protected-mode boot protocol.
-            raw_vmcb.state_save_area.cr0 = (1 << 0) | (1 << 4) | (1 << 5);
+            raw_vmcb.state_save_area.cr0 = 1 << 4;
             raw_vmcb.state_save_area.cr3 = 0;
             raw_vmcb.state_save_area.cr4 = 0;
             raw_vmcb.state_save_area.dr6 = 0xffff_0ff0;
@@ -629,14 +694,14 @@ impl AMDVCpu {
             raw_vmcb.state_save_area.cpl = 0;
         }
 
-        self.guest_registers.rsi = common::linux::LAYOUT_BOOTPARAM;
+        self.guest_registers = GuestRegisters::default();
 
         self.dump_guest_state();
 
         Ok(())
     }
 
-    fn setup_linux_segments(&mut self) {
+    fn setup_uefi_reset_segments(&mut self) {
         let raw_vmcb = self.vmcb.get_raw_vmcb();
 
         let code_attrib = common::segment::SegmentRights {
@@ -649,8 +714,8 @@ impl AMDVCpu {
             present: true,
             avl: false,
             long: false,
-            db: true,
-            granularity: common::segment::Granularity::KByte,
+            db: false,
+            granularity: common::segment::Granularity::Byte,
         }
         .to_amd_segment_attrib();
         let data_attrib = common::segment::SegmentRights {
@@ -663,8 +728,8 @@ impl AMDVCpu {
             present: true,
             avl: false,
             long: false,
-            db: true,
-            granularity: common::segment::Granularity::KByte,
+            db: false,
+            granularity: common::segment::Granularity::Byte,
         }
         .to_amd_segment_attrib();
         let tr_attrib = common::segment::SegmentRights {
@@ -682,10 +747,10 @@ impl AMDVCpu {
         }
         .to_amd_segment_attrib();
 
-        raw_vmcb.state_save_area.cs.selector = 0;
+        raw_vmcb.state_save_area.cs.selector = common::uefi::RESET_VECTOR_CS;
         raw_vmcb.state_save_area.cs.attrib = code_attrib;
-        raw_vmcb.state_save_area.cs.limit = u32::MAX;
-        raw_vmcb.state_save_area.cs.base = 0;
+        raw_vmcb.state_save_area.cs.limit = 0xffff;
+        raw_vmcb.state_save_area.cs.base = common::uefi::RESET_VECTOR_CS_BASE;
 
         for segment in [
             &mut raw_vmcb.state_save_area.ss,
@@ -696,7 +761,7 @@ impl AMDVCpu {
         ] {
             segment.selector = 0;
             segment.attrib = data_attrib;
-            segment.limit = u32::MAX;
+            segment.limit = 0xffff;
             segment.base = 0;
         }
 
@@ -748,6 +813,34 @@ impl AMDVCpu {
             }
             gpa += PAGE_SIZE;
         }
+
+        let firmware = common::uefi::firmware_image()?;
+        for (index, page) in firmware.chunks(PAGE_SIZE as usize).enumerate() {
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or("No free frames for guest UEFI firmware")?;
+            let hpa = frame.start_address().as_u64();
+            unsafe {
+                core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::copy_nonoverlapping(page.as_ptr(), hpa as *mut u8, page.len());
+            }
+            self.npt.map_4k(
+                common::uefi::FIRMWARE_BASE + index as u64 * PAGE_SIZE,
+                hpa,
+                frame_allocator,
+            )?;
+        }
+        for gpa in common::uefi::PLATFORM_MMIO_PAGES {
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or("No free frames for guest UEFI platform MMIO")?;
+            let hpa = frame.start_address().as_u64();
+            unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE as usize) };
+            self.npt.map_4k(gpa, hpa, frame_allocator)?;
+        }
+        let hpet_capabilities = (69_841_279u64 << 32) | (1 << 13) | 1;
+        self.npt
+            .set_slice(0xfed0_0000, &hpet_capabilities.to_le_bytes())?;
 
         if let Some(device) = self.passthrough.as_ref() {
             for (base, size) in device.mmio_regions() {
@@ -946,6 +1039,9 @@ impl AMDVCpu {
     }
 
     fn prepare_device_interrupt(&mut self) -> Result<(), &'static str> {
+        let hpet_counter = (time::get_ticks() as u64).wrapping_mul(14_318);
+        self.npt
+            .set_slice(0xfed0_00f0, &hpet_counter.to_le_bytes())?;
         if self.legacy_timer.pit.poll() {
             self.legacy_timer.pic.raise_irq(0);
         }
@@ -954,6 +1050,8 @@ impl AMDVCpu {
             let (irq, asserted) = device.poll_interrupt_level();
             self.legacy_timer.pic.set_irq_level(irq, asserted);
         }
+        let (irq, asserted) = self.guest_block.interrupt_level();
+        self.legacy_timer.pic.set_irq_level(irq, asserted);
         let next_irq = self.legacy_timer.pic.next_irq();
 
         let vmcb = self.vmcb.get_raw_vmcb();
@@ -989,7 +1087,11 @@ impl AMDVCpu {
         }
 
         const EVENT_VALID: u64 = 1 << 31;
-        let vector = self.legacy_timer.pic.master_base.wrapping_add(irq);
+        let vector = if irq < 8 {
+            self.legacy_timer.pic.master_base.wrapping_add(irq)
+        } else {
+            self.legacy_timer.pic.slave_base.wrapping_add(irq - 8)
+        };
         let control = &mut self.vmcb.get_raw_vmcb().control_area;
         // EVENTINJ type 0 is an architectural external interrupt.
         control.event_injection = vector as u64 | EVENT_VALID;
@@ -1037,7 +1139,7 @@ impl AMDVCpu {
         control.vmcb_clean_bits = 0;
     }
 
-    fn handle_io(&mut self) -> Result<(), &'static str> {
+    fn handle_io(&mut self, block: Option<&mut VirtioBlock>) -> Result<(), &'static str> {
         let exit_info = self.vmcb.get_raw_vmcb().control_area.exit_info1;
         let is_input = exit_info & 1 != 0;
         let is_string = exit_info & (1 << 2) != 0;
@@ -1045,15 +1147,80 @@ impl AMDVCpu {
         let size_bits = (exit_info >> 4) & 0x7;
         let port = ((exit_info >> 16) & 0xffff) as u16;
 
-        if is_string || is_rep {
-            return Err("AMD guest attempted unsupported string I/O");
-        }
         let size = match size_bits {
             1 => 1,
             2 => 2,
             4 => 4,
             _ => return Err("AMD guest attempted I/O with invalid operand size"),
         };
+
+        if is_string || is_rep {
+            if !is_input || port != 0x511 || size != 1 {
+                return Err("AMD guest attempted unsupported string I/O");
+            }
+            let count = if is_rep { self.guest_registers.rcx } else { 1 };
+            if count > self.guest_memory_size {
+                return Err("AMD guest fw_cfg transfer is too large");
+            }
+            let decrement = self.vmcb.get_raw_vmcb().state_save_area.rflags & (1 << 10) != 0;
+            for _ in 0..count {
+                let address =
+                    self.vmcb.get_raw_vmcb().state_save_area.es.base + self.guest_registers.rdi;
+                let value = self.fw_cfg.read_u8(self.guest_memory_size);
+                self.npt.set(address, value)?;
+                self.guest_registers.rdi = if decrement {
+                    self.guest_registers.rdi.wrapping_sub(1)
+                } else {
+                    self.guest_registers.rdi.wrapping_add(1)
+                };
+            }
+            if is_rep {
+                self.guest_registers.rcx = 0;
+            }
+            return self.advance_guest_rip();
+        }
+
+        let is_config_address = (0x0cf8..=0x0cfb).contains(&port);
+        if is_config_address {
+            if is_input {
+                let value = self.guest_block.io_in(port, size, 0);
+                let mask = match size {
+                    1 => u8::MAX as u64,
+                    2 => u16::MAX as u64,
+                    _ => u64::MAX,
+                };
+                let rax = &mut self.vmcb.get_raw_vmcb().state_save_area.rax;
+                *rax = (*rax & !mask) | u64::from(value);
+            } else {
+                let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u32;
+                self.guest_block.write_config_address(port, size, value);
+                if let Some(device) = self.passthrough.as_mut() {
+                    device.io_out(port, size, value);
+                }
+            }
+            return self.advance_guest_rip();
+        }
+
+        if self.guest_block.handles_port(port) {
+            let Some(block) = block else {
+                return Err("VM virtio-blk backend is unavailable");
+            };
+            if is_input {
+                let value = u64::from(self.guest_block.io_in(port, size, block.capacity_sectors()));
+                let mask = match size {
+                    1 => u8::MAX as u64,
+                    2 => u16::MAX as u64,
+                    _ => u64::MAX,
+                };
+                let rax = &mut self.vmcb.get_raw_vmcb().state_save_area.rax;
+                *rax = (*rax & !mask) | value;
+            } else {
+                let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u32;
+                self.guest_block
+                    .io_out(port, size, value, &mut self.npt, block)?;
+            }
+            return self.advance_guest_rip();
+        }
 
         if self
             .passthrough
@@ -1084,6 +1251,14 @@ impl AMDVCpu {
                 (0x61, 1) => self.legacy_timer.speaker_status() as u32,
                 (0x70, 1) => self.rtc.read_selector() as u32,
                 (0x71, 1) => self.rtc.read_data() as u32,
+                (0x511, 1) => self.fw_cfg.read_u8(self.guest_memory_size) as u32,
+                (0x608, 4) | (0xb008, 4) => {
+                    // Firmware delay loops only need a monotonic ACPI timer.
+                    // Advancing by 100 ms per trapped read avoids turning
+                    // thousands of nested PIO exits into minute-long boots.
+                    self.pm_timer = self.pm_timer.wrapping_add(357_954);
+                    self.pm_timer
+                }
                 (0x20 | 0x21 | 0xa0 | 0xa1, 1) => self.legacy_timer.pic.read(port) as u32,
                 (0x3f8..=0x3ff, 1) => self.serial_in(port) as u32,
                 (_, 1) => u8::MAX as u32,
@@ -1124,6 +1299,9 @@ impl AMDVCpu {
         } else if size == 1 && (0x3f8..=0x3ff).contains(&port) {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.serial_out(port, value);
+        } else if size == 2 && port == 0x510 {
+            let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u16;
+            self.fw_cfg.select(value);
         }
 
         if size == 1 && (0x3f8..=0x3ff).contains(&port) {
@@ -1172,6 +1350,7 @@ impl AMDVCpu {
 
     fn handle_msr(&mut self) -> Result<(), &'static str> {
         const EFER: u32 = 0xc000_0080;
+        const APIC_BASE: u32 = 0x1b;
         const STAR: u32 = 0xc000_0081;
         const LSTAR: u32 = 0xc000_0082;
         const CSTAR: u32 = 0xc000_0083;
@@ -1194,6 +1373,7 @@ impl AMDVCpu {
                 | self.vmcb.get_raw_vmcb().state_save_area.rax as u32 as u64;
             let state = &mut self.vmcb.get_raw_vmcb().state_save_area;
             match index {
+                APIC_BASE => self.apic_base = value & 0xffff_f000 | (value & 0xd00),
                 EFER => state.efer = value | (1 << 12),
                 STAR => state.star = value,
                 LSTAR => state.lstar = value,
@@ -1223,6 +1403,7 @@ impl AMDVCpu {
         } else {
             let state = &self.vmcb.get_raw_vmcb().state_save_area;
             let value = match index {
+                APIC_BASE => self.apic_base,
                 EFER => state.efer,
                 STAR => state.star,
                 LSTAR => state.lstar,
@@ -1338,6 +1519,7 @@ impl VCpu for AMDVCpu {
     fn run(
         &mut self,
         frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str> {
         interrupts::without_interrupts(|| {
             let result = (|| unsafe {
@@ -1419,8 +1601,12 @@ impl VCpu for AMDVCpu {
                         self.halted = true;
                         Ok(())
                     }
-                    0x7b => self.handle_io(),
+                    0x7b => self.handle_io(block),
                     0x7c => self.handle_msr(),
+                    // Guest firmware uses WBINVD while publishing its memory
+                    // map. Guest RAM is coherent host memory, so it is safe to
+                    // complete this as a no-op.
+                    0x89 => self.advance_guest_rip(),
                     0x8c => Err("AMD guest attempted unsupported XSETBV"),
                     0x7f => Err("AMD guest shutdown (likely a triple fault)"),
                     0x400 => Err("AMD nested page fault"),
@@ -1451,6 +1637,9 @@ impl VCpu for AMDVCpu {
         if let Some(device) = self.passthrough.as_mut() {
             device.reset();
         }
+        self.guest_block.reset();
+        self.fw_cfg.reset();
+        self.pm_timer = 0;
         let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
             .get()
             .copied()
@@ -1458,10 +1647,11 @@ impl VCpu for AMDVCpu {
         self.initialized = false;
         self.exit_reported = false;
         self.serial = SerialState::default();
-        self.rtc = RtcState::new();
+        self.rtc = RtcState::new(self.guest_memory_size);
         self.legacy_timer = LegacyTimer::new(tsc_khz);
         self.halted = false;
         self.tsc_aux = 0;
+        self.apic_base = 0xfee0_0900;
         self.nb_cfg = 0;
         self.guest_registers = GuestRegisters::default();
         self.guest_fx_state = FxState::guest_default();
@@ -1566,10 +1756,11 @@ impl VCpu for AMDVCpu {
             npt: Npt::new(frame_allocator)?,
             permission_maps,
             serial: SerialState::default(),
-            rtc: RtcState::new(),
+            rtc: RtcState::new(guest_memory_size),
             legacy_timer: LegacyTimer::new(tsc_khz),
             halted: false,
             tsc_aux: 0,
+            apic_base: 0xfee0_0900,
             nb_cfg: 0,
             host_patch_level,
             guest_registers: GuestRegisters::default(),
@@ -1584,6 +1775,9 @@ impl VCpu for AMDVCpu {
             // translations isolated when VMs are scheduled round-robin.
             guest_asid,
             passthrough,
+            guest_block: GuestVirtioBlock::new(),
+            fw_cfg: common::fw_cfg::FwCfg::new(),
+            pm_timer: 0,
         })
     }
 

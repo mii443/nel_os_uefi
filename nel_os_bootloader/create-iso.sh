@@ -8,6 +8,7 @@ readonly RUNTIME_DIR="$(realpath -m -- "$2")"
 readonly FAT_IMAGE="${RUNTIME_DIR}/fat.img"
 readonly ISO_ROOT="${RUNTIME_DIR}/iso"
 readonly ISO_IMAGE="${RUNTIME_DIR}/nel_os.iso"
+readonly GUEST_FIRMWARE="${RUNTIME_DIR}/guest-firmware.fd"
 KERNEL_PROFILE=""
 KERNEL_BUILD_ARGS=()
 
@@ -50,6 +51,9 @@ mmd -i "${FAT_IMAGE}" ::/EFI
 mmd -i "${FAT_IMAGE}" ::/EFI/BOOT
 mcopy -i "${FAT_IMAGE}" "${EFI_BINARY}" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "${FAT_IMAGE}" "${KERNEL_BINARY}" ::/nel_os_kernel.elf
+cp "${SOURCE_DIR}/OVMF_VARS.fd" "${GUEST_FIRMWARE}"
+dd if="${SOURCE_DIR}/OVMF_CODE.fd" of="${GUEST_FIRMWARE}" bs=128K seek=1 conv=notrunc status=none
+mcopy -i "${FAT_IMAGE}" "${GUEST_FIRMWARE}" ::/guest-firmware.fd
 
 mkdir "${ISO_ROOT}"
 cp "${FAT_IMAGE}" "${ISO_ROOT}/fat.img"

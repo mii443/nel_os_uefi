@@ -49,6 +49,31 @@ fn read_file(name: &CStr16) -> Box<[u8]> {
     buf.into_boxed_slice()
 }
 
+fn load_file_to_loader_data(name: &CStr16) -> (u64, u64) {
+    let mut root = get_fs();
+    let file_info = root
+        .open(name, FileMode::Read, FileAttribute::empty())
+        .expect("Failed to open file");
+    let mut file = file_info
+        .into_regular_file()
+        .expect("Failed to convert to regular file");
+    let file_size = file
+        .get_boxed_info::<FileInfo>()
+        .expect("Failed to get file info")
+        .file_size();
+    let page_ptr = uefi::boot::allocate_pages(
+        AllocateType::AnyPages,
+        MemoryType::LOADER_DATA,
+        file_size.div_ceil(4096) as usize,
+    )
+    .expect("Failed to allocate pages")
+    .as_ptr();
+    let buffer = unsafe { slice::from_raw_parts_mut(page_ptr, file_size as usize) };
+    let read_size = file.read(buffer).expect("Failed to read file");
+    println!("file {} size: {}", name, read_size);
+    (page_ptr as u64, file_size)
+}
+
 fn load_elf(bin: Box<[u8]>) -> u64 {
     let elf = elf::Elf::parse(&bin).expect("Failed to parse elf");
     let mut dest_start = u64::MAX;
@@ -143,6 +168,8 @@ fn main() -> Status {
     println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     let kernel = read_file(cstr16!("nel_os_kernel.elf"));
+    let (guest_firmware_addr, guest_firmware_size) =
+        load_file_to_loader_data(cstr16!("guest-firmware.fd"));
 
     let entry_point = load_elf(kernel);
 
@@ -194,5 +221,7 @@ fn main() -> Status {
         usable_memory,
         frame_buffer,
         rsdp,
+        guest_firmware_addr,
+        guest_firmware_size,
     });
 }

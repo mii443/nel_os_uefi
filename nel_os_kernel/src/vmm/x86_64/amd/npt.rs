@@ -3,6 +3,8 @@ use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
+use crate::storage::GuestMemory;
+
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
 const ENTRY_USER: u64 = 1 << 2;
@@ -158,5 +160,19 @@ impl Npt {
 
     fn frame_to_table(frame: PhysFrame) -> &'static mut [u64; 512] {
         unsafe { &mut *(frame.start_address().as_u64() as *mut [u64; 512]) }
+    }
+}
+
+impl GuestMemory for Npt {
+    fn read_u8(&mut self, address: u64) -> Result<u8, &'static str> {
+        self.get(address)
+    }
+
+    fn write_u8(&mut self, address: u64, value: u8) -> Result<(), &'static str> {
+        self.set(address, value)
+    }
+
+    fn write_slice(&mut self, address: u64, input: &[u8]) -> Result<(), &'static str> {
+        self.set_slice(address, input)
     }
 }
