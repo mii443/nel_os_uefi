@@ -80,6 +80,9 @@ pub struct IntelVCpu {
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
     pub(super) guest_apic_base: u64,
+    pub(super) guest_misc_enable: u64,
+    pub(super) local_apic: common::local_apic::LocalApic,
+    pub(super) io_apic: common::io_apic::IoApic,
     pub ia32e_enabled: bool,
     pub pic: super::io::Pic,
     io_bitmap: IOBitmap,
@@ -87,7 +90,8 @@ pub struct IntelVCpu {
     passthrough: Option<PassthroughNic>,
     guest_block: GuestVirtioBlock,
     fw_cfg: common::fw_cfg::FwCfg,
-    pm_timer: u32,
+    pm_timer: common::timer::AcpiPmTimer,
+    pm_registers: common::timer::AcpiPmRegisters,
     pub host_xcr0: u64,
     pub guest_xcr0: XCR0,
 }
@@ -316,9 +320,27 @@ impl IntelVCpu {
                         && matches!(qual_io.port(), 0x608 | 0xb008)
                         && size == 4
                     {
-                        self.pm_timer = self.pm_timer.wrapping_add(357_954);
                         self.guest_registers.rax = (self.guest_registers.rax & !(u32::MAX as u64))
-                            | u64::from(self.pm_timer);
+                            | u64::from(self.pm_timer.read());
+                        Ok(())
+                    } else if qual_io.direction() == 1
+                        && let Some(value) = self.pm_registers.read(qual_io.port(), size)
+                    {
+                        let mask = if size == 2 {
+                            u16::MAX as u64
+                        } else {
+                            u32::MAX as u64
+                        };
+                        self.guest_registers.rax =
+                            (self.guest_registers.rax & !mask) | u64::from(value);
+                        Ok(())
+                    } else if qual_io.direction() == 0
+                        && self.pm_registers.write(
+                            qual_io.port(),
+                            size,
+                            self.guest_registers.rax as u32,
+                        )
+                    {
                         Ok(())
                     } else {
                         self.pic.handle_io(&mut self.guest_registers, qual_io)
@@ -428,6 +450,88 @@ impl IntelVCpu {
         }
 
         Ok(())
+    }
+
+    fn inject_local_apic_timer(&mut self) -> Result<bool, &'static str> {
+        use x86::vmx::vmcs as hw_vmcs;
+
+        let Some(vector) = self.local_apic.pending_timer_vector() else {
+            return Ok(false);
+        };
+        if vmread(hw_vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)? & (1 << 31) != 0
+            || vmread(hw_vmcs::guest::RFLAGS)? & (1 << 9) == 0
+            || vmread(hw_vmcs::guest::INTERRUPTIBILITY_STATE)? & 0x3 != 0
+        {
+            return Ok(false);
+        }
+
+        let interrupt_info = vmcs::controls::EntryIntrInfo::new()
+            .with_vector(vector)
+            .with_typ(0)
+            .with_ec_available(false)
+            .with_valid(true);
+        vmwrite(
+            hw_vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            u32::from(interrupt_info) as u64,
+        )?;
+        self.local_apic.accept_interrupt(vector, false);
+        self.local_apic.acknowledge_timer();
+        Ok(true)
+    }
+
+    fn inject_io_apic_interrupt(&mut self) -> Result<bool, &'static str> {
+        use x86::vmx::vmcs as hw_vmcs;
+
+        let Some((irq, vector)) = self.io_apic.pending_vector() else {
+            return Ok(false);
+        };
+        if vmread(hw_vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)? & (1 << 31) != 0
+            || vmread(hw_vmcs::guest::RFLAGS)? & (1 << 9) == 0
+            || vmread(hw_vmcs::guest::INTERRUPTIBILITY_STATE)? & 0x3 != 0
+        {
+            return Ok(false);
+        }
+
+        let interrupt_info = vmcs::controls::EntryIntrInfo::new()
+            .with_vector(vector)
+            .with_typ(0)
+            .with_ec_available(false)
+            .with_valid(true);
+        vmwrite(
+            hw_vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            u32::from(interrupt_info) as u64,
+        )?;
+        self.local_apic
+            .accept_interrupt(vector, self.io_apic.is_level_triggered(irq));
+        self.io_apic.acknowledge(irq);
+        Ok(true)
+    }
+
+    fn inject_msi_interrupt(&mut self) -> Result<bool, &'static str> {
+        use x86::vmx::vmcs as hw_vmcs;
+
+        let Some(vector) = self.guest_block.pending_msi_vector() else {
+            return Ok(false);
+        };
+        if vmread(hw_vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD)? & (1 << 31) != 0
+            || vmread(hw_vmcs::guest::RFLAGS)? & (1 << 9) == 0
+            || vmread(hw_vmcs::guest::INTERRUPTIBILITY_STATE)? & 0x3 != 0
+        {
+            return Ok(false);
+        }
+
+        let interrupt_info = vmcs::controls::EntryIntrInfo::new()
+            .with_vector(vector)
+            .with_typ(0)
+            .with_ec_available(false)
+            .with_valid(true);
+        vmwrite(
+            hw_vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+            u32::from(interrupt_info) as u64,
+        )?;
+        self.local_apic.accept_interrupt(vector, false);
+        self.guest_block.acknowledge_msi();
+        Ok(true)
     }
 
     fn preserve_interrupted_event(&mut self) -> Result<bool, &'static str> {
@@ -616,7 +720,12 @@ impl IntelVCpu {
                 .allocate_frame()
                 .ok_or("No free frames for guest UEFI platform MMIO")?;
             let hpa = frame.start_address().as_u64();
-            unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE) };
+            common::uefi::initialize_platform_mmio_page(gpa, hpa);
+            if gpa == 0xfec0_0000 {
+                self.io_apic.attach_page(hpa);
+            } else if gpa == 0xfee0_0000 {
+                self.local_apic.attach_page(hpa);
+            }
             self.ept.map_mmio_4k(gpa, hpa, frame_allocator)?;
         }
 
@@ -832,7 +941,7 @@ impl IntelVCpu {
         vmwrite(vmcs::guest::GS_BASE, 0)?;
 
         vmwrite(vmcs::guest::IA32_DEBUGCTL_FULL, 0)?;
-        vmwrite(vmcs::guest::IA32_PAT_FULL, 0x0007_0406_0007_0406)?;
+        vmwrite(vmcs::guest::IA32_PAT_FULL, common::msr::DEFAULT_PAT)?;
         vmwrite(vmcs::guest::IA32_EFER_FULL, 0)?;
         vmwrite(vmcs::guest::IA32_EFER_HIGH, 0)?;
         vmwrite(vmcs::guest::DR7, 0x400)?;
@@ -1174,6 +1283,10 @@ impl VCpu for IntelVCpu {
         // A different VM may have made its VMCS current since this VM's
         // previous time slice (or since this VM was created).
         self.vmcs.load()?;
+        if self.local_apic.take_mmio_eoi() == Some(true) {
+            self.io_apic.eoi();
+        }
+        self.io_apic.synchronize();
 
         if let Some(device) = self.passthrough.as_mut() {
             let (irq, asserted) = device.poll_interrupt_level();
@@ -1182,6 +1295,7 @@ impl VCpu for IntelVCpu {
             } else {
                 self.pic.pending_irq &= !(1 << irq);
             }
+            self.io_apic.set_irq_level(irq, asserted);
         }
         let (irq, asserted) = self.guest_block.interrupt_level();
         if asserted {
@@ -1189,16 +1303,34 @@ impl VCpu for IntelVCpu {
         } else {
             self.pic.pending_irq &= !(1 << irq);
         }
+        self.io_apic.set_irq_level(irq, asserted);
         self.pic.pending_irq |= self.host_pending_irq.swap(0, Ordering::AcqRel);
         self.pic.poll_serial_input();
-        self.pic.poll_timer();
+        if self.pic.poll_timer() {
+            self.io_apic.set_irq_level(0, true);
+        }
 
         // Consume the one retry granted after the previous HLT exit. If the
         // IRQ cannot be injected, the early return below makes is_idle() true
         // rather than polling this halted VCPU until its slice expires.
         self.halted_irq_retry = false;
 
-        let interrupt_injected = self.pic.inject_external_interrupt()?;
+        let interrupt_injected = self.inject_local_apic_timer()?;
+        let interrupt_injected = if interrupt_injected {
+            true
+        } else {
+            self.inject_msi_interrupt()?
+        };
+        let interrupt_injected = if interrupt_injected {
+            true
+        } else {
+            self.inject_io_apic_interrupt()?
+        };
+        let interrupt_injected = if interrupt_injected {
+            true
+        } else {
+            self.pic.inject_external_interrupt()?
+        };
         if self.halted {
             if !interrupt_injected {
                 return Ok(());
@@ -1214,7 +1346,11 @@ impl VCpu for IntelVCpu {
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
         self.vmexit_handler(frame_allocator, block)?;
-        self.halted_irq_retry = self.halted && self.pic.has_pending_interrupt();
+        self.halted_irq_retry = self.halted
+            && (self.pic.has_pending_interrupt()
+                || self.local_apic.has_pending_timer()
+                || self.guest_block.pending_msi_vector().is_some()
+                || self.io_apic.has_pending_interrupt());
 
         Ok(())
     }
@@ -1237,6 +1373,9 @@ impl VCpu for IntelVCpu {
         self.host_msr.clear();
         self.guest_msr.clear();
         self.guest_apic_base = 0xfee0_0900;
+        self.guest_misc_enable = 0x1801;
+        self.local_apic.reset();
+        self.io_apic.reset();
         self.ia32e_enabled = false;
         let tsc_khz = interrupt::apic::GUEST_TSC_KHZ
             .get()
@@ -1251,7 +1390,8 @@ impl VCpu for IntelVCpu {
         }
         self.guest_block.reset();
         self.fw_cfg.reset();
-        self.pm_timer = 0;
+        self.pm_timer.reset();
+        self.pm_registers.reset();
         self.guest_xcr0 = XCR0::from(1);
         Ok(())
     }
@@ -1393,6 +1533,9 @@ impl VCpu for IntelVCpu {
             host_msr,
             guest_msr,
             guest_apic_base: 0xfee0_0900,
+            guest_misc_enable: 0x1801,
+            local_apic: common::local_apic::LocalApic::new(),
+            io_apic: common::io_apic::IoApic::new(),
             ia32e_enabled: false,
             pic: super::io::Pic::new(tsc_khz, guest_memory_size),
             io_bitmap: IOBitmap::new(frame_allocator),
@@ -1400,7 +1543,8 @@ impl VCpu for IntelVCpu {
             passthrough,
             guest_block: GuestVirtioBlock::new(),
             fw_cfg: common::fw_cfg::FwCfg::new(),
-            pm_timer: 0,
+            pm_timer: common::timer::AcpiPmTimer::new(),
+            pm_registers: common::timer::AcpiPmRegisters::new(),
             host_xcr0: host_xsave_mask,
             guest_xcr0: XCR0::from(1),
         })

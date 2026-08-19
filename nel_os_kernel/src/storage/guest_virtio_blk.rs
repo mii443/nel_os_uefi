@@ -18,6 +18,9 @@ const SECTOR_SIZE: usize = 512;
 const STATUS_DRIVER_OK: u8 = 4;
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
+const VIRTIO_BLK_T_GET_ID: u32 = 8;
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+const DEVICE_ID: &[u8] = b"NEL_OS_DISK";
 
 pub trait GuestMemory {
     fn read_u8(&mut self, address: u64) -> Result<u8, &'static str>;
@@ -92,6 +95,10 @@ pub struct GuestVirtioBlock {
     isr_status: u8,
     last_available_index: u16,
     interrupt_pending: bool,
+    msi_control: u16,
+    msi_address: u32,
+    msi_data: u16,
+    msi_signaled: bool,
 }
 
 impl GuestVirtioBlock {
@@ -108,6 +115,10 @@ impl GuestVirtioBlock {
             isr_status: 0,
             last_available_index: 0,
             interrupt_pending: false,
+            msi_control: 0,
+            msi_address: 0,
+            msi_data: 0,
+            msi_signaled: false,
         }
     }
 
@@ -135,7 +146,22 @@ impl GuestVirtioBlock {
     }
 
     pub fn interrupt_level(&self) -> (u8, bool) {
-        (IRQ_LINE, self.interrupt_pending)
+        (IRQ_LINE, self.interrupt_pending && !self.msi_enabled())
+    }
+
+    pub fn pending_msi_vector(&self) -> Option<u8> {
+        let vector = self.msi_data as u8;
+        (self.interrupt_pending
+            && !self.msi_signaled
+            && self.msi_enabled()
+            && self.msi_address & 0xfff0_0000 == 0xfee0_0000
+            && self.msi_data & 0x0700 == 0
+            && vector >= 16)
+            .then_some(vector)
+    }
+
+    pub fn acknowledge_msi(&mut self) {
+        self.msi_signaled = true;
     }
 
     pub fn io_in(&mut self, port: u16, size: u8, capacity_sectors: u64) -> u32 {
@@ -219,7 +245,7 @@ impl GuestVirtioBlock {
             (ConfigDevice::VirtioBlock, 0x00) => {
                 u32::from(VIRTIO_VENDOR_ID) | (u32::from(VIRTIO_BLOCK_DEVICE_ID) << 16)
             }
-            (ConfigDevice::VirtioBlock, 0x04) => u32::from(self.command),
+            (ConfigDevice::VirtioBlock, 0x04) => u32::from(self.command) | (1 << 20),
             (ConfigDevice::VirtioBlock, 0x08) => 0x0180_0000,
             (ConfigDevice::VirtioBlock, 0x0c) => 0,
             (ConfigDevice::VirtioBlock, 0x10) => {
@@ -231,6 +257,10 @@ impl GuestVirtioBlock {
             }
             (ConfigDevice::VirtioBlock, 0x2c) => u32::from(VIRTIO_VENDOR_ID) | (2 << 16),
             (ConfigDevice::VirtioBlock, 0x3c) => u32::from(IRQ_LINE) | (1 << 8),
+            (ConfigDevice::VirtioBlock, 0x34) => 0x40,
+            (ConfigDevice::VirtioBlock, 0x40) => 0x05 | (u32::from(self.msi_control) << 16),
+            (ConfigDevice::VirtioBlock, 0x44) => self.msi_address,
+            (ConfigDevice::VirtioBlock, 0x48) => u32::from(self.msi_data),
             _ => u32::MAX,
         };
         extract(value, offset - aligned, size)
@@ -255,6 +285,16 @@ impl GuestVirtioBlock {
                     self.io_base = base as u16;
                 }
             }
+        } else if aligned == 0x40 {
+            let mut capability = u32::from(self.msi_control) << 16 | 0x05;
+            merge(&mut capability, offset - aligned, size, value);
+            self.msi_control = (capability >> 16) as u16 & 1;
+        } else if aligned == 0x44 {
+            merge(&mut self.msi_address, offset - aligned, size, value);
+        } else if aligned == 0x48 {
+            let mut data = u32::from(self.msi_data);
+            merge(&mut data, offset - aligned, size, value);
+            self.msi_data = data as u16;
         }
     }
 
@@ -280,6 +320,7 @@ impl GuestVirtioBlock {
                 let value = self.isr_status;
                 self.isr_status = 0;
                 self.interrupt_pending = false;
+                self.msi_signaled = false;
                 u32::from(value)
             }
             (_, 1) => u8::MAX as u32,
@@ -340,9 +381,16 @@ impl GuestVirtioBlock {
             memory.write_u16(used + 2, used_index.wrapping_add(1))?;
             self.last_available_index = self.last_available_index.wrapping_add(1);
         }
-        self.isr_status |= 1;
-        self.interrupt_pending = true;
+        if memory.read_u16(available)? & VRING_AVAIL_F_NO_INTERRUPT == 0 {
+            self.isr_status |= 1;
+            self.interrupt_pending = true;
+            self.msi_signaled = false;
+        }
         Ok(())
+    }
+
+    fn msi_enabled(&self) -> bool {
+        self.msi_control & 1 != 0
     }
 
     fn process_request<M: GuestMemory>(
@@ -358,11 +406,19 @@ impl GuestVirtioBlock {
             return Err("guest virtio-blk request has an invalid header descriptor");
         }
         let request_type = memory.read_u32(header.address)?;
-        let request_supported = matches!(request_type, 0 | 1);
+        let request_supported = matches!(request_type, 0 | 1 | VIRTIO_BLK_T_GET_ID);
         let mut sector = memory.read_u64(header.address + 8)?;
         let mut descriptor_id = header.next;
-        let mut transferred = 0u32;
         let mut traversed = 1u16;
+        let mut data_descriptors = [Descriptor {
+            address: 0,
+            length: 0,
+            flags: 0,
+            next: 0,
+        }; QUEUE_SIZE as usize];
+        let mut data_descriptor_count = 0usize;
+        let mut data_length = 0u64;
+        let status;
 
         loop {
             if traversed >= QUEUE_SIZE {
@@ -375,49 +431,105 @@ impl GuestVirtioBlock {
                 if descriptor.length < 1 || descriptor.flags & DESC_F_WRITE == 0 {
                     return Err("guest virtio-blk request has an invalid status descriptor");
                 }
-                memory.write_u8(descriptor.address, if request_supported { 0 } else { 2 })?;
-                return Ok(if request_type == 0 {
-                    transferred.saturating_add(1)
-                } else {
-                    1
-                });
+                status = descriptor;
+                break;
             }
-            if descriptor.length as usize % SECTOR_SIZE != 0 {
-                return Err("guest virtio-blk data descriptor is not sector aligned");
+            if request_supported
+                && ((matches!(request_type, 0 | VIRTIO_BLK_T_GET_ID)
+                    && descriptor.flags & DESC_F_WRITE == 0)
+                    || (request_type == 1 && descriptor.flags & DESC_F_WRITE != 0))
+            {
+                return Err("guest virtio-blk data descriptor has invalid flags");
             }
-            let sectors = descriptor.length as usize / SECTOR_SIZE;
-            match request_type {
-                0 if descriptor.flags & DESC_F_WRITE != 0 => {
-                    let mut index = 0;
-                    while index < sectors {
-                        let count = (sectors - index).min(backend.max_transfer_sectors());
-                        let data = backend.read_sectors(sector, count)?;
-                        memory
-                            .write_slice(descriptor.address + (index * SECTOR_SIZE) as u64, data)?;
-                        index += count;
-                        sector = sector
-                            .checked_add(count as u64)
-                            .ok_or("guest virtio-blk sector overflow")?;
-                        transferred = transferred.saturating_add((count * SECTOR_SIZE) as u32);
+            data_length = data_length
+                .checked_add(u64::from(descriptor.length))
+                .ok_or("guest virtio-blk transfer length overflow")?;
+            data_descriptors[data_descriptor_count] = descriptor;
+            data_descriptor_count += 1;
+            descriptor_id = descriptor.next;
+        }
+
+        if matches!(request_type, 0 | 1) && data_length % SECTOR_SIZE as u64 != 0 {
+            return Err("guest virtio-blk transfer is not sector aligned");
+        }
+        let transferred =
+            u32::try_from(data_length).map_err(|_| "guest virtio-blk transfer is too large")?;
+
+        if request_type == VIRTIO_BLK_T_GET_ID {
+            let mut id_offset = 0usize;
+            for descriptor in &data_descriptors[..data_descriptor_count] {
+                for offset in 0..descriptor.length as usize {
+                    let value = DEVICE_ID.get(id_offset).copied().unwrap_or(0);
+                    memory.write_u8(descriptor.address + offset as u64, value)?;
+                    id_offset = id_offset.saturating_add(1);
+                }
+            }
+        } else if request_type == 0 {
+            let mut descriptor_index = 0usize;
+            let mut descriptor_offset = 0usize;
+            let mut sectors_remaining = data_length as usize / SECTOR_SIZE;
+            while sectors_remaining != 0 {
+                let sector_count = sectors_remaining.min(backend.max_transfer_sectors());
+                let data = backend.read_sectors(sector, sector_count)?;
+                let mut data_offset = 0usize;
+                while data_offset < data.len() {
+                    let descriptor = data_descriptors
+                        .get(descriptor_index)
+                        .ok_or("guest virtio-blk descriptor chain is shorter than its data")?;
+                    let descriptor_remaining = descriptor.length as usize - descriptor_offset;
+                    if descriptor_remaining == 0 {
+                        descriptor_index += 1;
+                        descriptor_offset = 0;
+                        continue;
+                    }
+                    let count = descriptor_remaining.min(data.len() - data_offset);
+                    memory.write_slice(
+                        descriptor.address + descriptor_offset as u64,
+                        &data[data_offset..data_offset + count],
+                    )?;
+                    descriptor_offset += count;
+                    data_offset += count;
+                    if descriptor_offset == descriptor.length as usize {
+                        descriptor_index += 1;
+                        descriptor_offset = 0;
                     }
                 }
-                1 if descriptor.flags & DESC_F_WRITE == 0 => {
-                    let mut sector_buffer = [0u8; SECTOR_SIZE];
-                    for index in 0..sectors {
-                        let address = descriptor.address + (index * SECTOR_SIZE) as u64;
-                        memory.read_slice(address, &mut sector_buffer)?;
+                sector = sector
+                    .checked_add(sector_count as u64)
+                    .ok_or("guest virtio-blk sector overflow")?;
+                sectors_remaining -= sector_count;
+            }
+        } else if request_type == 1 {
+            let mut sector_buffer = [0u8; SECTOR_SIZE];
+            let mut sector_offset = 0usize;
+            for descriptor in &data_descriptors[..data_descriptor_count] {
+                let mut descriptor_offset = 0usize;
+                while descriptor_offset < descriptor.length as usize {
+                    let count = (descriptor.length as usize - descriptor_offset)
+                        .min(SECTOR_SIZE - sector_offset);
+                    memory.read_slice(
+                        descriptor.address + descriptor_offset as u64,
+                        &mut sector_buffer[sector_offset..sector_offset + count],
+                    )?;
+                    descriptor_offset += count;
+                    sector_offset += count;
+                    if sector_offset == SECTOR_SIZE {
                         backend.write_sector(sector, &sector_buffer)?;
+                        sector_offset = 0;
                         sector = sector
                             .checked_add(1)
                             .ok_or("guest virtio-blk sector overflow")?;
-                        transferred = transferred.saturating_add(SECTOR_SIZE as u32);
                     }
                 }
-                0 | 1 => return Err("guest virtio-blk data descriptor has invalid flags"),
-                _ => {}
             }
-            descriptor_id = descriptor.next;
         }
+
+        memory.write_u8(status.address, if request_supported { 0 } else { 2 })?;
+        Ok(if matches!(request_type, 0 | VIRTIO_BLK_T_GET_ID) {
+            transferred.saturating_add(1)
+        } else {
+            1
+        })
     }
 }
 

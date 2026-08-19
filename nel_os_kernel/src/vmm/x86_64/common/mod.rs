@@ -1,6 +1,12 @@
+pub mod acpi;
+pub mod cpuid;
 pub mod fw_cfg;
 pub mod fxsave;
+pub mod io_apic;
+pub mod local_apic;
+pub mod msr;
 pub mod segment;
+pub mod timer;
 pub mod uefi;
 pub mod xsave;
 

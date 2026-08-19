@@ -541,10 +541,12 @@ impl Pic {
         }
     }
 
-    pub fn poll_timer(&mut self) {
-        if self.pit_channel0.poll() {
+    pub fn poll_timer(&mut self) -> bool {
+        let elapsed = self.pit_channel0.poll();
+        if elapsed {
             self.pending_irq |= 1;
         }
+        elapsed
     }
 
     /// Returns whether another VM entry is needed to deliver a latched IRQ.

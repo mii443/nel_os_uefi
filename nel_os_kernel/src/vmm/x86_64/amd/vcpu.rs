@@ -48,6 +48,8 @@ pub struct AMDVCpu {
     halted: bool,
     tsc_aux: u64,
     apic_base: u64,
+    local_apic: common::local_apic::LocalApic,
+    io_apic: common::io_apic::IoApic,
     nb_cfg: u64,
     host_patch_level: u64,
     guest_registers: GuestRegisters,
@@ -62,7 +64,8 @@ pub struct AMDVCpu {
     passthrough: Option<PassthroughNic>,
     guest_block: GuestVirtioBlock,
     fw_cfg: common::fw_cfg::FwCfg,
-    pm_timer: u32,
+    pm_timer: common::timer::AcpiPmTimer,
+    pm_registers: common::timer::AcpiPmRegisters,
 }
 
 struct SerialState {
@@ -831,7 +834,12 @@ impl AMDVCpu {
                 .allocate_frame()
                 .ok_or("No free frames for guest UEFI platform MMIO")?;
             let hpa = frame.start_address().as_u64();
-            unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE as usize) };
+            common::uefi::initialize_platform_mmio_page(gpa, hpa);
+            if gpa == 0xfec0_0000 {
+                self.io_apic.attach_page(hpa);
+            } else if gpa == 0xfee0_0000 {
+                self.local_apic.attach_page(hpa);
+            }
             self.npt.map_4k(gpa, hpa, frame_allocator)?;
         }
         let hpet_capabilities = (69_841_279u64 << 32) | (1 << 13) | 1;
@@ -907,22 +915,22 @@ impl AMDVCpu {
         let mut result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
 
         match leaf {
-            // L1 does not yet implement KVM paravirtual MSRs for L2. Hide the
-            // hypervisor bit so Linux selects its native AMD clock path.
             0x0000_0001 => {
                 result.ecx &= !((1 << 12)
-                    | (1 << 21)
                     // A TSC deadline requires a virtual local APIC timer.
                     | (1 << 24)
                     | (1 << 26)
                     | (1 << 27)
                     | (1 << 28)
-                    | (1 << 29)
-                    | (1 << 31));
+                    | (1 << 29));
+                // Identify the virtual-machine boundary and expose the local
+                // APIC interfaces implemented by the VMM.
+                result.ecx |= (1 << 21) | (1 << 31);
                 // Machine-check and MTRR state is MSR-backed.  Advertising
                 // these while the default-deny MSRPM rejects their MSRs sends
                 // Linux down a partially initialized firmware-error path.
-                result.edx &= !((1 << 7) | (1 << 9) | (1 << 12) | (1 << 14) | (1 << 28));
+                result.edx &= !((1 << 7) | (1 << 12) | (1 << 14) | (1 << 28));
+                result.edx |= 1 << 9;
 
                 // The VMM exposes one vCPU. Do not leak the physical initial
                 // APIC ID or the host's logical-processor count.
@@ -1037,7 +1045,27 @@ impl AMDVCpu {
                 result.ecx = 0;
                 result.edx = 0;
             }
-            0x4000_0000..=0x4000_00ff | 0x8000_000a => {
+            common::cpuid::HYPERVISOR_BASE_LEAF => {
+                let (eax, ebx, ecx, edx) = common::cpuid::hypervisor_vendor_leaf();
+                result.eax = eax;
+                result.ebx = ebx;
+                result.ecx = ecx;
+                result.edx = edx;
+            }
+            common::cpuid::KVM_COMPAT_BASE_LEAF => {
+                let (eax, ebx, ecx, edx) = common::cpuid::kvm_compat_vendor_leaf();
+                result.eax = eax;
+                result.ebx = ebx;
+                result.ecx = ecx;
+                result.edx = edx;
+            }
+            leaf if leaf == common::cpuid::KVM_COMPAT_BASE_LEAF + 1 => {
+                result.eax = 0;
+                result.ebx = 0;
+                result.ecx = 0;
+                result.edx = 0;
+            }
+            0x4000_0001..=0x4000_00ff | 0x8000_000a => {
                 result.eax = 0;
                 result.ebx = 0;
                 result.ecx = 0;
@@ -1082,23 +1110,34 @@ impl AMDVCpu {
     fn sync_uart_irq(&mut self) {
         let asserted = self.serial.interrupt_output_enabled() && self.serial.interrupt_pending();
         self.legacy_timer.pic.set_irq_level(4, asserted);
+        self.io_apic.set_irq_level(4, asserted);
     }
 
     fn prepare_device_interrupt(&mut self) -> Result<(), &'static str> {
+        if self.local_apic.take_mmio_eoi() == Some(true) {
+            self.io_apic.eoi();
+        }
+        self.io_apic.synchronize();
         let hpet_counter = (time::get_ticks() as u64).wrapping_mul(14_318);
         self.npt
             .set_slice(0xfed0_00f0, &hpet_counter.to_le_bytes())?;
         if self.legacy_timer.pit.poll() {
             self.legacy_timer.pic.raise_irq(0);
+            self.io_apic.set_irq_level(0, true);
         }
         self.sync_uart_irq();
         if let Some(device) = self.passthrough.as_mut() {
             let (irq, asserted) = device.poll_interrupt_level();
             self.legacy_timer.pic.set_irq_level(irq, asserted);
+            self.io_apic.set_irq_level(irq, asserted);
         }
         let (irq, asserted) = self.guest_block.interrupt_level();
         self.legacy_timer.pic.set_irq_level(irq, asserted);
+        self.io_apic.set_irq_level(irq, asserted);
         let next_irq = self.legacy_timer.pic.next_irq();
+        let local_vector = self.local_apic.pending_timer_vector();
+        let msi_vector = self.guest_block.pending_msi_vector();
+        let io_interrupt = self.io_apic.pending_vector();
 
         let vmcb = self.vmcb.get_raw_vmcb();
         let interrupts_enabled = vmcb.state_save_area.rflags & (1 << 9) != 0;
@@ -1107,9 +1146,13 @@ impl AMDVCpu {
             .interrupt_shadow_flags
             .contains(InterruptShadowFlags::INTERRUPT_SHADOW);
         let event_already_pending = vmcb.control_area.event_injection & (1 << 31) != 0;
-        let Some(irq) = next_irq else {
+        if local_vector.is_none()
+            && msi_vector.is_none()
+            && io_interrupt.is_none()
+            && next_irq.is_none()
+        {
             return Ok(());
-        };
+        }
         if !interrupts_enabled || event_already_pending {
             return Ok(());
         }
@@ -1132,17 +1175,42 @@ impl AMDVCpu {
                 .remove(InterruptShadowFlags::INTERRUPT_SHADOW);
         }
 
-        const EVENT_VALID: u64 = 1 << 31;
-        let vector = if irq < 8 {
-            self.legacy_timer.pic.master_base.wrapping_add(irq)
+        let vector = if let Some(vector) = local_vector {
+            vector
+        } else if let Some(vector) = msi_vector {
+            vector
+        } else if let Some((_, vector)) = io_interrupt {
+            vector
+        } else if next_irq.unwrap() < 8 {
+            self.legacy_timer
+                .pic
+                .master_base
+                .wrapping_add(next_irq.unwrap())
         } else {
-            self.legacy_timer.pic.slave_base.wrapping_add(irq - 8)
+            self.legacy_timer
+                .pic
+                .slave_base
+                .wrapping_add(next_irq.unwrap() - 8)
         };
+        const EVENT_VALID: u64 = 1 << 31;
         let control = &mut self.vmcb.get_raw_vmcb().control_area;
-        // EVENTINJ type 0 is an architectural external interrupt.
         control.event_injection = vector as u64 | EVENT_VALID;
         control.vmcb_clean_bits = 0;
-        self.legacy_timer.pic.acknowledge(irq);
+        let level_triggered =
+            io_interrupt.is_some_and(|(irq, _)| self.io_apic.is_level_triggered(irq));
+        self.local_apic.accept_interrupt(vector, level_triggered);
+        if local_vector.is_some() {
+            self.local_apic.acknowledge_timer();
+        } else if msi_vector.is_some() {
+            self.guest_block.acknowledge_msi();
+        } else if let Some((irq, _)) = io_interrupt {
+            // Delivery consumes the pending edge or sets remote-IRR for a
+            // level input. A still-asserted level is offered again only after
+            // the guest writes local-APIC EOI.
+            self.io_apic.acknowledge(irq);
+        } else if let Some(irq) = next_irq {
+            self.legacy_timer.pic.acknowledge(irq);
+        }
         Ok(())
     }
 
@@ -1154,7 +1222,6 @@ impl AMDVCpu {
         if interrupted_event & EVENT_VALID == 0 {
             return Ok(false);
         }
-
         // EXITINTINFO describes an event whose delivery was interrupted by
         // this VMEXIT. SVM does not queue it automatically: copying the full
         // field preserves vector, type, error-code-valid, and error code for
@@ -1298,12 +1365,9 @@ impl AMDVCpu {
                 (0x70, 1) => self.rtc.read_selector() as u32,
                 (0x71, 1) => self.rtc.read_data() as u32,
                 (0x511, 1) => self.fw_cfg.read_u8(self.guest_memory_size) as u32,
-                (0x608, 4) | (0xb008, 4) => {
-                    // Firmware delay loops only need a monotonic ACPI timer.
-                    // Advancing by 100 ms per trapped read avoids turning
-                    // thousands of nested PIO exits into minute-long boots.
-                    self.pm_timer = self.pm_timer.wrapping_add(357_954);
-                    self.pm_timer
+                (0x608, 4) | (0xb008, 4) => self.pm_timer.read(),
+                (0xb000 | 0xb002 | 0xb004, 2 | 4) => {
+                    self.pm_registers.read(port, size).unwrap_or(0)
                 }
                 (0x20 | 0x21 | 0xa0 | 0xa1, 1) => self.legacy_timer.pic.read(port) as u32,
                 (0x3f8..=0x3ff, 1) => self.serial_in(port) as u32,
@@ -1321,6 +1385,11 @@ impl AMDVCpu {
             };
             let rax = &mut self.vmcb.get_raw_vmcb().state_save_area.rax;
             *rax = (*rax & !mask) | value as u64;
+        } else if self.pm_registers.write(
+            port,
+            size,
+            self.vmcb.get_raw_vmcb().state_save_area.rax as u32,
+        ) {
         } else if size == 1 && port == 0x40 {
             let value = self.vmcb.get_raw_vmcb().state_save_area.rax as u8;
             self.legacy_timer.pit.write(value);
@@ -1420,6 +1489,17 @@ impl AMDVCpu {
             let state = &mut self.vmcb.get_raw_vmcb().state_save_area;
             match index {
                 APIC_BASE => self.apic_base = value & 0xffff_f000 | (value & 0xd00),
+                0x802..=0x83f => {
+                    if self.local_apic.write_x2apic(index, value).is_none() {
+                        self.inject_exception(13, Some(0));
+                        return Ok(());
+                    }
+                    if index == 0x80b {
+                        if self.local_apic.eoi() {
+                            self.io_apic.eoi();
+                        }
+                    }
+                }
                 EFER => state.efer = value | (1 << 12),
                 STAR => state.star = value,
                 LSTAR => state.lstar = value,
@@ -1431,7 +1511,13 @@ impl AMDVCpu {
                 SYSENTER_CS => state.sysenter_cs = value,
                 SYSENTER_ESP => state.sysenter_esp = value,
                 SYSENTER_EIP => state.sysenter_eip = value,
-                PAT => state.g_pat = value,
+                PAT => match common::msr::validate_pat(value) {
+                    Ok(value) => state.g_pat = value,
+                    Err(_) => {
+                        self.inject_exception(13, Some(0));
+                        return Ok(());
+                    }
+                },
                 TSC_AUX => self.tsc_aux = value,
                 // Linux uses bit 46 to enable extended CF8 PCI config-space
                 // addressing on AMD systems. PCI is hidden from this guest,
@@ -1450,6 +1536,13 @@ impl AMDVCpu {
             let state = &self.vmcb.get_raw_vmcb().state_save_area;
             let value = match index {
                 APIC_BASE => self.apic_base,
+                0x802..=0x83f => match self.local_apic.read_x2apic(index) {
+                    Some(value) => value,
+                    None => {
+                        self.inject_exception(13, Some(0));
+                        return Ok(());
+                    }
+                },
                 EFER => state.efer,
                 STAR => state.star,
                 LSTAR => state.lstar,
@@ -1606,18 +1699,19 @@ impl VCpu for AMDVCpu {
                 // translations for a recycled ASID.
                 self.vmcb.get_raw_vmcb().control_area.tlb_control = 0;
 
-                if self.preserve_interrupted_event()? {
-                    // Delivery of EXITINTINFO takes precedence over handling the
-                    // coincident VMEXIT. Leave RIP and the intercepted instruction
-                    // untouched; after the event handler returns, that instruction
-                    // executes again and produces a fresh exit to handle normally.
-                    return Ok(());
+                let interrupted_event = self.preserve_interrupted_event()?;
+                // SVM leaves EVENTINJ unchanged after a successful VMRUN.
+                // EXITINTINFO above is the authoritative indication that
+                // delivery was interrupted; otherwise the event was consumed
+                // and retaining VALID would inject it again on every entry.
+                if !interrupted_event {
+                    self.vmcb.get_raw_vmcb().control_area.event_injection = 0;
                 }
 
                 let vmcb = self.vmcb.get_raw_vmcb();
                 let exit_code = vmcb.control_area.exit_code;
                 if !self.exit_reported
-                    || !matches!(exit_code, 0x60 | 0x72 | 0x77 | 0x78 | 0x7b | 0x7c)
+                    || !matches!(exit_code, 0x60 | 0x72 | 0x77 | 0x78 | 0x7b | 0x7c | 0x89)
                 {
                     info!(
                         "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
@@ -1691,7 +1785,8 @@ impl VCpu for AMDVCpu {
         }
         self.guest_block.reset();
         self.fw_cfg.reset();
-        self.pm_timer = 0;
+        self.pm_timer.reset();
+        self.pm_registers.reset();
         let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
             .get()
             .copied()
@@ -1704,6 +1799,8 @@ impl VCpu for AMDVCpu {
         self.halted = false;
         self.tsc_aux = 0;
         self.apic_base = 0xfee0_0900;
+        self.local_apic.reset();
+        self.io_apic.reset();
         self.nb_cfg = 0;
         self.guest_registers = GuestRegisters::default();
         self.guest_fx_state = FxState::guest_default();
@@ -1733,7 +1830,12 @@ impl VCpu for AMDVCpu {
     }
 
     fn is_idle(&self) -> bool {
-        self.halted && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
+        self.halted
+            && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
+            && !self.local_apic.has_pending_timer()
+            && self.guest_block.pending_msi_vector().is_none()
+            && !self.io_apic.has_pending_interrupt()
+            && self.legacy_timer.pic.next_irq().is_none()
     }
 
     fn write_memory_ranged(
@@ -1839,6 +1941,8 @@ impl VCpu for AMDVCpu {
             halted: false,
             tsc_aux: 0,
             apic_base: 0xfee0_0900,
+            local_apic: common::local_apic::LocalApic::new(),
+            io_apic: common::io_apic::IoApic::new(),
             nb_cfg: 0,
             host_patch_level,
             guest_registers: GuestRegisters::default(),
@@ -1855,7 +1959,8 @@ impl VCpu for AMDVCpu {
             passthrough,
             guest_block: GuestVirtioBlock::new(),
             fw_cfg: common::fw_cfg::FwCfg::new(),
-            pm_timer: 0,
+            pm_timer: common::timer::AcpiPmTimer::new(),
+            pm_registers: common::timer::AcpiPmRegisters::new(),
         })
     }
 

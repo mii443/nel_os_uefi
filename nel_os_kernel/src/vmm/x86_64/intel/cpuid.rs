@@ -3,15 +3,39 @@
 use modular_bitfield::bitfield;
 use raw_cpuid::cpuid;
 
+use crate::vmm::x86_64::common::cpuid::{
+    HYPERVISOR_BASE_LEAF, KVM_COMPAT_BASE_LEAF, hypervisor_vendor_leaf, kvm_compat_vendor_leaf,
+};
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
 
 pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
     let regs = &mut vcpu.guest_registers;
 
-    let vendor: &[u8; 12] = b"miHypervisor";
     let brand_string: &[u8; 48] = b"mii Hypervisor CPU on Intel VT-x               \0";
-    let vendor = unsafe { core::mem::transmute::<&[u8; 12], &[u32; 3]>(vendor) };
     let brand_string = unsafe { core::mem::transmute::<&[u8; 48], &[u32; 12]>(brand_string) };
+
+    if regs.rax as u32 == HYPERVISOR_BASE_LEAF {
+        let (eax, ebx, ecx, edx) = hypervisor_vendor_leaf();
+        regs.rax = u64::from(eax);
+        regs.rbx = u64::from(ebx);
+        regs.rcx = u64::from(ecx);
+        regs.rdx = u64::from(edx);
+        return;
+    }
+
+    if regs.rax as u32 == KVM_COMPAT_BASE_LEAF {
+        let (eax, ebx, ecx, edx) = kvm_compat_vendor_leaf();
+        regs.rax = u64::from(eax);
+        regs.rbx = u64::from(ebx);
+        regs.rcx = u64::from(ecx);
+        regs.rdx = u64::from(edx);
+        return;
+    }
+
+    if regs.rax as u32 == KVM_COMPAT_BASE_LEAF + 1 {
+        invalid(vcpu);
+        return;
+    }
 
     match VmxLeaf::from(regs.rax) {
         VmxLeaf::EXTENDED_FEATURE_2 => {
@@ -90,36 +114,22 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
             regs.rdx = 0x00000000;
         }
         VmxLeaf::MAXIMUM_INPUT => {
-            regs.rax = 0x20;
-            regs.rbx = vendor[0] as u64;
-            regs.rcx = vendor[2] as u64;
-            regs.rdx = vendor[1] as u64;
+            let vendor = cpuid!(0, 0);
+            regs.rax = u64::from(vendor.eax);
+            regs.rbx = u64::from(vendor.ebx);
+            regs.rcx = u64::from(vendor.ecx);
+            regs.rdx = u64::from(vendor.edx);
         }
         VmxLeaf::VERSION_AND_FEATURE_INFO => {
             let version_and_feature_info = cpuid!(0x1, 0);
             let ecx = guest_leaf1_ecx(version_and_feature_info.ecx);
 
-            let edx = FeatureInfoEdx::new()
-                .with_fpu(true)
-                .with_vme(true)
-                .with_de(true)
-                .with_pse(true)
-                .with_msr(true)
-                .with_pae(true)
-                .with_cx8(true)
-                .with_sep(true)
-                .with_pge(true)
-                .with_cmov(true)
-                .with_pse36(true)
-                .with_acpi(true)
-                .with_fxsr(true)
-                .with_sse(true)
-                .with_sse2(true);
+            let edx = guest_leaf1_edx();
 
             regs.rax = version_and_feature_info.eax as u64;
             regs.rbx = single_vcpu_leaf1_ebx(version_and_feature_info.ebx) as u64;
             regs.rcx = ecx as u64;
-            regs.rdx = u32::from(edx) as u64;
+            regs.rdx = u64::from(edx);
         }
         _ => {
             invalid(vcpu);
@@ -127,14 +137,38 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
     }
 }
 
+fn guest_leaf1_edx() -> u32 {
+    FeatureInfoEdx::new()
+        .with_fpu(true)
+        .with_vme(true)
+        .with_de(true)
+        .with_pse(true)
+        .with_msr(true)
+        .with_pae(true)
+        .with_cx8(true)
+        .with_apic(true)
+        .with_sep(true)
+        .with_pge(true)
+        .with_cmov(true)
+        .with_pat(true)
+        .with_pse36(true)
+        .with_acpi(true)
+        .with_fxsr(true)
+        .with_sse(true)
+        .with_sse2(true)
+        .into()
+}
+
 fn guest_leaf1_ecx(host_ecx: u32) -> u32 {
     FeatureInfoEcx::new()
         .with_pcid(true)
         .with_sse4_1(true)
         .with_sse4_2(true)
+        .with_x2apic(true)
         .with_xsave(true)
         .with_osxsave(true)
         .with_rdrand(host_ecx & (1 << 30) != 0)
+        .with_hypervisor(true)
         .into()
 }
 
@@ -314,7 +348,7 @@ impl VmxLeaf {
 
 #[cfg(test)]
 mod tests {
-    use super::{guest_leaf1_ecx, guest_leaf7_ebx, single_vcpu_leaf1_ebx};
+    use super::{guest_leaf1_ecx, guest_leaf1_edx, guest_leaf7_ebx, single_vcpu_leaf1_ebx};
 
     #[test]
     fn leaf1_ebx_describes_one_vcpu_with_apic_id_zero() {
@@ -331,6 +365,16 @@ mod tests {
         assert_ne!(guest_leaf1_ecx(1 << 30) & (1 << 30), 0);
         assert_eq!(guest_leaf7_ebx(0) & (1 << 18), 0);
         assert_ne!(guest_leaf7_ebx(1 << 18) & (1 << 18), 0);
+    }
+
+    #[test]
+    fn leaf1_identifies_a_hypervisor() {
+        assert_ne!(guest_leaf1_ecx(0) & (1 << 31), 0);
+    }
+
+    #[test]
+    fn leaf1_pat_matches_the_virtual_msr_contract() {
+        assert_ne!(guest_leaf1_edx() & (1 << 16), 0);
     }
 
     #[test]

@@ -266,6 +266,14 @@ impl ShadowMsr {
                 Self::set_ret_val(vcpu, vmread(vmcs::guest::IA32_SYSENTER_EIP)?)
             }
             0x1b => Self::set_ret_val(vcpu, vcpu.guest_apic_base),
+            0x1a0 => Self::set_ret_val(vcpu, vcpu.guest_misc_enable), // IA32_MISC_ENABLE
+            0x802..=0x83f => {
+                let value = vcpu
+                    .local_apic
+                    .read_x2apic(msr_kind)
+                    .ok_or("Unsupported guest x2APIC RDMSR")?;
+                Self::set_ret_val(vcpu, value);
+            }
             0x8b => Self::set_ret_val(vcpu, 0x8701021),
             0xc0011029 => Self::set_ret_val(vcpu, 0x3000310e08202),
             0xc0010000 => Self::set_ret_val(vcpu, 0x130076),
@@ -275,7 +283,7 @@ impl ShadowMsr {
             0xc0010007 => Self::set_ret_val(vcpu, 0),
             0xc0010114 => Self::set_ret_val(vcpu, 0),
             0xc0010117 => Self::set_ret_val(vcpu, 0), // MSR_VM_HSAVE_PA
-            0x277 => Self::set_ret_val(vcpu, 0x0007040600070406),
+            0x277 => Self::set_ret_val(vcpu, vmread(vmcs::guest::IA32_PAT_FULL)?),
             0xc0000103 => Self::shadow_read(vcpu, msr_kind)?, // TSC_AUX
             0xd90 => Self::set_ret_val(vcpu, 0),              // MSR_C1_PMON_EVNT_SEL0
             0xe1 => Self::set_ret_val(vcpu, 0),               // IA32_UMWAIT_CONTROL
@@ -314,6 +322,26 @@ impl ShadowMsr {
             x86::msr::IA32_FS_BASE => vmwrite(vmcs::guest::FS_BASE, value)?,
             x86::msr::IA32_GS_BASE => vmwrite(vmcs::guest::GS_BASE, value)?,
             0x1b => vcpu.guest_apic_base = value & 0xffff_f000 | (value & 0xd00),
+            0x1a0 => {
+                // IA32_MISC_ENABLE.XD-disable is the only writable bit needed
+                // by generic guests.  Bits 11 and 12 describe unavailable
+                // branch-trace/PEBS facilities and remain mandatory.
+                const XD_DISABLE: u64 = 1 << 34;
+                vcpu.guest_misc_enable =
+                    (vcpu.guest_misc_enable & !XD_DISABLE) | (value & XD_DISABLE) | 0x1800;
+            }
+            0x277 => vmwrite(
+                vmcs::guest::IA32_PAT_FULL,
+                crate::vmm::x86_64::common::msr::validate_pat(value)?,
+            )?,
+            0x802..=0x83f => {
+                vcpu.local_apic
+                    .write_x2apic(msr_kind, value)
+                    .ok_or("Unsupported guest x2APIC WRMSR")?;
+                if msr_kind == 0x80b && vcpu.local_apic.eoi() {
+                    vcpu.io_apic.eoi();
+                }
+            }
             0xc0010007 => Self::shadow_write(vcpu, msr_kind)?,
             0xc0010117 => Self::shadow_write(vcpu, msr_kind)?,
 

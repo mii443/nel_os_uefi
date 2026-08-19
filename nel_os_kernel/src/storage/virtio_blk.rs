@@ -13,7 +13,6 @@ use x86_64::{
 use crate::{
     info,
     network::pci::{self, PciAddress},
-    time,
 };
 
 const DEVICE_FEATURES: u16 = 0;
@@ -44,7 +43,6 @@ const MAX_TRANSFER_BYTES: usize = 64 * 1024;
 const REQUEST_STATUS_OFFSET: u64 = REQUEST_DATA_OFFSET + MAX_TRANSFER_BYTES as u64;
 const REQUEST_MEMORY_BYTES: usize = REQUEST_STATUS_OFFSET as usize + 1;
 const REQUEST_TIMEOUT_MILLIS: usize = 1_000;
-const REQUEST_SPIN_LIMIT: usize = 10_000_000;
 
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
@@ -402,8 +400,13 @@ impl VirtioBlock {
         fence(Ordering::SeqCst);
         self.queue.notify(self.io_base);
 
-        let start = time::get_ticks();
-        for _ in 0..REQUEST_SPIN_LIMIT {
+        let start = unsafe { x86::time::rdtsc() };
+        let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .ok_or("TSC frequency unavailable for virtio-blk timeout")?;
+        let timeout_cycles = tsc_khz.saturating_mul(REQUEST_TIMEOUT_MILLIS as u64);
+        loop {
             if let Some(used) = self.queue.pop_used() {
                 let expected_length = if request_type == VIRTIO_BLK_T_IN {
                     data_length.saturating_add(1)
@@ -424,12 +427,11 @@ impl VirtioBlock {
                     _ => Err("virtio-blk returned an invalid request status"),
                 };
             }
-            if time::get_ticks().wrapping_sub(start) >= REQUEST_TIMEOUT_MILLIS {
+            if unsafe { x86::time::rdtsc() }.wrapping_sub(start) >= timeout_cycles {
                 return Err("virtio-blk request timed out");
             }
             core::hint::spin_loop();
         }
-        Err("virtio-blk request exceeded the polling limit")
     }
 }
 

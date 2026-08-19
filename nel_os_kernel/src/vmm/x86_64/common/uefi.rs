@@ -20,6 +20,12 @@ pub const PLATFORM_MMIO_PAGES: [u64; 5] = [
     0xfee0_0000,
 ];
 
+pub fn initialize_platform_mmio_page(_gpa: u64, hpa: u64) {
+    unsafe {
+        core::ptr::write_bytes(hpa as *mut u8, 0, 4096);
+    }
+}
+
 pub fn ram_ranges(memory_size: u64) -> [(u64, u64); 2] {
     let low_size = memory_size.min(LOW_MEMORY_LIMIT);
     [
