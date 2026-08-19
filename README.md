@@ -98,7 +98,7 @@ The shell supports:
 
 ```text
 vm list                show all created VMs
-vm create [ID] MEMORY  create a VM and allocate its RAM (`128M`, `256MiB`, etc.)
+vm create [ID] MEMORY  create a 256 MiB-4 GiB VM; RAM backing is allocated on demand
 vm start [ID]          start a created VM, or resume it when stopped
 vm start [ID] -a       start/resume and attach its serial (`--attach` also works)
 vm stop [ID]           stop one VCPU while retaining its guest memory

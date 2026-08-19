@@ -7,6 +7,7 @@ use x86_64::{
 
 use crate::{
     error, info,
+    memory::bitmap::BitmapMemoryTable,
     network::{PassthroughDescriptor, PassthroughNic},
     serial,
     storage::{GuestVirtioBlock, VirtioBlock},
@@ -222,12 +223,17 @@ impl RtcState {
         registers[0x18] = 0x3c;
         registers[0x30] = registers[0x17];
         registers[0x31] = registers[0x18];
-        let above_16m = guest_memory_size
+        let above_16m = common::uefi::low_memory_size(guest_memory_size)
             .saturating_sub(16 * 1024 * 1024)
             .div_ceil(64 * 1024)
             .min(u16::MAX as u64) as u16;
         registers[0x34] = above_16m as u8;
         registers[0x35] = (above_16m >> 8) as u8;
+        let above_4g = (common::uefi::high_memory_size(guest_memory_size) / (64 * 1024))
+            .min(0x00ff_ffff) as u32;
+        registers[0x5b] = above_4g as u8;
+        registers[0x5c] = (above_4g >> 8) as u8;
+        registers[0x5d] = (above_4g >> 16) as u8;
         Self {
             selector: 0,
             registers,
@@ -598,12 +604,10 @@ impl LegacyTimer {
 }
 
 const PAGE_SIZE: u64 = 4096;
+const GUEST_MEMORY_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
 impl AMDVCpu {
-    pub fn setup(
-        &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
-    ) -> Result<(), &'static str>
+    pub fn setup(&mut self, frame_allocator: &mut BitmapMemoryTable) -> Result<(), &'static str>
     where
         Self: X86VCpu,
     {
@@ -787,31 +791,23 @@ impl AMDVCpu {
 
     fn init_guest_memory(
         &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
     ) -> Result<(), &'static str> {
         info!(
             "Allocating {} MiB of AMD guest RAM",
             self.guest_memory_size / 1024 / 1024
         );
-        let mut gpa = 0;
-        while gpa < self.guest_memory_size {
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or("No free frames for guest RAM")?;
-            self.guest_memory_allocated = self.guest_memory_allocated.saturating_add(PAGE_SIZE);
-            unsafe {
-                core::ptr::write_bytes(
-                    frame.start_address().as_u64() as *mut u8,
-                    0,
-                    PAGE_SIZE as usize,
-                );
+        // Passthrough DMA needs every IOVA backed in advance. VMs without a
+        // passthrough device demand-allocate zeroed 2 MiB chunks on NPT faults.
+        if self.passthrough.is_some() {
+            for (range_base, range_size) in common::uefi::ram_ranges(self.guest_memory_size) {
+                let range_end = range_base.saturating_add(range_size);
+                let mut gpa = range_base;
+                while gpa < range_end {
+                    self.allocate_guest_memory_chunk(gpa, frame_allocator)?;
+                    gpa = gpa.saturating_add(GUEST_MEMORY_CHUNK_SIZE);
+                }
             }
-            self.npt
-                .map_4k(gpa, frame.start_address().as_u64(), frame_allocator)?;
-            if let Some(device) = self.passthrough.as_mut() {
-                device.map_dma(gpa, frame.start_address().as_u64(), frame_allocator)?;
-            }
-            gpa += PAGE_SIZE;
         }
 
         let firmware = common::uefi::firmware_image()?;
@@ -852,6 +848,56 @@ impl AMDVCpu {
             }
         }
 
+        Ok(())
+    }
+
+    fn allocate_guest_memory_chunk(
+        &mut self,
+        guest_address: u64,
+        frame_allocator: &mut BitmapMemoryTable,
+    ) -> Result<(), &'static str> {
+        let (range_base, range_size) =
+            common::uefi::ram_range_containing(self.guest_memory_size, guest_address)
+                .ok_or("NPT fault is outside guest RAM")?;
+        let range_end = range_base.saturating_add(range_size);
+        let mut gpa = guest_address & !(GUEST_MEMORY_CHUNK_SIZE - 1);
+        gpa = gpa.max(range_base);
+        let chunk_end = gpa.saturating_add(GUEST_MEMORY_CHUNK_SIZE).min(range_end);
+
+        if chunk_end - gpa == GUEST_MEMORY_CHUNK_SIZE && self.npt.get_phys_addr(gpa).is_none() {
+            if let Some(frame) = frame_allocator.allocate_contiguous_frames(512, 512) {
+                let hpa = frame.start_address().as_u64();
+                unsafe {
+                    core::ptr::write_bytes(hpa as *mut u8, 0, GUEST_MEMORY_CHUNK_SIZE as usize)
+                };
+                self.npt.map_2m(gpa, hpa, frame_allocator)?;
+                if let Some(device) = self.passthrough.as_mut() {
+                    for offset in (0..GUEST_MEMORY_CHUNK_SIZE).step_by(PAGE_SIZE as usize) {
+                        device.map_dma(gpa + offset, hpa + offset, frame_allocator)?;
+                    }
+                }
+                self.guest_memory_allocated = self
+                    .guest_memory_allocated
+                    .saturating_add(GUEST_MEMORY_CHUNK_SIZE);
+                return Ok(());
+            }
+        }
+
+        while gpa < chunk_end {
+            if self.npt.get_phys_addr(gpa).is_none() {
+                let frame = frame_allocator
+                    .allocate_frame()
+                    .ok_or("No free frames for guest RAM")?;
+                let hpa = frame.start_address().as_u64();
+                unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE as usize) };
+                self.npt.map_4k(gpa, hpa, frame_allocator)?;
+                if let Some(device) = self.passthrough.as_mut() {
+                    device.map_dma(gpa, hpa, frame_allocator)?;
+                }
+                self.guest_memory_allocated = self.guest_memory_allocated.saturating_add(PAGE_SIZE);
+            }
+            gpa += PAGE_SIZE;
+        }
         Ok(())
     }
 
@@ -1505,10 +1551,7 @@ impl AMDVCpu {
 }
 
 impl VCpu for AMDVCpu {
-    fn prepare(
-        &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
-    ) -> Result<(), &'static str> {
+    fn prepare(&mut self, frame_allocator: &mut BitmapMemoryTable) -> Result<(), &'static str> {
         if !self.initialized {
             self.setup(frame_allocator)?;
             self.initialized = true;
@@ -1518,7 +1561,7 @@ impl VCpu for AMDVCpu {
 
     fn run(
         &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
         block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str> {
         interrupts::without_interrupts(|| {
@@ -1609,7 +1652,16 @@ impl VCpu for AMDVCpu {
                     0x89 => self.advance_guest_rip(),
                     0x8c => Err("AMD guest attempted unsupported XSETBV"),
                     0x7f => Err("AMD guest shutdown (likely a triple fault)"),
-                    0x400 => Err("AMD nested page fault"),
+                    0x400 => {
+                        let guest_address = self.vmcb.get_raw_vmcb().control_area.exit_info2;
+                        if self.npt.get_phys_addr(guest_address).is_some() {
+                            Err("AMD NPT permission fault")
+                        } else {
+                            self.allocate_guest_memory_chunk(guest_address, frame_allocator)?;
+                            self.vmcb.get_raw_vmcb().control_area.tlb_control = 3;
+                            Ok(())
+                        }
+                    }
                     u32::MAX => Err("VMRUN rejected the VMCB guest state"),
                     _ => Err("Unhandled AMD VMEXIT"),
                 }
@@ -1691,7 +1743,10 @@ impl VCpu for AMDVCpu {
     }
 
     fn get_used_guest_memory_size(&self) -> u64 {
-        self.npt.accessed_bytes(self.guest_memory_size)
+        common::uefi::ram_ranges(self.guest_memory_size)
+            .into_iter()
+            .map(|(base, size)| self.npt.accessed_bytes(base, base.saturating_add(size)))
+            .sum()
     }
 
     fn new(

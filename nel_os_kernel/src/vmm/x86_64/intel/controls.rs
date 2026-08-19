@@ -37,7 +37,10 @@ pub fn preemption_timer_ticks(tsc_khz: u64, slice_millis: u64, timer_shift: u8) 
 
 pub fn setup_exec_controls() -> Result<u8, &'static str> {
     let basic_msr = common::read_msr(0x480);
-    let mut raw_pin_exec_ctrl = u32::from(vmcs::controls::PinBasedVmExecutionControls::read()?);
+    // VMCS fields are architecturally undefined after VMCLEAR. Build every
+    // control value from the capability MSR rather than preserving whatever
+    // VMREAD happens to return for a newly created VMCS.
+    let mut raw_pin_exec_ctrl = 0;
 
     let pin_capabilities = if basic_msr & (1 << 55) != 0 {
         common::read_msr(0x48d)
@@ -57,8 +60,7 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
 
     pin_exec_ctrl.write()?;
 
-    let mut raw_primary_exec_ctrl =
-        u32::from(vmcs::controls::PrimaryProcessorBasedVmExecutionControls::read()?);
+    let mut raw_primary_exec_ctrl = 0;
 
     let primary_capabilities = if basic_msr & (1 << 55) != 0 {
         common::read_msr(0x48e)
@@ -90,8 +92,7 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
 
     primary_exec_ctrl.write()?;
 
-    let mut raw_secondary_exec_ctrl =
-        u32::from(vmcs::controls::SecondaryProcessorBasedVmExecutionControls::read()?);
+    let mut raw_secondary_exec_ctrl = 0;
 
     let secondary_capabilities = if basic_msr & (1 << 55) != 0 {
         common::read_msr(x86::msr::IA32_VMX_PROCBASED_CTLS2)
@@ -123,7 +124,7 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
 pub fn setup_entry_controls() -> Result<(), &'static str> {
     let baisc_msr = common::read_msr(0x480);
 
-    let mut raw_entry_ctrl = u32::from(vmcs::controls::EntryControls::read()?);
+    let mut raw_entry_ctrl = 0;
     let reserved_bits = if baisc_msr & (1 << 55) != 0 {
         common::read_msr(0x490)
     } else {
@@ -145,7 +146,7 @@ pub fn setup_entry_controls() -> Result<(), &'static str> {
 pub fn setup_exit_controls() -> Result<(), &'static str> {
     let basic_msr = common::read_msr(0x480);
 
-    let mut raw_exit_ctrl = u32::from(vmcs::controls::PrimaryExitControls::read()?);
+    let mut raw_exit_ctrl = 0;
     let reserved_bits = if basic_msr & (1 << 55) != 0 {
         common::read_msr(0x48f)
     } else {

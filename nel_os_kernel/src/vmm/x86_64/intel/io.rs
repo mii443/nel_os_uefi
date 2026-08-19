@@ -8,8 +8,9 @@ use crate::{
     info,
     interrupt::{idt::IRQ_TIMER, subscriber::InterruptContext},
     serial,
-    vmm::x86_64::intel::{
-        register::GuestRegisters, vmcs::controls::EntryIntrInfo, vmread, vmwrite,
+    vmm::x86_64::{
+        common::uefi,
+        intel::{register::GuestRegisters, vmcs::controls::EntryIntrInfo, vmread, vmwrite},
     },
 };
 
@@ -324,12 +325,17 @@ impl RtcState {
         registers[0x18] = 0x3c;
         registers[0x30] = registers[0x17];
         registers[0x31] = registers[0x18];
-        let above_16m = guest_memory_size
+        let above_16m = uefi::low_memory_size(guest_memory_size)
             .saturating_sub(16 * 1024 * 1024)
             .div_ceil(64 * 1024)
             .min(u16::MAX as u64) as u16;
         registers[0x34] = above_16m as u8;
         registers[0x35] = (above_16m >> 8) as u8;
+        let above_4g =
+            (uefi::high_memory_size(guest_memory_size) / (64 * 1024)).min(0x00ff_ffff) as u32;
+        registers[0x5b] = above_4g as u8;
+        registers[0x5c] = (above_4g >> 8) as u8;
+        registers[0x5d] = (above_4g >> 16) as u8;
         Self {
             selector: 0,
             registers,

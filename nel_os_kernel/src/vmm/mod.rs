@@ -2,6 +2,7 @@ use ::x86_64::structures::paging::{FrameAllocator, Size4KiB};
 use alloc::boxed::Box;
 
 use crate::{
+    memory::bitmap::BitmapMemoryTable,
     network::PassthroughDescriptor,
     platform,
     storage::VirtioBlock,
@@ -16,7 +17,7 @@ pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 256;
 // image, its decompressed kernel, initrd, and OVMF allocations at the same
 // time. At 128 MiB the EFI stub fails with EFI_OUT_OF_RESOURCES.
 pub const MIN_GUEST_MEMORY_MIB: u32 = 256;
-pub const MAX_GUEST_MEMORY_MIB: u32 = 768;
+pub const MAX_GUEST_MEMORY_MIB: u32 = 4 * 1024;
 pub const VCPU_TIME_SLICE_MILLIS: u64 = 4;
 pub const MAX_VCPU_HEAP_BYTES: usize = {
     let amd = core::mem::size_of::<AMDVCpu>();
@@ -40,16 +41,13 @@ pub trait VCpu {
 
     fn run(
         &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
         block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str>;
 
     /// Allocates guest RAM and initializes the boot state without executing
     /// guest instructions.
-    fn prepare(
-        &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
-    ) -> Result<(), &'static str>;
+    fn prepare(&mut self, frame_allocator: &mut BitmapMemoryTable) -> Result<(), &'static str>;
 
     /// Returns the existing VCPU and guest RAM to its boot state. Implementors
     /// must retain already allocated guest-memory mappings.

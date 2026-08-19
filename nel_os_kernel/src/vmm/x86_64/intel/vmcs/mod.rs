@@ -55,6 +55,12 @@ impl Vmcs {
         let frame = frame_allocator
             .allocate_frame()
             .ok_or("Failed to allocate VMCS frame")?;
+        // VMCLEAR resets launch state but does not initialize every VMCS
+        // field. A reused host frame may contain allowed control bits from
+        // unrelated data, so start each VMCS from a deterministic zero page.
+        unsafe {
+            core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 4096);
+        }
         Ok(Vmcs { frame })
     }
 

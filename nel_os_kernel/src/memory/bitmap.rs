@@ -85,6 +85,37 @@ impl BitmapMemoryTable {
         self.free_frames
     }
 
+    /// Allocates a physically contiguous, PFN-aligned run of frames.
+    pub fn allocate_contiguous_frames(
+        &mut self,
+        count: usize,
+        alignment_frames: usize,
+    ) -> Option<PhysFrame<Size4KiB>> {
+        if count == 0 || !alignment_frames.is_power_of_two() {
+            return None;
+        }
+
+        let alignment_mask = alignment_frames - 1;
+        let mut candidate = self.start.checked_add(alignment_mask)? & !alignment_mask;
+        while candidate.checked_add(count)? <= self.end {
+            let mut offset = 0;
+            while offset < count && self.get_bit(candidate + offset) {
+                offset += 1;
+            }
+            if offset == count {
+                for frame in candidate..candidate + count {
+                    self.set_frame(frame, false);
+                }
+                return PhysFrame::from_start_address(PhysAddr::new(
+                    Self::pfn_to_addr(candidate) as u64
+                ))
+                .ok();
+            }
+            candidate = candidate.checked_add(offset + 1 + alignment_mask)? & !alignment_mask;
+        }
+        None
+    }
+
     pub fn set_range(&mut self, range: &memory::Range) {
         let start = Self::addr_to_pfn(range.start as usize);
         let size = (range.end - range.start) / PAGE_SIZE as u64;
@@ -143,6 +174,10 @@ impl BitmapMemoryTable {
 unsafe impl FrameAllocator<Size4KiB> for BitmapMemoryTable {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         if let Some(frame) = self.get_free_pfn() {
+            // `get_free_pfn` found the first free frame at or after `start`, so
+            // everything before it is allocated.  Advancing the cursor avoids
+            // repeatedly rescanning a large aligned allocation.
+            self.start = frame;
             self.set_frame(frame, false);
             Some(
                 PhysFrame::from_start_address(PhysAddr::new(Self::pfn_to_addr(frame) as u64))

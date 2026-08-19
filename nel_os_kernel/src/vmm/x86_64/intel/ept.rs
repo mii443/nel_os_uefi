@@ -46,12 +46,12 @@ impl Ept {
             .with_phys(frame.start_address().as_u64() >> 12)
     }
 
-    fn memory_entry(hpa: u64, map_memory: bool) -> EntryBase {
+    fn memory_entry(hpa: u64, map_memory: bool, memory_type: u8) -> EntryBase {
         EntryBase::new()
             .with_read(true)
             .with_write(true)
             .with_exec_super(true)
-            .with_typ(0)
+            .with_typ(memory_type)
             .with_map_memory(map_memory)
             .with_phys(hpa >> 12)
     }
@@ -63,6 +63,9 @@ impl Ept {
         hpa: u64,
         allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
+        if gpa & 0x1f_ffff != 0 || hpa & 0x1f_ffff != 0 {
+            return Err("EPT 2 MiB mapping is not aligned");
+        }
         let lv4_index = (gpa >> 39) & 0x1FF;
         let lv3_index = (gpa >> 30) & 0x1FF;
         let lv2_index = (gpa >> 21) & 0x1FF;
@@ -103,7 +106,7 @@ impl Ept {
         };
 
         let lv2_entry = &mut lv2_table[lv2_index as usize];
-        *lv2_entry = Self::memory_entry(hpa, true);
+        *lv2_entry = Self::memory_entry(hpa, true, 6);
 
         Ok(())
     }
@@ -112,6 +115,25 @@ impl Ept {
         &mut self,
         gpa: u64,
         hpa: u64,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        self.map_4k_with_type(gpa, hpa, 6, allocator)
+    }
+
+    pub fn map_mmio_4k(
+        &mut self,
+        gpa: u64,
+        hpa: u64,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        self.map_4k_with_type(gpa, hpa, 0, allocator)
+    }
+
+    fn map_4k_with_type(
+        &mut self,
+        gpa: u64,
+        hpa: u64,
+        memory_type: u8,
         allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<(), &'static str> {
         let lv4_index = (gpa >> 39) & 0x1FF;
@@ -172,7 +194,7 @@ impl Ept {
         };
 
         let lv1_entry = &mut lv1_table[lv1_index as usize];
-        *lv1_entry = Self::memory_entry(hpa, true);
+        *lv1_entry = Self::memory_entry(hpa, true, memory_type);
 
         Ok(())
     }
@@ -263,9 +285,10 @@ impl Ept {
         lv1_entry.is_present() && lv1_entry.map_memory() && lv1_entry.accessed()
     }
 
-    pub fn accessed_bytes(&self, gpa_end: u64) -> u64 {
+    pub fn accessed_bytes(&self, gpa_start: u64, gpa_end: u64) -> u64 {
+        let first_page = gpa_start / 4096;
         let page_count = gpa_end.div_ceil(4096);
-        (0..page_count)
+        (first_page..page_count)
             .filter(|page| self.is_accessed(page * 4096))
             .count() as u64
             * 4096

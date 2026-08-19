@@ -68,6 +68,50 @@ impl Npt {
         Ok(())
     }
 
+    pub fn map_2m(
+        &mut self,
+        gpa: u64,
+        hpa: u64,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        if gpa & 0x1f_ffff != 0 || hpa & 0x1f_ffff != 0 {
+            return Err("NPT 2 MiB mapping is not aligned");
+        }
+
+        let indexes = [
+            ((gpa >> 39) & 0x1ff) as usize,
+            ((gpa >> 30) & 0x1ff) as usize,
+        ];
+        let mut table_frame = self.root_table;
+        for index in indexes {
+            let table = Self::frame_to_table(table_frame);
+            let entry = &mut table[index];
+            if *entry & ENTRY_PRESENT == 0 {
+                let next = allocator
+                    .allocate_frame()
+                    .ok_or("Failed to allocate NPT page table")?;
+                Self::clear_frame(next);
+                *entry = next.start_address().as_u64() | TABLE_FLAGS;
+                table_frame = next;
+            } else {
+                if *entry & ENTRY_HUGE != 0 {
+                    return Err("NPT mapping collides with a huge page");
+                }
+                table_frame =
+                    PhysFrame::from_start_address(PhysAddr::new(*entry & ENTRY_ADDRESS_MASK))
+                        .map_err(|_| "Invalid NPT table address")?;
+            }
+        }
+
+        let table = Self::frame_to_table(table_frame);
+        let entry = &mut table[((gpa >> 21) & 0x1ff) as usize];
+        if *entry & ENTRY_PRESENT != 0 {
+            return Err("NPT 2 MiB mapping collides with an existing mapping");
+        }
+        *entry = hpa | TABLE_FLAGS | ENTRY_HUGE;
+        Ok(())
+    }
+
     pub fn get_phys_addr(&self, gpa: u64) -> Option<u64> {
         let indexes = [
             ((gpa >> 39) & 0x1ff) as usize,
@@ -127,9 +171,10 @@ impl Npt {
         false
     }
 
-    pub fn accessed_bytes(&self, gpa_end: u64) -> u64 {
+    pub fn accessed_bytes(&self, gpa_start: u64, gpa_end: u64) -> u64 {
+        let first_page = gpa_start / 4096;
         let page_count = gpa_end.div_ceil(4096);
-        (0..page_count)
+        (first_page..page_count)
             .filter(|page| self.is_accessed(page * 4096))
             .count() as u64
             * 4096

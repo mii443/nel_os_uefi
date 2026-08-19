@@ -14,6 +14,7 @@ use x86_64::{
 use crate::{
     constant::PAGE_SIZE,
     info, interrupt,
+    memory::bitmap::BitmapMemoryTable,
     network::{PassthroughDescriptor, PassthroughNic},
     storage::{GuestVirtioBlock, VirtioBlock},
     vmm::{
@@ -39,6 +40,7 @@ use crate::{
     },
 };
 const TEMP_STACK_SIZE: usize = 4096;
+const GUEST_MEMORY_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 static mut TEMP_STACK: [u8; TEMP_STACK_SIZE + 0x10] = [0; TEMP_STACK_SIZE + 0x10];
 static VMXON_REGION: Once<Result<vmxon::Vmxon, &'static str>> = Once::new();
 
@@ -94,7 +96,11 @@ impl IntelVCpu {
         vmwrite(x86::vmx::vmcs::host::RSP, rsp).unwrap();
     }
 
-    fn vmexit_handler(&mut self, block: Option<&mut VirtioBlock>) -> Result<(), &'static str> {
+    fn vmexit_handler(
+        &mut self,
+        frame_allocator: &mut BitmapMemoryTable,
+        block: Option<&mut VirtioBlock>,
+    ) -> Result<(), &'static str> {
         use x86::vmx::vmcs;
         let exit_reason_raw = vmread(vmcs::ro::EXIT_REASON)? as u32;
 
@@ -329,8 +335,14 @@ impl IntelVCpu {
                 },
                 VmxExitReason::EPT_VIOLATION => {
                     let guest_address = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL)?;
-                    info!("Ept Violation at guest address: {:#x}", guest_address);
-                    return Err("Ept Violation");
+                    if self.ept.get_phys_addr(guest_address).is_some() {
+                        info!(
+                            "Ept permission violation at mapped guest address: {:#x}",
+                            guest_address
+                        );
+                        return Err("Ept permission violation");
+                    }
+                    self.allocate_guest_memory_chunk(guest_address, frame_allocator)?;
                 }
                 VmxExitReason::TRIPLE_FAULT => {
                     info!(
@@ -476,8 +488,6 @@ impl IntelVCpu {
     }
 
     fn vmentry(&mut self) -> Result<(), InstructionError> {
-        auditor::controls::check_vmcs_control_fields().unwrap();
-
         let success = {
             let result: u16;
 
@@ -504,10 +514,7 @@ impl IntelVCpu {
         Ok(())
     }
 
-    fn activate(
-        &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
-    ) -> Result<(), &'static str> {
+    fn activate(&mut self, frame_allocator: &mut BitmapMemoryTable) -> Result<(), &'static str> {
         let revision_id = common::read_msr(0x480) as u32;
         self.vmcs.write_revision_id(revision_id);
         self.vmcs.reset()?;
@@ -559,31 +566,31 @@ impl IntelVCpu {
             Cr4::write(cr4);
         }
 
+        // The control fields are immutable during normal execution except for
+        // explicitly managed mode bits. Auditing every VM entry is especially
+        // expensive under nested VMX, so validate the freshly prepared VMCS
+        // once instead of on every time slice and EPT retry.
+        auditor::controls::check_vmcs_control_fields()?;
+
         Ok(())
     }
 
     fn init_guest_memory(
         &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
     ) -> Result<(), &'static str> {
-        let mut pages = self.guest_memory_size / 0x1000;
-        let mut gpa = 0;
-
-        while pages > 0 {
-            let frame = frame_allocator.allocate_frame().ok_or("No free frames")?;
-            let hpa = frame.start_address().as_u64();
-            self.guest_memory_allocated =
-                self.guest_memory_allocated.saturating_add(PAGE_SIZE as u64);
-
-            unsafe {
-                core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE);
+        // A passthrough device can DMA into a buffer before the guest CPU has
+        // touched it, so its entire IOVA space must be backed up front. Other
+        // VMs allocate zeroed RAM in 2 MiB chunks on their first EPT access.
+        if self.passthrough.is_some() {
+            for (range_base, range_size) in common::uefi::ram_ranges(self.guest_memory_size) {
+                let range_end = range_base.saturating_add(range_size);
+                let mut gpa = range_base;
+                while gpa < range_end {
+                    self.allocate_guest_memory_chunk(gpa, frame_allocator)?;
+                    gpa = gpa.saturating_add(GUEST_MEMORY_CHUNK_SIZE);
+                }
             }
-            self.ept.map_4k(gpa, hpa, frame_allocator)?;
-            if let Some(device) = self.passthrough.as_mut() {
-                device.map_dma(gpa, hpa, frame_allocator)?;
-            }
-            gpa += 0x1000;
-            pages -= 1;
         }
 
         let firmware = common::uefi::firmware_image()?;
@@ -608,14 +615,14 @@ impl IntelVCpu {
                 .ok_or("No free frames for guest UEFI platform MMIO")?;
             let hpa = frame.start_address().as_u64();
             unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE) };
-            self.ept.map_4k(gpa, hpa, frame_allocator)?;
+            self.ept.map_mmio_4k(gpa, hpa, frame_allocator)?;
         }
 
         if let Some(device) = self.passthrough.as_ref() {
             for (base, size) in device.mmio_regions() {
                 let mut address = base;
                 while address < base.saturating_add(size) {
-                    self.ept.map_4k(address, address, frame_allocator)?;
+                    self.ept.map_mmio_4k(address, address, frame_allocator)?;
                     address += PAGE_SIZE as u64;
                 }
             }
@@ -624,6 +631,55 @@ impl IntelVCpu {
         let eptp = ept::Eptp::init(&self.ept.root_table);
         vmwrite(x86::vmx::vmcs::control::EPTP_FULL, u64::from(eptp))?;
 
+        Ok(())
+    }
+
+    fn allocate_guest_memory_chunk(
+        &mut self,
+        guest_address: u64,
+        frame_allocator: &mut BitmapMemoryTable,
+    ) -> Result<(), &'static str> {
+        let (range_base, range_size) =
+            common::uefi::ram_range_containing(self.guest_memory_size, guest_address)
+                .ok_or("EPT violation is outside guest RAM")?;
+        let range_end = range_base.saturating_add(range_size);
+        let mut gpa = guest_address & !(GUEST_MEMORY_CHUNK_SIZE - 1);
+        gpa = gpa.max(range_base);
+        let chunk_end = gpa.saturating_add(GUEST_MEMORY_CHUNK_SIZE).min(range_end);
+
+        if chunk_end - gpa == GUEST_MEMORY_CHUNK_SIZE && self.ept.get_phys_addr(gpa).is_none() {
+            if let Some(frame) = frame_allocator.allocate_contiguous_frames(512, 512) {
+                let hpa = frame.start_address().as_u64();
+                unsafe {
+                    core::ptr::write_bytes(hpa as *mut u8, 0, GUEST_MEMORY_CHUNK_SIZE as usize)
+                };
+                self.ept.map_2m(gpa, hpa, frame_allocator)?;
+                if let Some(device) = self.passthrough.as_mut() {
+                    for offset in (0..GUEST_MEMORY_CHUNK_SIZE).step_by(PAGE_SIZE) {
+                        device.map_dma(gpa + offset, hpa + offset, frame_allocator)?;
+                    }
+                }
+                self.guest_memory_allocated = self
+                    .guest_memory_allocated
+                    .saturating_add(GUEST_MEMORY_CHUNK_SIZE);
+                return Ok(());
+            }
+        }
+
+        while gpa < chunk_end {
+            if self.ept.get_phys_addr(gpa).is_none() {
+                let frame = frame_allocator.allocate_frame().ok_or("No free frames")?;
+                let hpa = frame.start_address().as_u64();
+                unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE) };
+                self.ept.map_4k(gpa, hpa, frame_allocator)?;
+                if let Some(device) = self.passthrough.as_mut() {
+                    device.map_dma(gpa, hpa, frame_allocator)?;
+                }
+                self.guest_memory_allocated =
+                    self.guest_memory_allocated.saturating_add(PAGE_SIZE as u64);
+            }
+            gpa += PAGE_SIZE as u64;
+        }
         Ok(())
     }
 
@@ -1098,10 +1154,7 @@ impl IntelVCpu {
 }
 
 impl VCpu for IntelVCpu {
-    fn prepare(
-        &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
-    ) -> Result<(), &'static str> {
+    fn prepare(&mut self, frame_allocator: &mut BitmapMemoryTable) -> Result<(), &'static str> {
         if !self.activated {
             self.activate(frame_allocator)?;
             self.dump_vmcs_settings()?;
@@ -1112,7 +1165,7 @@ impl VCpu for IntelVCpu {
 
     fn run(
         &mut self,
-        frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
         block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str> {
         self.prepare(frame_allocator)?;
@@ -1158,7 +1211,7 @@ impl VCpu for IntelVCpu {
 
         x86_64::instructions::interrupts::without_interrupts(|| self.vmentry())
             .map_err(|e| e.to_str())?;
-        self.vmexit_handler(block)?;
+        self.vmexit_handler(frame_allocator, block)?;
         self.halted_irq_retry = self.halted && self.pic.has_pending_interrupt();
 
         Ok(())
@@ -1223,7 +1276,10 @@ impl VCpu for IntelVCpu {
     }
 
     fn get_used_guest_memory_size(&self) -> u64 {
-        self.ept.accessed_bytes(self.guest_memory_size)
+        common::uefi::ram_ranges(self.guest_memory_size)
+            .into_iter()
+            .map(|(base, size)| self.ept.accessed_bytes(base, base.saturating_add(size)))
+            .sum()
     }
 
     fn is_idle(&self) -> bool {
