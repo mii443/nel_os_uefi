@@ -194,6 +194,8 @@ pub struct VirtioBlock {
     _request_memory_pages: usize,
     request_address: u64,
     capacity_sectors: u64,
+    cached_sector: u64,
+    cached_sector_count: usize,
 }
 
 impl VirtioBlock {
@@ -261,6 +263,8 @@ impl VirtioBlock {
             _request_memory_pages: request_memory_pages,
             request_address,
             capacity_sectors,
+            cached_sector: 0,
+            cached_sector_count: 0,
         };
         let mut first_sector = [0u8; SECTOR_SIZE];
         device.read_sector(0, &mut first_sector)?;
@@ -306,19 +310,53 @@ impl VirtioBlock {
         if sector_count == 0 || sector_count > self.max_transfer_sectors() {
             return Err("virtio-blk read has an invalid transfer size");
         }
-        let data_length = sector_count
+        let request_end = sector
+            .checked_add(sector_count as u64)
+            .ok_or("virtio-blk read sector overflow")?;
+        if request_end > self.capacity_sectors {
+            return Err("virtio-blk read is beyond the device capacity");
+        }
+
+        let cached_end = self
+            .cached_sector
+            .saturating_add(self.cached_sector_count as u64);
+        if self.cached_sector_count != 0
+            && sector >= self.cached_sector
+            && request_end <= cached_end
+        {
+            let offset = (sector - self.cached_sector) as usize * SECTOR_SIZE;
+            let length = sector_count * SECTOR_SIZE;
+            return Ok(unsafe {
+                slice::from_raw_parts(
+                    (self.request_address + REQUEST_DATA_OFFSET) as *const u8,
+                    self.cached_sector_count * SECTOR_SIZE,
+                )
+                .get_unchecked(offset..offset + length)
+            });
+        }
+
+        // Firmware and kernel block probes commonly issue small sequential
+        // reads. Fetch one maximum-sized window so those requests do not each
+        // require another nested virtio transaction to the outer QEMU device.
+        let fill_sector_count = self
+            .max_transfer_sectors()
+            .min((self.capacity_sectors - sector) as usize);
+        let data_length = fill_sector_count
             .checked_mul(SECTOR_SIZE)
             .ok_or("virtio-blk read size overflow")?;
+        self.cached_sector_count = 0;
         self.submit(
             VIRTIO_BLK_T_IN,
             sector,
             self.request_address + REQUEST_DATA_OFFSET,
             data_length as u32,
         )?;
+        self.cached_sector = sector;
+        self.cached_sector_count = fill_sector_count;
         Ok(unsafe {
             slice::from_raw_parts(
                 (self.request_address + REQUEST_DATA_OFFSET) as *const u8,
-                data_length,
+                sector_count * SECTOR_SIZE,
             )
         })
     }
@@ -331,6 +369,7 @@ impl VirtioBlock {
         if sector >= self.capacity_sectors {
             return Err("virtio-blk write is beyond the device capacity");
         }
+        self.cached_sector_count = 0;
         let data = unsafe {
             slice::from_raw_parts_mut(
                 (self.request_address + REQUEST_DATA_OFFSET) as *mut u8,

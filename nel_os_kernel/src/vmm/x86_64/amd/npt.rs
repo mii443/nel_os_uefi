@@ -294,6 +294,27 @@ impl Npt {
         Ok(())
     }
 
+    pub fn get_slice(&self, gpa_start: u64, output: &mut [u8]) -> Result<(), &'static str> {
+        let mut gpa = gpa_start;
+        let mut offset = 0;
+        while offset < output.len() {
+            let hpa = self
+                .get_phys_addr(gpa)
+                .ok_or("Guest physical address is not mapped")?;
+            let bytes = (0x1000 - (gpa as usize & 0xfff)).min(output.len() - offset);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    hpa as *const u8,
+                    output[offset..].as_mut_ptr(),
+                    bytes,
+                )
+            };
+            gpa += bytes as u64;
+            offset += bytes;
+        }
+        Ok(())
+    }
+
     fn clear_frame(frame: PhysFrame) {
         unsafe {
             core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 4096);
@@ -312,6 +333,10 @@ impl GuestMemory for Npt {
 
     fn write_u8(&mut self, address: u64, value: u8) -> Result<(), &'static str> {
         self.set(address, value)
+    }
+
+    fn read_slice(&mut self, address: u64, output: &mut [u8]) -> Result<(), &'static str> {
+        self.get_slice(address, output)
     }
 
     fn write_slice(&mut self, address: u64, input: &[u8]) -> Result<(), &'static str> {
