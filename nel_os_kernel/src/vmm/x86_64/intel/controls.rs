@@ -108,8 +108,14 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
 
     secondary_exec_ctrl.write()?;
 
-    vmwrite(x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK, u64::MAX)?;
-    vmwrite(x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK, u64::MAX)?;
+    vmwrite(
+        x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK,
+        super::cr::cr0_guest_host_mask(),
+    )?;
+    vmwrite(
+        x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK,
+        super::cr::cr4_guest_host_mask(),
+    )?;
 
     Ok((common::read_msr(x86::msr::IA32_VMX_MISC) & 0x1f) as u8)
 }

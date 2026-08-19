@@ -46,7 +46,7 @@ pub fn vmm_interrupt_subscriber(pending_ptr: *mut core::ffi::c_void, context: &I
 
 #[cfg(test)]
 mod interrupt_vector_tests {
-    use super::{Pic, QualIo, Serial, interrupt_vector_to_irq};
+    use super::{Pic, Ps2Controller, QualIo, Serial, interrupt_vector_to_irq};
     use crate::vmm::x86_64::intel::register::GuestRegisters;
 
     #[test]
@@ -90,6 +90,26 @@ mod interrupt_vector_tests {
         pic.pending_irq |= 1 << 4;
 
         assert!(pic.has_pending_interrupt());
+    }
+
+    #[test]
+    fn ps2_controller_completes_firmware_probe_without_timeout() {
+        let mut controller = Ps2Controller::new();
+
+        controller.write_command(0xaa);
+        assert_ne!(controller.status() & 1, 0);
+        assert_eq!(controller.read_data(), 0x55);
+
+        controller.write_command(0xab);
+        assert_ne!(controller.status() & 1, 0);
+        assert_eq!(controller.read_data(), 0x00);
+
+        controller.write_data(0xf4);
+        assert_eq!(controller.read_data(), 0xfa);
+        controller.write_data(0xff);
+        assert_eq!(controller.read_data(), 0xfa);
+        assert_eq!(controller.read_data(), 0xaa);
+        assert_eq!(controller.status() & 1, 0);
     }
 }
 
@@ -213,6 +233,76 @@ impl Serial {
 struct RtcState {
     selector: u8,
     registers: [u8; 128],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Ps2Controller {
+    output: [u8; 4],
+    output_head: usize,
+    output_len: usize,
+    config: u8,
+    expect_config: bool,
+}
+
+impl Ps2Controller {
+    fn new() -> Self {
+        Self {
+            output: [0; 4],
+            output_head: 0,
+            output_len: 0,
+            config: 0,
+            expect_config: false,
+        }
+    }
+
+    fn enqueue(&mut self, value: u8) {
+        if self.output_len == self.output.len() {
+            return;
+        }
+        let tail = (self.output_head + self.output_len) % self.output.len();
+        self.output[tail] = value;
+        self.output_len += 1;
+    }
+
+    fn status(&self) -> u8 {
+        // Bit 2 reports that the controller self-test completed. The input
+        // buffer always drains synchronously; bit 0 follows the response FIFO.
+        0x04 | u8::from(self.output_len != 0)
+    }
+
+    fn read_data(&mut self) -> u8 {
+        if self.output_len == 0 {
+            return 0;
+        }
+        let value = self.output[self.output_head];
+        self.output_head = (self.output_head + 1) % self.output.len();
+        self.output_len -= 1;
+        value
+    }
+
+    fn write_command(&mut self, command: u8) {
+        match command {
+            0x20 => self.enqueue(self.config),
+            0x60 => self.expect_config = true,
+            0xaa => self.enqueue(0x55),
+            0xa9 | 0xab => self.enqueue(0x00),
+            _ => {}
+        }
+    }
+
+    fn write_data(&mut self, value: u8) {
+        if self.expect_config {
+            self.config = value;
+            self.expect_config = false;
+        } else if value == 0xff {
+            self.enqueue(0xfa);
+            self.enqueue(0xaa);
+        } else {
+            // Firmware only needs command acknowledgement and reset/BAT
+            // completion. Guest input remains on the emulated serial port.
+            self.enqueue(0xfa);
+        }
+    }
 }
 
 impl RtcState {
@@ -418,6 +508,7 @@ pub struct Pic {
     pit_channel2: PitChannel,
     speaker_control: u8,
     rtc: RtcState,
+    ps2: Ps2Controller,
 }
 
 impl Pic {
@@ -441,6 +532,7 @@ impl Pic {
             pit_channel2: PitChannel::new(tsc_khz),
             speaker_control: 0,
             rtc: RtcState::new(guest_memory_size),
+            ps2: Ps2Controller::new(),
         }
     }
 
@@ -632,6 +724,8 @@ impl Pic {
             0x0040 if qual.size() == 0 => regs.rax = self.pit_channel0.read() as u64,
             0x0042 if qual.size() == 0 => regs.rax = self.pit_channel2.read() as u64,
             0x0061 if qual.size() == 0 => regs.rax = self.speaker_status() as u64,
+            0x0060 if qual.size() == 0 => regs.rax = self.ps2.read_data() as u64,
+            0x0064 if qual.size() == 0 => regs.rax = self.ps2.status() as u64,
             0x0070 if qual.size() == 0 => regs.rax = self.rtc.selector as u64,
             0x0071 if qual.size() == 0 => regs.rax = self.rtc.read_data() as u64,
             0x03F8..=0x03FF => self.handle_serial_in(regs, qual),
@@ -649,6 +743,8 @@ impl Pic {
             0x0042 if qual.size() == 0 => self.pit_channel2.write(regs.rax as u8),
             0x0043 if qual.size() == 0 => self.write_pit_control(regs.rax as u8),
             0x0061 if qual.size() == 0 => self.speaker_control = regs.rax as u8 & 0x03,
+            0x0060 if qual.size() == 0 => self.ps2.write_data(regs.rax as u8),
+            0x0064 if qual.size() == 0 => self.ps2.write_command(regs.rax as u8),
             0x0070 if qual.size() == 0 => self.rtc.selector = regs.rax as u8,
             0x0071 if qual.size() == 0 => self.rtc.write_data(regs.rax as u8),
             0x03F8..=0x03FF => self.handle_serial_out(regs, qual),

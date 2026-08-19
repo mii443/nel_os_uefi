@@ -128,7 +128,7 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
             version_and_feature_info.ecx &= !(1 << 17);
 
             regs.rax = version_and_feature_info.eax as u64;
-            regs.rbx = version_and_feature_info.ebx as u64;
+            regs.rbx = single_vcpu_leaf1_ebx(version_and_feature_info.ebx) as u64;
             regs.rcx = u32::from(ecx) as u64;
             regs.rdx = u32::from(edx) as u64;
         }
@@ -136,6 +136,13 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
             invalid(vcpu);
         }
     }
+}
+
+fn single_vcpu_leaf1_ebx(host_ebx: u32) -> u32 {
+    // CPUID.1:EBX[23:16] is the maximum number of addressable logical
+    // processors and EBX[31:24] is the initial APIC ID. Report topology that
+    // matches this single-VCPU VM rather than passing through the host values.
+    (host_ebx & 0x0000_ffff) | (1 << 16)
 }
 
 fn invalid(vcpu: &mut IntelVCpu) {
@@ -289,5 +296,19 @@ impl VmxLeaf {
             0x80000004 => VmxLeaf::EXTENDED_FEATURE_4,
             _ => VmxLeaf::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_vcpu_leaf1_ebx;
+
+    #[test]
+    fn leaf1_ebx_describes_one_vcpu_with_apic_id_zero() {
+        let ebx = single_vcpu_leaf1_ebx(0xab20_0800);
+
+        assert_eq!((ebx >> 16) & 0xff, 1);
+        assert_eq!(ebx >> 24, 0);
+        assert_eq!(ebx & 0xffff, 0x0800);
     }
 }

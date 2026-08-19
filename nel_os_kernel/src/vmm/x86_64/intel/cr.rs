@@ -93,6 +93,29 @@ fn ia32e_active(cr0: u64, cr4: u64, efer: u64) -> bool {
     cr0 & (1 << 31) != 0 && cr4 & (1 << 5) != 0 && efer & (1 << 8) != 0
 }
 
+pub fn cr0_guest_host_mask() -> u64 {
+    guest_host_mask(
+        read_msr(x86::msr::IA32_VMX_CR0_FIXED0),
+        read_msr(x86::msr::IA32_VMX_CR0_FIXED1),
+        (1 << 0) | (1 << 31),
+    )
+}
+
+pub fn cr4_guest_host_mask() -> u64 {
+    guest_host_mask(
+        read_msr(x86::msr::IA32_VMX_CR4_FIXED0),
+        read_msr(x86::msr::IA32_VMX_CR4_FIXED1),
+        1 << 5,
+    )
+}
+
+fn guest_host_mask(fixed0: u64, fixed1: u64, mode_bits: u64) -> u64 {
+    // Trap bits whose VMX fixed value must be synthesized, reserved bits that
+    // cannot enter the VMCS, and the mode bits that update IA-32e state. Other
+    // architectural bits (notably CR0.WP) can execute directly in the guest.
+    fixed0 | !fixed1 | mode_bits
+}
+
 pub fn adjust_cr0(value: u64) -> u64 {
     let mut result = value;
 
@@ -171,7 +194,7 @@ fn get_value(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<u64, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ia32e_active, validate_cr8};
+    use super::{guest_host_mask, ia32e_active, validate_cr8};
 
     #[test]
     fn cr8_accepts_all_architectural_priority_values() {
@@ -192,5 +215,17 @@ mod tests {
         assert!(!ia32e_active(0, 1 << 5, 1 << 8));
         assert!(!ia32e_active(1 << 31, 0, 1 << 8));
         assert!(!ia32e_active(1 << 31, 1 << 5, 0));
+    }
+
+    #[test]
+    fn guest_host_mask_traps_fixed_reserved_and_mode_bits_only() {
+        let fixed0 = 1 << 13;
+        let fixed1 = (1 << 5) | (1 << 13) | (1 << 16);
+        let mask = guest_host_mask(fixed0, fixed1, 1 << 5);
+
+        assert_ne!(mask & (1 << 5), 0);
+        assert_ne!(mask & (1 << 13), 0);
+        assert_eq!(mask & (1 << 16), 0);
+        assert_ne!(mask & (1 << 20), 0);
     }
 }
