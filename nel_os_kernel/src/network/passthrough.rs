@@ -33,6 +33,7 @@ pub struct PassthroughDescriptor {
     io_base: u16,
     iommu_base: u64,
     device_status_address: u64,
+    config_space: [u32; 64],
     bars: [u32; 6],
     bar_masks: [u32; 6],
 }
@@ -58,6 +59,10 @@ impl PassthroughDescriptor {
         let common_config_address = find_virtio_cap_address(address, &bars, 1)
             .ok_or("the passthrough NIC has no virtio common configuration capability")?;
         let device_status_address = common_config_address + 20;
+        let mut config_space = [0u32; 64];
+        for (index, value) in config_space.iter_mut().enumerate() {
+            *value = address.read_u32(index as u8 * 4);
+        }
 
         // Keep the endpoint unable to DMA until its translation domain exists.
         let command = address.read_u16(0x04);
@@ -77,6 +82,7 @@ impl PassthroughDescriptor {
             io_base,
             iommu_base,
             device_status_address,
+            config_space,
             bars,
             bar_masks,
         })
@@ -89,6 +95,10 @@ pub struct PassthroughNic {
     command: u16,
     bar_probe: [bool; 6],
     fault_reported: bool,
+    last_interrupt_poll_tsc: u64,
+    last_fault_poll_tsc: u64,
+    interrupt_poll_cycles: u64,
+    fault_poll_cycles: u64,
     dma: DmaDomain,
 }
 
@@ -98,12 +108,21 @@ impl PassthroughNic {
         allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<Self, &'static str> {
         let dma = DmaDomain::new(descriptor, allocator)?;
+        let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .unwrap_or(1)
+            .max(1);
         Ok(Self {
             descriptor,
             config_address: 0,
             command: 0,
             bar_probe: [false; 6],
             fault_reported: false,
+            last_interrupt_poll_tsc: 0,
+            last_fault_poll_tsc: 0,
+            interrupt_poll_cycles: tsc_khz.saturating_mul(4),
+            fault_poll_cycles: tsc_khz.saturating_mul(1_000),
             dma,
         })
     }
@@ -179,20 +198,44 @@ impl PassthroughNic {
     }
 
     pub fn poll_interrupt_level(&mut self) -> (u8, bool) {
-        let fault_status = unsafe { mmio_read_u32(self.descriptor.iommu_base + IOMMU_FSTS) };
-        if fault_status != 0 && !self.fault_reported {
-            error!(
-                "VT-d reported a passthrough DMA fault: FSTS={:#x}",
-                fault_status
-            );
-            self.fault_reported = true;
+        if self.command & 0x6 != 0x6 {
+            return (GUEST_IRQ, false);
+        }
+
+        let now = unsafe { core::arch::x86_64::_rdtsc() };
+        if self.last_interrupt_poll_tsc != 0
+            && now.wrapping_sub(self.last_interrupt_poll_tsc) < self.interrupt_poll_cycles
+        {
+            // The physical INTx status was already offered to the guest on the
+            // sampling pass. Holding the cached level high would re-inject the
+            // same interrupt repeatedly until the next expensive host PCI
+            // read, even after the guest consumed the virtio ISR.
+            return (GUEST_IRQ, false);
+        }
+        self.last_interrupt_poll_tsc = now;
+
+        // Both VT-d MMIO and PCI configuration accesses become expensive L0
+        // exits when nel_os itself runs as a nested hypervisor. DMA faults are
+        // diagnostic rather than latency-sensitive, so sample them sparsely.
+        if self.last_fault_poll_tsc == 0
+            || now.wrapping_sub(self.last_fault_poll_tsc) >= self.fault_poll_cycles
+        {
+            self.last_fault_poll_tsc = now;
+            let fault_status = unsafe { mmio_read_u32(self.descriptor.iommu_base + IOMMU_FSTS) };
+            if fault_status != 0 && !self.fault_reported {
+                error!(
+                    "VT-d reported a passthrough DMA fault: FSTS={:#x}",
+                    fault_status
+                );
+                self.fault_reported = true;
+            }
         }
         // PCI Status bit 3 reflects the INTx line without acknowledging the
         // virtio interrupt. Reading the virtio ISR here would clear it before
         // the guest driver can determine why the device interrupted.
         const PCI_STATUS_INTERRUPT: u16 = 1 << 3;
-        let interrupt_asserted = self.descriptor.address.read_u16(0x06) & PCI_STATUS_INTERRUPT != 0;
-        (GUEST_IRQ, self.command & 0x6 == 0x6 && interrupt_asserted)
+        let asserted = self.descriptor.address.read_u16(0x06) & PCI_STATUS_INTERRUPT != 0;
+        (GUEST_IRQ, asserted)
     }
 
     pub fn reset(&mut self) {
@@ -200,6 +243,8 @@ impl PassthroughNic {
         self.command = 0;
         self.bar_probe = [false; 6];
         self.fault_reported = false;
+        self.last_interrupt_poll_tsc = 0;
+        self.last_fault_poll_tsc = 0;
         if self.descriptor.io_base != 0 {
             unsafe { Port::<u8>::new(self.descriptor.io_base + 18).write(0) };
         } else {
@@ -223,8 +268,7 @@ impl PassthroughNic {
             return width_mask(size);
         };
         if offset == 0x04 && size >= 2 {
-            let physical = self.descriptor.address.read_u32(0x04);
-            return physical & 0xffff_0000 | u32::from(self.command);
+            return self.descriptor.config_space[1] & 0xffff_0000 | u32::from(self.command);
         }
         if (0x10..=0x24).contains(&offset) && offset & 3 == 0 && size == 4 {
             let index = ((offset - 0x10) / 4) as usize;
@@ -235,12 +279,12 @@ impl PassthroughNic {
             };
         }
         if offset == 0x3c {
-            let mut value = self.descriptor.address.read_u32(0x3c);
+            let mut value = self.descriptor.config_space[0x3c / 4];
             value = (value & !0xff) | u32::from(GUEST_IRQ);
             return value & width_mask(size);
         }
         extract(
-            self.descriptor.address.read_u32(offset & 0xfc),
+            self.descriptor.config_space[usize::from(offset & 0xfc) / 4],
             u16::from(offset & 3),
             size,
         )
@@ -255,6 +299,9 @@ impl PassthroughNic {
             let mut command = u32::from(self.command);
             merge(&mut command, 0, size.min(2), value);
             self.command = command as u16 & 0x0007;
+            if self.command != old_command {
+                self.last_interrupt_poll_tsc = 0;
+            }
             if old_command & (1 << 2) == 0 && self.command & (1 << 2) != 0 {
                 fence(Ordering::SeqCst);
                 if let Err(error) = self.dma.invalidate() {

@@ -68,6 +68,27 @@ impl Npt {
         Ok(())
     }
 
+    pub fn reserve_4k(
+        &mut self,
+        gpa: u64,
+        hpa: u64,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        self.map_4k(gpa, hpa, allocator)?;
+        let indexes = [
+            ((gpa >> 39) & 0x1ff) as usize,
+            ((gpa >> 30) & 0x1ff) as usize,
+            ((gpa >> 21) & 0x1ff) as usize,
+        ];
+        let mut table_frame = self.root_table;
+        for index in indexes {
+            let entry = Self::frame_to_table(table_frame)[index];
+            table_frame = Self::table_frame(entry).ok_or("Invalid reserved NPT table")?;
+        }
+        Self::frame_to_table(table_frame)[((gpa >> 12) & 0x1ff) as usize] &= !TABLE_FLAGS;
+        Ok(())
+    }
+
     pub fn map_2m(
         &mut self,
         gpa: u64,
@@ -110,6 +131,89 @@ impl Npt {
         }
         *entry = hpa | TABLE_FLAGS | ENTRY_HUGE;
         Ok(())
+    }
+
+    pub fn reserve_2m(
+        &mut self,
+        gpa: u64,
+        hpa: u64,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<(), &'static str> {
+        self.map_2m(gpa, hpa, allocator)?;
+        let indexes = [
+            ((gpa >> 39) & 0x1ff) as usize,
+            ((gpa >> 30) & 0x1ff) as usize,
+        ];
+        let mut table_frame = self.root_table;
+        for index in indexes {
+            let entry = Self::frame_to_table(table_frame)[index];
+            table_frame = Self::table_frame(entry).ok_or("Invalid reserved NPT table")?;
+        }
+        Self::frame_to_table(table_frame)[((gpa >> 21) & 0x1ff) as usize] &= !TABLE_FLAGS;
+        Ok(())
+    }
+
+    /// Makes an already-backed, CPU-hidden DMA mapping visible after its first
+    /// nested-page fault. Intermediate page-table entries remain present so the
+    /// reserved HPA can be recovered without a side allocation table.
+    pub fn activate_reserved(&mut self, gpa: u64) -> bool {
+        let indexes = [
+            ((gpa >> 39) & 0x1ff) as usize,
+            ((gpa >> 30) & 0x1ff) as usize,
+            ((gpa >> 21) & 0x1ff) as usize,
+            ((gpa >> 12) & 0x1ff) as usize,
+        ];
+        let mut table_frame = self.root_table;
+
+        for (level, index) in indexes.into_iter().enumerate() {
+            let entry = &mut Self::frame_to_table(table_frame)[index];
+            let terminal = (level == 2 && *entry & ENTRY_HUGE != 0) || level == 3;
+            if terminal && *entry & ENTRY_ADDRESS_MASK != 0 {
+                if *entry & ENTRY_PRESENT != 0 {
+                    return false;
+                }
+                *entry |= TABLE_FLAGS;
+                return true;
+            }
+            if *entry & ENTRY_PRESENT == 0 || *entry & ENTRY_HUGE != 0 {
+                return false;
+            }
+            let Ok(next) =
+                PhysFrame::from_start_address(PhysAddr::new(*entry & ENTRY_ADDRESS_MASK))
+            else {
+                return false;
+            };
+            table_frame = next;
+        }
+        false
+    }
+
+    pub fn get_backing_phys_addr(&self, gpa: u64) -> Option<u64> {
+        let indexes = [
+            ((gpa >> 39) & 0x1ff) as usize,
+            ((gpa >> 30) & 0x1ff) as usize,
+            ((gpa >> 21) & 0x1ff) as usize,
+            ((gpa >> 12) & 0x1ff) as usize,
+        ];
+        let mut table_frame = self.root_table;
+
+        for (level, index) in indexes.into_iter().enumerate() {
+            let entry = Self::frame_to_table(table_frame)[index];
+            if entry & ENTRY_HUGE != 0 {
+                let offset_mask = if level == 1 { 0x3fff_ffff } else { 0x1f_ffff };
+                return Some((entry & ENTRY_ADDRESS_MASK & !offset_mask) | (gpa & offset_mask));
+            }
+            if level == 3 {
+                return (entry & ENTRY_ADDRESS_MASK != 0)
+                    .then_some((entry & ENTRY_ADDRESS_MASK) | (gpa & 0xfff));
+            }
+            if entry & ENTRY_PRESENT == 0 {
+                return None;
+            }
+            table_frame =
+                PhysFrame::from_start_address(PhysAddr::new(entry & ENTRY_ADDRESS_MASK)).ok()?;
+        }
+        None
     }
 
     pub fn get_phys_addr(&self, gpa: u64) -> Option<u64> {
@@ -193,7 +297,9 @@ impl Npt {
                 };
                 let lv2_table = Self::frame_to_table(lv2_frame);
                 for (lv2_index, &lv2_entry) in lv2_table.iter().enumerate() {
-                    if lv2_entry & ENTRY_PRESENT == 0 {
+                    if lv2_entry & ENTRY_PRESENT == 0
+                        && (lv2_entry & ENTRY_HUGE == 0 || lv2_entry & ENTRY_ADDRESS_MASK == 0)
+                    {
                         continue;
                     }
                     let gpa_2m = (lv4_index as u64) << 39
@@ -216,7 +322,7 @@ impl Npt {
                     let lv1_table = Self::frame_to_table(lv1_frame);
                     for (lv1_index, &lv1_entry) in lv1_table.iter().enumerate() {
                         let gpa = gpa_2m | (lv1_index as u64) << 12;
-                        if lv1_entry & ENTRY_PRESENT != 0
+                        if lv1_entry & ENTRY_ADDRESS_MASK != 0
                             && uefi::owns_backing_page(guest_memory_size, gpa)
                         {
                             allocator.deallocate_frame(PhysFrame::containing_address(
@@ -242,14 +348,14 @@ impl Npt {
 
     pub fn get(&self, gpa: u64) -> Result<u8, &'static str> {
         let hpa = self
-            .get_phys_addr(gpa)
+            .get_backing_phys_addr(gpa)
             .ok_or("Guest physical address is not mapped")?;
         Ok(unsafe { *(hpa as *const u8) })
     }
 
     pub fn set(&mut self, gpa: u64, value: u8) -> Result<(), &'static str> {
         let hpa = self
-            .get_phys_addr(gpa)
+            .get_backing_phys_addr(gpa)
             .ok_or("Guest physical address is not mapped")?;
         unsafe { *(hpa as *mut u8) = value };
         Ok(())
@@ -268,7 +374,7 @@ impl Npt {
         let mut gpa = gpa_start;
         while gpa < gpa_end {
             let hpa = self
-                .get_phys_addr(gpa)
+                .get_backing_phys_addr(gpa)
                 .ok_or("Guest physical address is not mapped")?;
             let bytes = ((0x1000 - (gpa & 0xfff)).min(gpa_end - gpa)) as usize;
             unsafe { core::ptr::write_bytes(hpa as *mut u8, value, bytes) };
@@ -282,7 +388,7 @@ impl Npt {
         let mut offset = 0;
         while offset < data.len() {
             let hpa = self
-                .get_phys_addr(gpa)
+                .get_backing_phys_addr(gpa)
                 .ok_or("Guest physical address is not mapped")?;
             let bytes = (0x1000 - (gpa as usize & 0xfff)).min(data.len() - offset);
             unsafe {
@@ -299,7 +405,7 @@ impl Npt {
         let mut offset = 0;
         while offset < output.len() {
             let hpa = self
-                .get_phys_addr(gpa)
+                .get_backing_phys_addr(gpa)
                 .ok_or("Guest physical address is not mapped")?;
             let bytes = (0x1000 - (gpa as usize & 0xfff)).min(output.len() - offset);
             unsafe {

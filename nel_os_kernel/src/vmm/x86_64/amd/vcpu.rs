@@ -652,7 +652,6 @@ impl AMDVCpu {
                     | InterceptVector1::MSR_PROT
                     | InterceptVector1::SHUTDOWN,
             );
-
             raw_vmcb.control_area.intercept_vec2.insert(
                 InterceptVector2::VMRUN
                     | InterceptVector2::VMMCALL
@@ -807,7 +806,7 @@ impl AMDVCpu {
                 let range_end = range_base.saturating_add(range_size);
                 let mut gpa = range_base;
                 while gpa < range_end {
-                    self.allocate_guest_memory_chunk(gpa, frame_allocator)?;
+                    self.allocate_guest_memory_chunk(gpa, frame_allocator, false)?;
                     gpa = gpa.saturating_add(GUEST_MEMORY_CHUNK_SIZE);
                 }
             }
@@ -863,6 +862,7 @@ impl AMDVCpu {
         &mut self,
         guest_address: u64,
         frame_allocator: &mut BitmapMemoryTable,
+        cpu_visible: bool,
     ) -> Result<(), &'static str> {
         let (range_base, range_size) =
             common::uefi::ram_range_containing(self.guest_memory_size, guest_address)
@@ -872,13 +872,19 @@ impl AMDVCpu {
         gpa = gpa.max(range_base);
         let chunk_end = gpa.saturating_add(GUEST_MEMORY_CHUNK_SIZE).min(range_end);
 
-        if chunk_end - gpa == GUEST_MEMORY_CHUNK_SIZE && self.npt.get_phys_addr(gpa).is_none() {
+        if chunk_end - gpa == GUEST_MEMORY_CHUNK_SIZE
+            && self.npt.get_backing_phys_addr(gpa).is_none()
+        {
             if let Some(frame) = frame_allocator.allocate_contiguous_frames(512, 512) {
                 let hpa = frame.start_address().as_u64();
                 unsafe {
                     core::ptr::write_bytes(hpa as *mut u8, 0, GUEST_MEMORY_CHUNK_SIZE as usize)
                 };
-                self.npt.map_2m(gpa, hpa, frame_allocator)?;
+                if cpu_visible {
+                    self.npt.map_2m(gpa, hpa, frame_allocator)?;
+                } else {
+                    self.npt.reserve_2m(gpa, hpa, frame_allocator)?;
+                }
                 if let Some(device) = self.passthrough.as_mut() {
                     for offset in (0..GUEST_MEMORY_CHUNK_SIZE).step_by(PAGE_SIZE as usize) {
                         device.map_dma(gpa + offset, hpa + offset, frame_allocator)?;
@@ -892,13 +898,17 @@ impl AMDVCpu {
         }
 
         while gpa < chunk_end {
-            if self.npt.get_phys_addr(gpa).is_none() {
+            if self.npt.get_backing_phys_addr(gpa).is_none() {
                 let frame = frame_allocator
                     .allocate_frame()
                     .ok_or("No free frames for guest RAM")?;
                 let hpa = frame.start_address().as_u64();
                 unsafe { core::ptr::write_bytes(hpa as *mut u8, 0, PAGE_SIZE as usize) };
-                self.npt.map_4k(gpa, hpa, frame_allocator)?;
+                if cpu_visible {
+                    self.npt.map_4k(gpa, hpa, frame_allocator)?;
+                } else {
+                    self.npt.reserve_4k(gpa, hpa, frame_allocator)?;
+                }
                 if let Some(device) = self.passthrough.as_mut() {
                     device.map_dma(gpa, hpa, frame_allocator)?;
                 }
@@ -1047,6 +1057,18 @@ impl AMDVCpu {
             }
             common::cpuid::HYPERVISOR_BASE_LEAF => {
                 let (eax, ebx, ecx, edx) = common::cpuid::hypervisor_vendor_leaf();
+                result.eax = eax;
+                result.ebx = ebx;
+                result.ecx = ecx;
+                result.edx = edx;
+            }
+            common::cpuid::HYPERVISOR_FREQUENCY_LEAF => {
+                let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+                    .get()
+                    .copied()
+                    .unwrap_or(0)
+                    .min(u32::MAX as u64) as u32;
+                let (eax, ebx, ecx, edx) = common::cpuid::hypervisor_frequency_leaf(tsc_khz);
                 result.eax = eax;
                 result.ebx = ebx;
                 result.ecx = ecx;
@@ -1716,7 +1738,10 @@ impl VCpu for AMDVCpu {
                 let vmcb = self.vmcb.get_raw_vmcb();
                 let exit_code = vmcb.control_area.exit_code;
                 if !self.exit_reported
-                    || !matches!(exit_code, 0x60 | 0x72 | 0x77 | 0x78 | 0x7b | 0x7c | 0x89)
+                    || !matches!(
+                        exit_code,
+                        0x60 | 0x72 | 0x77 | 0x78 | 0x7b | 0x7c | 0x89 | 0x400
+                    )
                 {
                     info!(
                         "VMEXIT: code={:#x} info1={:#x} info2={:#x} next_rip={:#x}",
@@ -1755,8 +1780,11 @@ impl VCpu for AMDVCpu {
                         let guest_address = self.vmcb.get_raw_vmcb().control_area.exit_info2;
                         if self.npt.get_phys_addr(guest_address).is_some() {
                             Err("AMD NPT permission fault")
+                        } else if self.npt.activate_reserved(guest_address) {
+                            self.vmcb.get_raw_vmcb().control_area.tlb_control = 3;
+                            Ok(())
                         } else {
-                            self.allocate_guest_memory_chunk(guest_address, frame_allocator)?;
+                            self.allocate_guest_memory_chunk(guest_address, frame_allocator, true)?;
                             self.vmcb.get_raw_vmcb().control_area.tlb_control = 3;
                             Ok(())
                         }

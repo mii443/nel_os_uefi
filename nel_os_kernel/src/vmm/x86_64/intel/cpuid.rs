@@ -4,7 +4,8 @@ use modular_bitfield::bitfield;
 use raw_cpuid::cpuid;
 
 use crate::vmm::x86_64::common::cpuid::{
-    HYPERVISOR_BASE_LEAF, KVM_COMPAT_BASE_LEAF, hypervisor_vendor_leaf, kvm_compat_vendor_leaf,
+    HYPERVISOR_BASE_LEAF, HYPERVISOR_FREQUENCY_LEAF, KVM_COMPAT_BASE_LEAF,
+    hypervisor_frequency_leaf, hypervisor_vendor_leaf, kvm_compat_vendor_leaf,
 };
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
 
@@ -23,6 +24,20 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
         return;
     }
 
+    if regs.rax as u32 == HYPERVISOR_FREQUENCY_LEAF {
+        let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+            .get()
+            .copied()
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        let (eax, ebx, ecx, edx) = hypervisor_frequency_leaf(tsc_khz);
+        regs.rax = u64::from(eax);
+        regs.rbx = u64::from(ebx);
+        regs.rcx = u64::from(ecx);
+        regs.rdx = u64::from(edx);
+        return;
+    }
+
     if regs.rax as u32 == KVM_COMPAT_BASE_LEAF {
         let (eax, ebx, ecx, edx) = kvm_compat_vendor_leaf();
         regs.rax = u64::from(eax);
@@ -33,6 +48,11 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
     }
 
     if regs.rax as u32 == KVM_COMPAT_BASE_LEAF + 1 {
+        invalid(vcpu);
+        return;
+    }
+
+    if (HYPERVISOR_BASE_LEAF + 1..KVM_COMPAT_BASE_LEAF).contains(&(regs.rax as u32)) {
         invalid(vcpu);
         return;
     }
