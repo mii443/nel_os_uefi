@@ -1283,7 +1283,12 @@ impl VCpu for IntelVCpu {
         // A different VM may have made its VMCS current since this VM's
         // previous time slice (or since this VM was created).
         self.vmcs.load()?;
-        if self.local_apic.take_mmio_eoi() == Some(true) {
+        let mmio_eoi = if self.guest_apic_base & (1 << 10) == 0 {
+            self.local_apic.synchronize_mmio()
+        } else {
+            None
+        };
+        if mmio_eoi == Some(true) {
             self.io_apic.eoi();
         }
         self.io_apic.synchronize();

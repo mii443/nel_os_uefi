@@ -66,6 +66,16 @@ without being modified. This allows another Linux distribution or another
 UEFI-capable operating system image to use the same virtual disk interface.
 `NEL_OS_BLOCK_SIZE_MIB` applies only when the default image is generated.
 
+The bundled Linux image defaults to the legacy PIC/PIT interrupt path
+(`acpi=off noapic nolapic`). This avoids severe nested-VMX timer dilation while
+the virtual ACPI/APIC devices remain available to other guest images. Override
+the complete Linux command line when generating the default image with, for
+example,
+
+```sh
+NEL_OS_LINUX_KERNEL_OPTIONS='console=ttyS0 pci=conf1' ./run.sh
+```
+
 Additional images can be exposed as disk 1, disk 2, and so on by setting
 contiguous numbered variables starting at `NEL_OS_BLOCK_IMAGE_1`. Disk 0 is the
 default/generated image and is assigned to the automatically started VM 0.

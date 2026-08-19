@@ -6,6 +6,7 @@ readonly SIZE_MIB="${2:?usage: create-linux-disk.sh OUTPUT SIZE_MIB BZIMAGE INIT
 readonly BZIMAGE="$(realpath -- "${3:?usage: create-linux-disk.sh OUTPUT SIZE_MIB BZIMAGE INITRAMFS}")"
 readonly INITRAMFS="$(realpath -- "${4:?usage: create-linux-disk.sh OUTPUT SIZE_MIB BZIMAGE INITRAMFS}")"
 readonly SYSTEMD_BOOT="${NEL_OS_SYSTEMD_BOOT:-/usr/lib/systemd/boot/efi/systemd-bootx64.efi}"
+readonly KERNEL_OPTIONS="${NEL_OS_LINUX_KERNEL_OPTIONS:-console=ttyS0 quiet loglevel=4 nokaslr pci=conf1 acpi=off noapic nolapic}"
 readonly ESP_START_SECTOR=2048
 readonly SECTOR_SIZE=512
 
@@ -48,7 +49,7 @@ printf '%s\n' \
     'title nel Linux' \
     'linux /EFI/Linux/nel-linux.efi' \
     'initrd /initrd.img' \
-    'options console=ttyS0 earlyprintk=serial nokaslr pci=conf1' \
+    "options ${KERNEL_OPTIONS}" \
     >"${CONFIG_DIR}/nel-linux.conf"
 mcopy -i "${MTOOLS_IMAGE}" "${CONFIG_DIR}/loader.conf" ::/loader/loader.conf
 mcopy -i "${MTOOLS_IMAGE}" "${CONFIG_DIR}/nel-linux.conf" ::/loader/entries/nel-linux.conf

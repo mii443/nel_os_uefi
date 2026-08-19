@@ -7,6 +7,7 @@ const VMX_PREEMPTION_TIMER: u32 = 1 << 6;
 const CR8_LOAD_EXITING: u32 = 1 << 19;
 const CR8_STORE_EXITING: u32 = 1 << 20;
 const MOV_DR_EXITING: u32 = 1 << 23;
+const ENABLE_RDTSCP: u32 = 1 << 3;
 
 fn apply_vmx_fixed_bits(value: u32, capability_msr: u64) -> u32 {
     let must_be_one = capability_msr as u32;
@@ -104,6 +105,7 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
     let mut secondary_exec_ctrl =
         vmcs::controls::SecondaryProcessorBasedVmExecutionControls::from(raw_secondary_exec_ctrl);
     secondary_exec_ctrl.set_ept(true);
+    secondary_exec_ctrl.set_rdtscp(((secondary_capabilities >> 32) as u32) & ENABLE_RDTSCP != 0);
     secondary_exec_ctrl.set_unrestricted_guest(true);
     //secondary_exec_ctrl.set_virtualize_apic_accesses(false); // TODO: true
 

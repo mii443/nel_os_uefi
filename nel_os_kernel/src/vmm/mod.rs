@@ -16,7 +16,10 @@ pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 256;
 // image, its decompressed kernel, initrd, and OVMF allocations at the same
 // time. At 128 MiB the EFI stub fails with EFI_OUT_OF_RESOURCES.
 pub const MIN_GUEST_MEMORY_MIB: u32 = 256;
-pub const VCPU_TIME_SLICE_MILLIS: u64 = 4;
+// Common Linux and BSD kernels program a roughly 1 ms local-APIC deadline
+// while booting. A longer forced-exit interval stretches every HLT-based wait
+// by the same factor, which is especially visible under nested VMX.
+pub const VCPU_TIME_SLICE_MILLIS: u64 = 1;
 pub const MAX_VCPU_HEAP_BYTES: usize = {
     let amd = core::mem::size_of::<AMDVCpu>();
     let intel = core::mem::size_of::<IntelVCpu>();

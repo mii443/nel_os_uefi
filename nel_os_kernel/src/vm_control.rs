@@ -494,9 +494,10 @@ impl VmController {
         let vm_id = self.vms[vm_index].id;
         let owns_serial = self.serial_owner.is_some() && self.serial_vm_id == vm_id;
         serial::set_guest_bridge_active(owns_serial);
-        // Force a bounded VMEXIT even for a compute-bound guest, including on
-        // nested-hypervisor combinations that stop the LAPIC current count.
-        interrupt::apic::rearm_management_timer();
+        // VMX/SVM provide their own bounded guest exit. Do not reprogram the
+        // host LAPIC here: a halted guest returns to this loop immediately,
+        // and repeatedly resetting the LAPIC before its deadline both starves
+        // the host timer and is extremely expensive under nested KVM.
         let slice_start = unsafe { core::arch::x86_64::_rdtsc() };
         let slice_cycles = interrupt::apic::GUEST_TSC_KHZ
             .get()

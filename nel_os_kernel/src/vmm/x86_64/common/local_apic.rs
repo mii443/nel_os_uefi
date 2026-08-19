@@ -66,27 +66,90 @@ impl LocalApic {
     pub fn attach_page(&mut self, hpa: u64) {
         self.page_hpa = hpa;
         unsafe {
-            core::ptr::write_volatile((hpa + 0x20) as *mut u32, 0);
-            core::ptr::write_volatile((hpa + 0x30) as *mut u32, APIC_VERSION);
-            core::ptr::write_volatile((hpa + XAPIC_EOI_OFFSET) as *mut u32, XAPIC_EOI_SENTINEL);
+            core::ptr::write_bytes(hpa as *mut u8, 0, 4096);
         }
+        self.publish_mmio();
     }
 
-    /// Observe an xAPIC MMIO EOI write on the shared register page. x2APIC
-    /// EOIs are intercepted as WRMSR by each virtualization backend instead.
-    pub fn take_mmio_eoi(&mut self) -> Option<bool> {
+    /// Import xAPIC writes made through the shared MMIO register page and
+    /// publish the current architectural state for subsequent guest reads.
+    ///
+    /// x2APIC accesses are intercepted as MSRs. xAPIC accesses intentionally
+    /// use a shared page so common register reads do not cause nested exits,
+    /// but that means writes must be sampled whenever control returns to the
+    /// VMM. In particular, losing the initial-count write leaves a guest in
+    /// HLT forever waiting for a local-APIC timer that was never armed.
+    pub fn synchronize_mmio(&mut self) -> Option<bool> {
         if self.page_hpa == 0 {
             return None;
         }
-        let address = self.page_hpa + XAPIC_EOI_OFFSET;
-        let value = unsafe { core::ptr::read_volatile(address as *const u32) };
-        if value != 0 {
-            return None;
+
+        let eoi = if self.read_mmio(XAPIC_EOI_OFFSET) == 0 {
+            Some(self.eoi())
+        } else {
+            None
+        };
+
+        self.tpr = self.read_mmio(0x80) & 0xff;
+        self.svr = self.read_mmio(0xf0) & 0x3ff;
+        self.esr = self.read_mmio(0x280);
+        self.icr = u64::from(self.read_mmio(0x300)) | (u64::from(self.read_mmio(0x310)) << 32);
+        self.lvt_cmci = self.read_mmio(0x2f0);
+        self.lvt_timer = self.read_mmio(0x320);
+        self.lvt_thermal = self.read_mmio(0x330);
+        self.lvt_pmi = self.read_mmio(0x340);
+        self.lvt_lint0 = self.read_mmio(0x350);
+        self.lvt_lint1 = self.read_mmio(0x360);
+        self.lvt_error = self.read_mmio(0x370);
+        self.divide_configuration = self.read_mmio(0x3e0) & 0xb;
+
+        let initial_count = self.read_mmio(0x380);
+        if initial_count != self.initial_count {
+            self.initial_count = initial_count;
+            self.timer_start_tsc = Self::now();
+            self.timer_armed = initial_count != 0;
+            self.timer_pending = false;
         }
-        unsafe {
-            core::ptr::write_volatile(address as *mut u32, XAPIC_EOI_SENTINEL);
+
+        self.publish_mmio();
+        eoi
+    }
+
+    fn publish_mmio(&self) {
+        if self.page_hpa == 0 {
+            return;
         }
-        Some(self.eoi())
+        self.write_mmio(0x20, 0);
+        self.write_mmio(0x30, APIC_VERSION);
+        self.write_mmio(0x80, self.tpr);
+        self.write_mmio(0xd0, 0);
+        self.write_mmio(0xe0, u32::MAX);
+        self.write_mmio(0xf0, self.svr);
+        self.write_mmio(XAPIC_EOI_OFFSET, XAPIC_EOI_SENTINEL);
+        self.write_mmio(0x280, self.esr);
+        self.write_mmio(0x2f0, self.lvt_cmci);
+        self.write_mmio(0x300, self.icr as u32);
+        self.write_mmio(0x310, (self.icr >> 32) as u32);
+        self.write_mmio(0x320, self.lvt_timer);
+        self.write_mmio(0x330, self.lvt_thermal);
+        self.write_mmio(0x340, self.lvt_pmi);
+        self.write_mmio(0x350, self.lvt_lint0);
+        self.write_mmio(0x360, self.lvt_lint1);
+        self.write_mmio(0x370, self.lvt_error);
+        self.write_mmio(0x380, self.initial_count);
+        self.write_mmio(0x390, self.current_count());
+        self.write_mmio(0x3e0, self.divide_configuration);
+        for bank in 0..self.in_service.len() {
+            self.sync_interrupt_bank(bank);
+        }
+    }
+
+    fn read_mmio(&self, offset: u64) -> u32 {
+        unsafe { core::ptr::read_volatile((self.page_hpa + offset) as *const u32) }
+    }
+
+    fn write_mmio(&self, offset: u64, value: u32) {
+        unsafe { core::ptr::write_volatile((self.page_hpa + offset) as *mut u32, value) }
     }
 
     pub fn read_x2apic(&self, index: u32) -> Option<u64> {

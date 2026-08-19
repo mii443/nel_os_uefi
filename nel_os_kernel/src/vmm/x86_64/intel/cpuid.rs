@@ -4,8 +4,8 @@ use modular_bitfield::bitfield;
 use raw_cpuid::cpuid;
 
 use crate::vmm::x86_64::common::cpuid::{
-    HYPERVISOR_BASE_LEAF, HYPERVISOR_FREQUENCY_LEAF, KVM_COMPAT_BASE_LEAF,
-    hypervisor_frequency_leaf, hypervisor_vendor_leaf, kvm_compat_vendor_leaf,
+    HYPERVISOR_BASE_LEAF, HYPERVISOR_FREQUENCY_LEAF, hypervisor_frequency_leaf,
+    hypervisor_vendor_leaf,
 };
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
 
@@ -38,21 +38,7 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
         return;
     }
 
-    if regs.rax as u32 == KVM_COMPAT_BASE_LEAF {
-        let (eax, ebx, ecx, edx) = kvm_compat_vendor_leaf();
-        regs.rax = u64::from(eax);
-        regs.rbx = u64::from(ebx);
-        regs.rcx = u64::from(ecx);
-        regs.rdx = u64::from(edx);
-        return;
-    }
-
-    if regs.rax as u32 == KVM_COMPAT_BASE_LEAF + 1 {
-        invalid(vcpu);
-        return;
-    }
-
-    if (HYPERVISOR_BASE_LEAF + 1..KVM_COMPAT_BASE_LEAF).contains(&(regs.rax as u32)) {
+    if (HYPERVISOR_BASE_LEAF + 1..=0x4fff_ffff).contains(&(regs.rax as u32)) {
         invalid(vcpu);
         return;
     }
@@ -125,20 +111,54 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
             regs.rax = 0x00000000;
             regs.rbx = 0x00000000;
             regs.rcx = signature.ecx as u64;
-            regs.rdx = signature.edx as u64;
+            regs.rdx = u64::from(guest_extended_feature_edx(signature.edx));
+        }
+        VmxLeaf::EXTENDED_POWER_MANAGEMENT => {
+            let power = cpuid!(0x80000007, 0);
+            regs.rax = 0;
+            regs.rbx = 0;
+            regs.rcx = 0;
+            // The virtual TSC runs directly from the invariant host TSC.
+            // Expose only that contract instead of leaking host power states.
+            regs.rdx = u64::from(power.edx & (1 << 8));
+        }
+        VmxLeaf::EXTENDED_ADDRESS_SIZE => {
+            let address_size = cpuid!(0x80000008, 0);
+            regs.rax = u64::from(address_size.eax);
+            regs.rbx = 0;
+            regs.rcx = 0;
+            regs.rdx = 0;
         }
         VmxLeaf::EXTENDED_FUNCTION => {
-            regs.rax = 0x80000000 + 4;
+            regs.rax = 0x80000008;
             regs.rbx = 0x00000000;
             regs.rcx = 0x00000000;
             regs.rdx = 0x00000000;
         }
         VmxLeaf::MAXIMUM_INPUT => {
             let vendor = cpuid!(0, 0);
-            regs.rax = u64::from(vendor.eax);
+            regs.rax = u64::from(vendor.eax.max(VmxLeaf::PROCESSOR_FREQUENCY as u32));
             regs.rbx = u64::from(vendor.ebx);
             regs.rcx = u64::from(vendor.ecx);
             regs.rdx = u64::from(vendor.edx);
+        }
+        VmxLeaf::TSC_FREQUENCY => {
+            let tsc_khz = guest_tsc_khz();
+            // A 1 MHz reference clock keeps the ratio in 32-bit fields even
+            // when the virtual TSC runs faster than 4.29 GHz.
+            // Linux understands this architectural leaf without depending on
+            // a vendor-specific hypervisor signature.
+            regs.rax = 1_000;
+            regs.rbx = u64::from(tsc_khz);
+            regs.rcx = 1_000_000;
+            regs.rdx = 0;
+        }
+        VmxLeaf::PROCESSOR_FREQUENCY => {
+            let tsc_mhz = guest_tsc_khz().div_ceil(1_000);
+            regs.rax = u64::from(tsc_mhz);
+            regs.rbx = u64::from(tsc_mhz);
+            regs.rcx = 100;
+            regs.rdx = 0;
         }
         VmxLeaf::VERSION_AND_FEATURE_INFO => {
             let version_and_feature_info = cpuid!(0x1, 0);
@@ -157,12 +177,21 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
     }
 }
 
+fn guest_tsc_khz() -> u32 {
+    crate::interrupt::apic::GUEST_TSC_KHZ
+        .get()
+        .copied()
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
+}
+
 fn guest_leaf1_edx() -> u32 {
     FeatureInfoEdx::new()
         .with_fpu(true)
         .with_vme(true)
         .with_de(true)
         .with_pse(true)
+        .with_tsc(true)
         .with_msr(true)
         .with_pae(true)
         .with_cx8(true)
@@ -179,11 +208,27 @@ fn guest_leaf1_edx() -> u32 {
         .into()
 }
 
+fn guest_extended_feature_edx(host_edx: u32) -> u32 {
+    const RDTSCP: u32 = 1 << 27;
+    const ENABLE_RDTSCP: u32 = 1 << 3;
+    let secondary_capabilities =
+        crate::vmm::x86_64::common::read_msr(x86::msr::IA32_VMX_PROCBASED_CTLS2);
+    let rdtscp_allowed = (secondary_capabilities >> 32) as u32 & ENABLE_RDTSCP != 0;
+    if rdtscp_allowed {
+        host_edx
+    } else {
+        host_edx & !RDTSCP
+    }
+}
+
 fn guest_leaf1_ecx(host_ecx: u32) -> u32 {
     FeatureInfoEcx::new()
         .with_pcid(true)
         .with_sse4_1(true)
         .with_sse4_2(true)
+        // x2APIC MSR exits provide exact timer reads and writes. A shared
+        // xAPIC page cannot represent a counter that changes while the guest
+        // is running and causes Linux timer calibration to drift badly.
         .with_x2apic(true)
         .with_xsave(true)
         .with_osxsave(true)
@@ -341,11 +386,15 @@ pub enum VmxLeaf {
     VERSION_AND_FEATURE_INFO = 0x1,
     EXTENDED_FEATURE = 0x7,
     EXTENDED_ENUMERATION = 0xD,
+    TSC_FREQUENCY = 0x15,
+    PROCESSOR_FREQUENCY = 0x16,
     EXTENDED_FUNCTION = 0x80000000,
     EXTENDED_PROCESSOR_SIGNATURE = 0x80000001,
     EXTENDED_FEATURE_2 = 0x80000002,
     EXTENDED_FEATURE_3 = 0x80000003,
     EXTENDED_FEATURE_4 = 0x80000004,
+    EXTENDED_POWER_MANAGEMENT = 0x80000007,
+    EXTENDED_ADDRESS_SIZE = 0x80000008,
     Unknown = 0xFFFFFFFF,
 }
 
@@ -356,11 +405,15 @@ impl VmxLeaf {
             0x1 => VmxLeaf::VERSION_AND_FEATURE_INFO,
             0x7 => VmxLeaf::EXTENDED_FEATURE,
             0xD => VmxLeaf::EXTENDED_ENUMERATION,
+            0x15 => VmxLeaf::TSC_FREQUENCY,
+            0x16 => VmxLeaf::PROCESSOR_FREQUENCY,
             0x80000000 => VmxLeaf::EXTENDED_FUNCTION,
             0x80000001 => VmxLeaf::EXTENDED_PROCESSOR_SIGNATURE,
             0x80000002 => VmxLeaf::EXTENDED_FEATURE_2,
             0x80000003 => VmxLeaf::EXTENDED_FEATURE_3,
             0x80000004 => VmxLeaf::EXTENDED_FEATURE_4,
+            0x80000007 => VmxLeaf::EXTENDED_POWER_MANAGEMENT,
+            0x80000008 => VmxLeaf::EXTENDED_ADDRESS_SIZE,
             _ => VmxLeaf::Unknown,
         }
     }
@@ -395,6 +448,11 @@ mod tests {
     #[test]
     fn leaf1_pat_matches_the_virtual_msr_contract() {
         assert_ne!(guest_leaf1_edx() & (1 << 16), 0);
+    }
+
+    #[test]
+    fn leaf1_exposes_the_direct_virtual_tsc() {
+        assert_ne!(guest_leaf1_edx() & (1 << 4), 0);
     }
 
     #[test]

@@ -934,7 +934,8 @@ impl AMDVCpu {
                     | (1 << 28)
                     | (1 << 29));
                 // Identify the virtual-machine boundary and expose the local
-                // APIC interfaces implemented by the VMM.
+                // APIC interfaces implemented by the VMM. x2APIC exits give
+                // the emulated changing timer counter exact read semantics.
                 result.ecx |= (1 << 21) | (1 << 31);
                 // Machine-check and MTRR state is MSR-backed.  Advertising
                 // these while the default-deny MSRPM rejects their MSRs sends
@@ -1074,20 +1075,7 @@ impl AMDVCpu {
                 result.ecx = ecx;
                 result.edx = edx;
             }
-            common::cpuid::KVM_COMPAT_BASE_LEAF => {
-                let (eax, ebx, ecx, edx) = common::cpuid::kvm_compat_vendor_leaf();
-                result.eax = eax;
-                result.ebx = ebx;
-                result.ecx = ecx;
-                result.edx = edx;
-            }
-            leaf if leaf == common::cpuid::KVM_COMPAT_BASE_LEAF + 1 => {
-                result.eax = 0;
-                result.ebx = 0;
-                result.ecx = 0;
-                result.edx = 0;
-            }
-            0x4000_0001..=0x4000_00ff | 0x8000_000a => {
+            0x4000_0001..=0x4fff_ffff | 0x8000_000a => {
                 result.eax = 0;
                 result.ebx = 0;
                 result.ecx = 0;
@@ -1136,7 +1124,12 @@ impl AMDVCpu {
     }
 
     fn prepare_device_interrupt(&mut self) -> Result<(), &'static str> {
-        if self.local_apic.take_mmio_eoi() == Some(true) {
+        let mmio_eoi = if self.apic_base & (1 << 10) == 0 {
+            self.local_apic.synchronize_mmio()
+        } else {
+            None
+        };
+        if mmio_eoi == Some(true) {
             self.io_apic.eoi();
         }
         self.io_apic.synchronize();
