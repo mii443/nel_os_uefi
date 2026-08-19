@@ -80,6 +80,11 @@ pub trait VCpu {
 
     fn get_guest_memory_size(&self) -> u64;
     fn get_allocated_guest_memory_size(&self) -> u64;
+
+    /// Returns the approximate guest working set. This is derived from the
+    /// accessed bits in the second-level page tables and therefore excludes
+    /// backing pages that the guest has never touched.
+    fn get_used_guest_memory_size(&self) -> u64;
 }
 
 pub fn get_vcpu(

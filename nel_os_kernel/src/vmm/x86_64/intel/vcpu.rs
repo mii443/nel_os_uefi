@@ -1222,6 +1222,10 @@ impl VCpu for IntelVCpu {
         self.guest_memory_allocated
     }
 
+    fn get_used_guest_memory_size(&self) -> u64 {
+        self.ept.accessed_bytes(self.guest_memory_size)
+    }
+
     fn is_idle(&self) -> bool {
         self.halted && !self.halted_irq_retry
     }

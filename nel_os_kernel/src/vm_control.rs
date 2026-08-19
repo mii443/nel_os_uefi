@@ -63,8 +63,14 @@ impl VirtualMachine {
             .map_or(0, |vcpu| vcpu.get_allocated_guest_memory_size())
     }
 
+    fn used_memory(&self) -> u64 {
+        self.vcpu
+            .as_ref()
+            .map_or(0, |vcpu| vcpu.get_used_guest_memory_size())
+    }
+
     fn memory_usage_tenths(&self) -> u64 {
-        percentage_tenths(self.allocated_memory(), self.configured_memory)
+        percentage_tenths(self.used_memory(), self.configured_memory)
     }
 
     fn cpu_usage_tenths(&self, now: u64) -> u64 {
@@ -620,6 +626,7 @@ impl ManagementEndpoint for SerialConsole {
 }
 
 fn write_vm_status<E: ManagementEndpoint>(endpoint: &mut E, vm_id: usize, vm: &VirtualMachine) {
+    let used_mib = vm.used_memory() / 1024 / 1024;
     let allocated_mib = vm.allocated_memory() / 1024 / 1024;
     let configured_mib = vm.configured_memory / 1024 / 1024;
     let memory_usage = vm.memory_usage_tenths();
@@ -628,11 +635,16 @@ fn write_vm_status<E: ManagementEndpoint>(endpoint: &mut E, vm_id: usize, vm: &V
     let _ = write!(endpoint, "vCPUs: {}\r\n", vmm::VCPUS_PER_VM);
     let _ = write!(
         endpoint,
-        "Memory allocation: {}/{} MiB ({}.{:01}%)\r\n",
-        allocated_mib,
+        "Memory usage: {}/{} MiB ({}.{:01}%)\r\n",
+        used_mib,
         configured_mib,
         memory_usage / 10,
         memory_usage % 10
+    );
+    let _ = write!(
+        endpoint,
+        "Host backing: {}/{} MiB\r\n",
+        allocated_mib, configured_mib
     );
     let _ = write!(
         endpoint,
@@ -656,14 +668,15 @@ fn write_vm_list<E: ManagementEndpoint>(endpoint: &mut E, vms: &[VirtualMachine]
         let cpu_usage = vm.cpu_usage_tenths(now);
         let _ = write!(
             endpoint,
-            "VM {}: {}, {} vCPU, memory={}/{} MiB ({}.{:01}%), cpu={}.{:01}%\r\n",
+            "VM {}: {}, {} vCPU, memory={}/{} MiB ({}.{:01}%), backing={} MiB, cpu={}.{:01}%\r\n",
             vm.id,
             vm.state_text(),
             vmm::VCPUS_PER_VM,
-            vm.allocated_memory() / 1024 / 1024,
+            vm.used_memory() / 1024 / 1024,
             vm.configured_memory / 1024 / 1024,
             memory_usage / 10,
             memory_usage % 10,
+            vm.allocated_memory() / 1024 / 1024,
             cpu_usage / 10,
             cpu_usage % 10,
         );
@@ -864,34 +877,21 @@ fn process_management_command<E: ManagementEndpoint>(
                         None
                     };
                     match vmm::get_vcpu(allocator, hardware_vcpu_id, memory_size, assigned_nic) {
-                        Ok(mut new_vcpu) => {
-                            let prepare_result = new_vcpu.prepare(allocator);
+                        Ok(new_vcpu) => {
                             vm.vcpu = Some(new_vcpu);
-                            match prepare_result {
-                                Ok(()) => {
-                                    vm.state = VmState::Created;
-                                    let _ = write!(
-                                        endpoint,
-                                        "VM {} created with {} MiB and {} vCPU; use 'vm start {}'.\r\n",
-                                        vm_id,
-                                        memory_mib,
-                                        vmm::VCPUS_PER_VM,
-                                        vm_id
-                                    );
-                                    info!(
-                                        "VM {} created with {} MiB by management shell",
-                                        vm_id, memory_mib
-                                    );
-                                }
-                                Err(error) => {
-                                    vm.state = VmState::Failed(error);
-                                    let _ = write!(
-                                        endpoint,
-                                        "ERR unable to prepare VM {}: {}\r\n",
-                                        vm_id, error
-                                    );
-                                }
-                            }
+                            vm.state = VmState::Created;
+                            let _ = write!(
+                                endpoint,
+                                "VM {} created with {} MiB and {} vCPU; use 'vm start {}'.\r\n",
+                                vm_id,
+                                memory_mib,
+                                vmm::VCPUS_PER_VM,
+                                vm_id
+                            );
+                            info!(
+                                "VM {} created with {} MiB by management shell",
+                                vm_id, memory_mib
+                            );
                         }
                         Err(error) => {
                             vm.state = VmState::Failed(error);

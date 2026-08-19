@@ -1690,6 +1690,10 @@ impl VCpu for AMDVCpu {
         self.guest_memory_allocated
     }
 
+    fn get_used_guest_memory_size(&self) -> u64 {
+        self.npt.accessed_bytes(self.guest_memory_size)
+    }
+
     fn new(
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
         hardware_vcpu_id: usize,

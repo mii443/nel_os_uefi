@@ -8,6 +8,7 @@ use crate::storage::GuestMemory;
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
 const ENTRY_USER: u64 = 1 << 2;
+const ENTRY_ACCESSED: u64 = 1 << 5;
 const ENTRY_HUGE: u64 = 1 << 7;
 const ENTRY_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const TABLE_FLAGS: u64 = ENTRY_PRESENT | ENTRY_WRITABLE | ENTRY_USER;
@@ -96,6 +97,42 @@ impl Npt {
         }
 
         None
+    }
+
+    fn is_accessed(&self, gpa: u64) -> bool {
+        let indexes = [
+            ((gpa >> 39) & 0x1ff) as usize,
+            ((gpa >> 30) & 0x1ff) as usize,
+            ((gpa >> 21) & 0x1ff) as usize,
+            ((gpa >> 12) & 0x1ff) as usize,
+        ];
+        let mut table_frame = self.root_table;
+
+        for (level, index) in indexes.into_iter().enumerate() {
+            let entry = Self::frame_to_table(table_frame)[index];
+            if entry & ENTRY_PRESENT == 0 {
+                return false;
+            }
+            if entry & ENTRY_HUGE != 0 || level == 3 {
+                return entry & ENTRY_ACCESSED != 0;
+            }
+            let Ok(frame) =
+                PhysFrame::from_start_address(PhysAddr::new(entry & ENTRY_ADDRESS_MASK))
+            else {
+                return false;
+            };
+            table_frame = frame;
+        }
+
+        false
+    }
+
+    pub fn accessed_bytes(&self, gpa_end: u64) -> u64 {
+        let page_count = gpa_end.div_ceil(4096);
+        (0..page_count)
+            .filter(|page| self.is_accessed(page * 4096))
+            .count() as u64
+            * 4096
     }
 
     pub fn get(&self, gpa: u64) -> Result<u8, &'static str> {

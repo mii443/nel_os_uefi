@@ -226,6 +226,51 @@ impl Ept {
         }
     }
 
+    fn is_accessed(&self, gpa: u64) -> bool {
+        let lv4_index = ((gpa >> 39) & 0x1ff) as usize;
+        let lv3_index = ((gpa >> 30) & 0x1ff) as usize;
+        let lv2_index = ((gpa >> 21) & 0x1ff) as usize;
+        let lv1_index = ((gpa >> 12) & 0x1ff) as usize;
+
+        let lv4_entry = &Self::frame_to_table_ptr(&self.root_table)[lv4_index];
+        if !lv4_entry.is_present() {
+            return false;
+        }
+        let Ok(frame) = PhysFrame::from_start_address(PhysAddr::new(lv4_entry.phys() << 12)) else {
+            return false;
+        };
+
+        let lv3_entry = &Self::frame_to_table_ptr(&frame)[lv3_index];
+        if !lv3_entry.is_present() {
+            return false;
+        }
+        let Ok(frame) = PhysFrame::from_start_address(PhysAddr::new(lv3_entry.phys() << 12)) else {
+            return false;
+        };
+
+        let lv2_entry = &Self::frame_to_table_ptr(&frame)[lv2_index];
+        if !lv2_entry.is_present() {
+            return false;
+        }
+        if lv2_entry.map_memory() {
+            return lv2_entry.accessed();
+        }
+        let Ok(frame) = PhysFrame::from_start_address(PhysAddr::new(lv2_entry.phys() << 12)) else {
+            return false;
+        };
+
+        let lv1_entry = &Self::frame_to_table_ptr(&frame)[lv1_index];
+        lv1_entry.is_present() && lv1_entry.map_memory() && lv1_entry.accessed()
+    }
+
+    pub fn accessed_bytes(&self, gpa_end: u64) -> u64 {
+        let page_count = gpa_end.div_ceil(4096);
+        (0..page_count)
+            .filter(|page| self.is_accessed(page * 4096))
+            .count() as u64
+            * 4096
+    }
+
     pub fn get(&mut self, gpa: u64) -> Result<u8, &'static str> {
         let hpa = self
             .get_phys_addr(gpa)
