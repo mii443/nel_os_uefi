@@ -57,13 +57,9 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
         },
         VmxLeaf::EXTENDED_FEATURE => match regs.rcx {
             0 => {
-                let ebx = ExtFeatureEbx0::new()
-                    .with_fsgsbase(false)
-                    .with_smep(true)
-                    .with_invpcid(false)
-                    .with_smap(true);
+                let ebx = guest_leaf7_ebx(cpuid!(0x7, 0).ebx);
                 regs.rax = 1;
-                regs.rbx = u32::from(ebx) as u64;
+                regs.rbx = ebx as u64;
                 regs.rcx = 0;
                 regs.rdx = 0;
             }
@@ -100,12 +96,8 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
             regs.rdx = vendor[1] as u64;
         }
         VmxLeaf::VERSION_AND_FEATURE_INFO => {
-            let ecx = FeatureInfoEcx::new()
-                .with_pcid(true)
-                .with_sse4_1(true)
-                .with_sse4_2(true)
-                .with_xsave(true)
-                .with_osxsave(true);
+            let version_and_feature_info = cpuid!(0x1, 0);
+            let ecx = guest_leaf1_ecx(version_and_feature_info.ecx);
 
             let edx = FeatureInfoEdx::new()
                 .with_fpu(true)
@@ -124,18 +116,39 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
                 .with_sse(true)
                 .with_sse2(true);
 
-            let mut version_and_feature_info = cpuid!(0x1, 0);
-            version_and_feature_info.ecx &= !(1 << 17);
-
             regs.rax = version_and_feature_info.eax as u64;
             regs.rbx = single_vcpu_leaf1_ebx(version_and_feature_info.ebx) as u64;
-            regs.rcx = u32::from(ecx) as u64;
+            regs.rcx = ecx as u64;
             regs.rdx = u32::from(edx) as u64;
         }
         _ => {
             invalid(vcpu);
         }
     }
+}
+
+fn guest_leaf1_ecx(host_ecx: u32) -> u32 {
+    FeatureInfoEcx::new()
+        .with_pcid(true)
+        .with_sse4_1(true)
+        .with_sse4_2(true)
+        .with_xsave(true)
+        .with_osxsave(true)
+        .with_rdrand(host_ecx & (1 << 30) != 0)
+        .into()
+}
+
+fn guest_leaf7_ebx(host_ebx: u32) -> u32 {
+    // Instructions advertised here execute directly in VMX non-root mode.
+    // Never advertise a feature that the physical CPU cannot execute: doing
+    // so turns hot kernel paths such as STAC/CLAC into repeated #UD exits.
+    ExtFeatureEbx0::new()
+        .with_fsgsbase(false)
+        .with_smep(host_ebx & (1 << 7) != 0)
+        .with_invpcid(false)
+        .with_rdseed(host_ebx & (1 << 18) != 0)
+        .with_smap(host_ebx & (1 << 20) != 0)
+        .into()
 }
 
 fn single_vcpu_leaf1_ebx(host_ebx: u32) -> u32 {
@@ -301,7 +314,7 @@ impl VmxLeaf {
 
 #[cfg(test)]
 mod tests {
-    use super::single_vcpu_leaf1_ebx;
+    use super::{guest_leaf1_ecx, guest_leaf7_ebx, single_vcpu_leaf1_ebx};
 
     #[test]
     fn leaf1_ebx_describes_one_vcpu_with_apic_id_zero() {
@@ -310,5 +323,21 @@ mod tests {
         assert_eq!((ebx >> 16) & 0xff, 1);
         assert_eq!(ebx >> 24, 0);
         assert_eq!(ebx & 0xffff, 0x0800);
+    }
+
+    #[test]
+    fn native_random_features_follow_the_host() {
+        assert_eq!(guest_leaf1_ecx(0) & (1 << 30), 0);
+        assert_ne!(guest_leaf1_ecx(1 << 30) & (1 << 30), 0);
+        assert_eq!(guest_leaf7_ebx(0) & (1 << 18), 0);
+        assert_ne!(guest_leaf7_ebx(1 << 18) & (1 << 18), 0);
+    }
+
+    #[test]
+    fn smep_and_smap_are_never_advertised_without_host_support() {
+        let ebx = guest_leaf7_ebx(1 << 7);
+
+        assert_ne!(ebx & (1 << 7), 0);
+        assert_eq!(ebx & (1 << 20), 0);
     }
 }
