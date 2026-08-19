@@ -85,6 +85,20 @@ impl BitmapMemoryTable {
         self.free_frames
     }
 
+    pub fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        self.set_frame(
+            Self::addr_to_pfn(frame.start_address().as_u64() as usize),
+            true,
+        );
+    }
+
+    pub fn deallocate_contiguous_frames(&mut self, first: PhysFrame<Size4KiB>, count: usize) {
+        let first_pfn = Self::addr_to_pfn(first.start_address().as_u64() as usize);
+        for pfn in first_pfn..first_pfn.saturating_add(count) {
+            self.set_frame(pfn, true);
+        }
+    }
+
     /// Allocates a physically contiguous, PFN-aligned run of frames.
     pub fn allocate_contiguous_frames(
         &mut self,

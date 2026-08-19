@@ -3,7 +3,7 @@ use x86_64::{
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
-use crate::storage::GuestMemory;
+use crate::{memory::bitmap::BitmapMemoryTable, storage::GuestMemory, vmm::x86_64::common::uefi};
 
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
@@ -178,6 +178,66 @@ impl Npt {
             .filter(|page| self.is_accessed(page * 4096))
             .count() as u64
             * 4096
+    }
+
+    pub fn reclaim(self, allocator: &mut BitmapMemoryTable, guest_memory_size: u64) {
+        let lv4_table = Self::frame_to_table(self.root_table);
+        for (lv4_index, &lv4_entry) in lv4_table.iter().enumerate() {
+            let Some(lv3_frame) = Self::table_frame(lv4_entry) else {
+                continue;
+            };
+            let lv3_table = Self::frame_to_table(lv3_frame);
+            for (lv3_index, &lv3_entry) in lv3_table.iter().enumerate() {
+                let Some(lv2_frame) = Self::table_frame(lv3_entry) else {
+                    continue;
+                };
+                let lv2_table = Self::frame_to_table(lv2_frame);
+                for (lv2_index, &lv2_entry) in lv2_table.iter().enumerate() {
+                    if lv2_entry & ENTRY_PRESENT == 0 {
+                        continue;
+                    }
+                    let gpa_2m = (lv4_index as u64) << 39
+                        | (lv3_index as u64) << 30
+                        | (lv2_index as u64) << 21;
+                    if lv2_entry & ENTRY_HUGE != 0 {
+                        if uefi::ram_range_containing(guest_memory_size, gpa_2m).is_some() {
+                            allocator.deallocate_contiguous_frames(
+                                PhysFrame::containing_address(PhysAddr::new(
+                                    lv2_entry & ENTRY_ADDRESS_MASK,
+                                )),
+                                512,
+                            );
+                        }
+                        continue;
+                    }
+                    let Some(lv1_frame) = Self::table_frame(lv2_entry) else {
+                        continue;
+                    };
+                    let lv1_table = Self::frame_to_table(lv1_frame);
+                    for (lv1_index, &lv1_entry) in lv1_table.iter().enumerate() {
+                        let gpa = gpa_2m | (lv1_index as u64) << 12;
+                        if lv1_entry & ENTRY_PRESENT != 0
+                            && uefi::owns_backing_page(guest_memory_size, gpa)
+                        {
+                            allocator.deallocate_frame(PhysFrame::containing_address(
+                                PhysAddr::new(lv1_entry & ENTRY_ADDRESS_MASK),
+                            ));
+                        }
+                    }
+                    allocator.deallocate_frame(lv1_frame);
+                }
+                allocator.deallocate_frame(lv2_frame);
+            }
+            allocator.deallocate_frame(lv3_frame);
+        }
+        allocator.deallocate_frame(self.root_table);
+    }
+
+    fn table_frame(entry: u64) -> Option<PhysFrame<Size4KiB>> {
+        if entry & ENTRY_PRESENT == 0 || entry & ENTRY_HUGE != 0 {
+            return None;
+        }
+        PhysFrame::from_start_address(PhysAddr::new(entry & ENTRY_ADDRESS_MASK)).ok()
     }
 
     pub fn get(&self, gpa: u64) -> Result<u8, &'static str> {

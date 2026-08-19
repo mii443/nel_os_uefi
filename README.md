@@ -103,6 +103,7 @@ vm start [ID]          start a created VM, or resume it when stopped
 vm start [ID] -a       start/resume and attach its serial (`--attach` also works)
 vm stop [ID]           stop one VCPU while retaining its guest memory
 vm reset [ID]          reset one VM in place and start it
+vm delete [ID]         delete a VM and release its host memory (`remove` also works)
 vm status [ID]         show one VM (`vm info` and `info vm` also work)
 serial attach [ID]     attach to one VM's COM1 byte stream
 serial detach          explicitly detach while at the management prompt
@@ -119,8 +120,12 @@ commands default to VM 0 when `ID` is omitted. VM creation records the requested
 RAM size but does not allocate all of its backing or execute Linux; run
 `vm start [ID]` separately. Guest RAM is backed on demand while the VM runs.
 Stopping a VM retains its allocation and state while the other running VMs
-continue to execute. Memory may be specified in MiB by a bare number or with
-`M`, `MB`, or `MiB`; `G`, `GB`, and `GiB` are also accepted. The minimum is 256
+continue to execute. Deleting a VM stops it, detaches its serial console, and
+returns its guest backing and virtualization tables to the host allocator. VM 0
+cannot be deleted when it owns the passthrough NIC because its active VT-d
+domain must remain installed until reboot. Memory may be specified in MiB by a
+bare number or with `M`, `MB`, or `MiB`; `G`, `GB`, and `GiB` are also accepted.
+The minimum is 256
 MiB because the bundled UEFI Linux image cannot boot reliably below it. The
 upper limit is calculated at runtime from currently free host RAM, outstanding
 VM memory commitments, the management reserve, and the firmware-addressable

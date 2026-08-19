@@ -2,9 +2,12 @@ use core::arch::x86_64::{_xgetbv, _xsave64, _xsetbv};
 
 use raw_cpuid::cpuid;
 use x86_64::{
+    PhysAddr,
     registers::control::{Cr4, Cr4Flags},
-    structures::paging::{FrameAllocator, Size4KiB},
+    structures::paging::PhysFrame,
 };
+
+use crate::memory::bitmap::BitmapMemoryTable;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -23,7 +26,7 @@ pub struct HostXsaveState {
 }
 
 impl HostXsaveState {
-    pub fn new(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> Result<Self, &'static str> {
+    pub fn new(frame_allocator: &mut BitmapMemoryTable) -> Result<Self, &'static str> {
         let features = cpuid!(1, 0);
         if features.ecx & (1 << 26) == 0 {
             return Ok(Self {
@@ -55,18 +58,9 @@ impl HostXsaveState {
 
         let pages = pages_required(size);
         let first = frame_allocator
-            .allocate_frame()
+            .allocate_contiguous_frames(pages, 1)
             .ok_or("Failed to allocate host XSAVE area")?;
         let addr = first.start_address().as_u64();
-
-        for page in 1..pages {
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or("Failed to allocate contiguous host XSAVE area")?;
-            if frame.start_address().as_u64() != addr + (page * PAGE_SIZE) as u64 {
-                return Err("Host XSAVE area frames are not contiguous");
-            }
-        }
 
         unsafe { core::ptr::write_bytes(addr as *mut u8, 0, pages * PAGE_SIZE) };
 
@@ -87,6 +81,15 @@ impl HostXsaveState {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    pub fn reclaim(&self, allocator: &mut BitmapMemoryTable) {
+        if self.addr != 0 {
+            allocator.deallocate_contiguous_frames(
+                PhysFrame::containing_address(PhysAddr::new(self.addr)),
+                pages_required(self.size),
+            );
+        }
     }
 
     /// Save every state component enabled in the host XCR0, then narrow XCR0

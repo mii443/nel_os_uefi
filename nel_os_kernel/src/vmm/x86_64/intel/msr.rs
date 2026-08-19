@@ -5,6 +5,7 @@ use x86_64::{
 };
 
 use crate::info;
+use crate::memory::bitmap::BitmapMemoryTable;
 use crate::vmm::x86_64::common::read_msr;
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
 use crate::vmm::x86_64::intel::{vmread, vmwrite};
@@ -180,6 +181,10 @@ impl ShadowMsr {
 
     pub fn phys(&self) -> PhysAddr {
         self.frame.start_address()
+    }
+
+    pub fn reclaim(self, allocator: &mut BitmapMemoryTable) {
+        allocator.deallocate_frame(self.frame);
     }
 
     pub fn concat(r1: u64, r2: u64) -> u64 {

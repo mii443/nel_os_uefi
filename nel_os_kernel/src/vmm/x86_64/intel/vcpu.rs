@@ -3,12 +3,14 @@ use core::{
     sync::atomic::{AtomicU16, Ordering},
 };
 
+use alloc::boxed::Box;
+
 use raw_cpuid::cpuid;
 use spin::Once;
 use x86_64::{
     VirtAddr,
     registers::control::{Cr4, Cr4Flags},
-    structures::paging::{FrameAllocator, Size4KiB},
+    structures::paging::FrameAllocator,
 };
 
 use crate::{
@@ -1254,6 +1256,35 @@ impl VCpu for IntelVCpu {
         Ok(())
     }
 
+    fn destroy(mut self: Box<Self>, frame_allocator: &mut BitmapMemoryTable) {
+        if self.interrupt_subscribed {
+            let context = &self.host_pending_irq as *const AtomicU16 as *mut core::ffi::c_void;
+            let _ = x86_64::instructions::interrupts::without_interrupts(|| {
+                interrupt::subscriber::unsubscribe_context(vmm_interrupt_subscriber, context)
+            });
+            self.interrupt_subscribed = false;
+        }
+        let _ = self.vmcs.reset();
+
+        let IntelVCpu {
+            vmcs,
+            ept,
+            host_xsave_state,
+            host_msr,
+            guest_msr,
+            io_bitmap,
+            guest_memory_size,
+            ..
+        } = *self;
+        ept.reclaim(frame_allocator, guest_memory_size);
+        host_xsave_state.reclaim(frame_allocator);
+        host_msr.reclaim(frame_allocator);
+        guest_msr.reclaim(frame_allocator);
+        frame_allocator.deallocate_frame(io_bitmap.bitmap_a);
+        frame_allocator.deallocate_frame(io_bitmap.bitmap_b);
+        frame_allocator.deallocate_frame(vmcs.frame);
+    }
+
     fn write_memory_ranged(
         &mut self,
         addr_start: u64,
@@ -1287,7 +1318,7 @@ impl VCpu for IntelVCpu {
     }
 
     fn new(
-        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
         _hardware_vcpu_id: usize,
         guest_memory_size: u64,
         passthrough: Option<PassthroughDescriptor>,

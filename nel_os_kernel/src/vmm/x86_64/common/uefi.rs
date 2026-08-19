@@ -47,6 +47,12 @@ pub fn ram_range_containing(memory_size: u64, address: u64) -> Option<(u64, u64)
         .find(|(base, size)| *size != 0 && address >= *base && address < base.saturating_add(*size))
 }
 
+pub fn owns_backing_page(memory_size: u64, address: u64) -> bool {
+    ram_range_containing(memory_size, address).is_some()
+        || (FIRMWARE_BASE..FIRMWARE_BASE + FIRMWARE_SIZE as u64).contains(&address)
+        || PLATFORM_MMIO_PAGES.contains(&(address & !0xfff))
+}
+
 pub fn firmware_image() -> Result<&'static [u8], &'static str> {
     let address = *crate::GUEST_FIRMWARE_ADDR
         .get()

@@ -31,6 +31,7 @@ enum VmState {
 
 struct VirtualMachine {
     id: usize,
+    hardware_vcpu_id: usize,
     vcpu: Option<Box<dyn vmm::VCpu>>,
     state: VmState,
     configured_memory: u64,
@@ -39,9 +40,10 @@ struct VirtualMachine {
 }
 
 impl VirtualMachine {
-    fn new(id: usize, configured_memory: u64) -> Self {
+    fn new(id: usize, hardware_vcpu_id: usize, configured_memory: u64) -> Self {
         Self {
             id,
+            hardware_vcpu_id,
             vcpu: None,
             state: VmState::Created,
             configured_memory,
@@ -724,6 +726,16 @@ fn lowest_free_vm_id(vms: &[VirtualMachine]) -> Option<usize> {
     }
 }
 
+fn lowest_free_hardware_vcpu_id(vms: &[VirtualMachine]) -> Option<usize> {
+    let mut candidate = 0usize;
+    loop {
+        if vms.iter().all(|vm| vm.hardware_vcpu_id != candidate) {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+}
+
 fn vm_registry_capacity(total_frames: usize) -> usize {
     let total_mib = total_frames.saturating_mul(PAGE_SIZE) / BYTES_PER_MIB;
     total_mib.saturating_sub(HOST_RESERVE_MIB)
@@ -894,12 +906,17 @@ fn process_management_command<E: ManagementEndpoint>(
                     .write_bytes(b"ERR management heap cannot allocate another VCPU safely.\r\n");
             } else {
                 let memory_size = memory_mib as u64 * BYTES_PER_MIB as u64;
-                // External IDs may be sparse. Use the dense registry index
-                // for hardware resources such as AMD ASIDs, and never
-                // recycle it because failed construction may have consumed
-                // frames that cannot be reclaimed until reboot.
-                let hardware_vcpu_id = vms.len();
-                let mut vm = VirtualMachine::new(vm_id, memory_size);
+                // External IDs may be sparse. Hardware IDs stay unique among
+                // live VMs and may be reused only after deletion has reclaimed
+                // the old VCPU and its translation state.
+                let Some(hardware_vcpu_id) = lowest_free_hardware_vcpu_id(vms) else {
+                    endpoint.write_bytes(b"ERR no hardware VCPU ID is available.\r\n");
+                    if add_prompt {
+                        endpoint.prompt();
+                    }
+                    return serial_action;
+                };
+                let mut vm = VirtualMachine::new(vm_id, hardware_vcpu_id, memory_size);
                 let assigned_nic = if vm_id == crate::management::DEFAULT_VM_ID {
                     passthrough
                 } else {
@@ -1021,6 +1038,36 @@ fn process_management_command<E: ManagementEndpoint>(
                 write_missing_vm(endpoint, vm_id);
             }
         }
+        ManagementCommand::VmDelete { id } => {
+            let vm_id = id;
+            if vm_id == crate::management::DEFAULT_VM_ID && passthrough.is_some() {
+                endpoint.write_bytes(
+                    b"ERR VM 0 owns the passthrough NIC and cannot be deleted safely; reboot the hypervisor to recreate it.\r\n",
+                );
+            } else if let Some(vm_index) = find_vm_index(vms, vm_id) {
+                let mut vm = vms.remove(vm_index);
+                let free_before = allocator.free_frame_count();
+                if let Some(vcpu) = vm.vcpu.take() {
+                    vcpu.destroy(allocator);
+                }
+                let released_kib = allocator
+                    .free_frame_count()
+                    .saturating_sub(free_before)
+                    .saturating_mul(PAGE_SIZE)
+                    / 1024;
+                let _ = write!(
+                    endpoint,
+                    "VM {} deleted; released {} KiB of host memory.\r\n",
+                    vm_id, released_kib
+                );
+                info!(
+                    "VM {} deleted by management shell; released {} KiB",
+                    vm_id, released_kib
+                );
+            } else {
+                write_missing_vm(endpoint, vm_id);
+            }
+        }
         ManagementCommand::VmStatus { id } => {
             let vm_id = id;
             if let Some(vm_index) = find_vm_index(vms, vm_id) {
@@ -1121,12 +1168,13 @@ mod tests {
         let mut vms = Vec::new();
         assert_eq!(lowest_free_vm_id(&vms), Some(0));
 
-        vms.push(VirtualMachine::new(7, 128 * 1024 * 1024));
+        vms.push(VirtualMachine::new(7, 0, 128 * 1024 * 1024));
         assert_eq!(lowest_free_vm_id(&vms), Some(0));
 
-        vms.push(VirtualMachine::new(0, 128 * 1024 * 1024));
-        vms.push(VirtualMachine::new(2, 128 * 1024 * 1024));
+        vms.push(VirtualMachine::new(0, 1, 128 * 1024 * 1024));
+        vms.push(VirtualMachine::new(2, 2, 128 * 1024 * 1024));
         assert_eq!(lowest_free_vm_id(&vms), Some(1));
+        assert_eq!(lowest_free_hardware_vcpu_id(&vms), Some(3));
     }
 
     #[test]

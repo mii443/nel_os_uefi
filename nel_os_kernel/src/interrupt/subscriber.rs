@@ -50,6 +50,21 @@ pub fn unsubscribe(callback: SubscriberCallback) -> Result<(), &'static str> {
     Err("Subscriber not found")
 }
 
+pub fn unsubscribe_context(
+    callback: SubscriberCallback,
+    context: *mut core::ffi::c_void,
+) -> Result<(), &'static str> {
+    let mut subscribers = SUBSCRIBERS.lock();
+    if let Some(index) = subscribers.iter().position(|subscriber| {
+        core::ptr::fn_addr_eq(subscriber.callback, callback) && subscriber.context == context
+    }) {
+        subscribers.swap_remove(index);
+        Ok(())
+    } else {
+        Err("Subscriber not found")
+    }
+}
+
 pub fn dispatch_to_subscribers(context: &InterruptContext) {
     let subscribers = SUBSCRIBERS.lock();
 

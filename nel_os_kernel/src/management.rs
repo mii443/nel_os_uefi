@@ -1,7 +1,7 @@
 pub(crate) const BANNER: &[u8] =
     b"nel hypervisor management shell\r\nType 'help' for commands.\r\nnel> ";
 pub(crate) const PROMPT: &[u8] = b"nel> ";
-pub(crate) const HELP: &[u8] = b"Commands:\r\n  vm list\r\n  vm create [ID] MEMORY\r\n  vm start [ID] [--attach|-a]\r\n  vm stop|reset|status [ID]\r\n  serial attach [ID]\r\n  serial detach\r\n  info memory|runtime|all\r\n  info vm [ID]\r\n  help\r\n  exit\r\nVMs are created dynamically. Omitting ID from 'vm create' selects the lowest free ID; other commands default to VM 0. MEMORY is MiB unless suffixed M/MiB/G/GiB.\r\n";
+pub(crate) const HELP: &[u8] = b"Commands:\r\n  vm list\r\n  vm create [ID] MEMORY\r\n  vm start [ID] [--attach|-a]\r\n  vm stop|reset|delete|status [ID]\r\n  serial attach [ID]\r\n  serial detach\r\n  info memory|runtime|all\r\n  info vm [ID]\r\n  help\r\n  exit\r\nVMs are created dynamically. Omitting ID from 'vm create' selects the lowest free ID; other commands default to VM 0. MEMORY is MiB unless suffixed M/MiB/G/GiB.\r\n";
 
 pub const DEFAULT_VM_ID: usize = 0;
 
@@ -12,6 +12,7 @@ pub enum ManagementCommand {
     VmStart { id: usize, attach: bool },
     VmStop { id: usize },
     VmReset { id: usize },
+    VmDelete { id: usize },
     VmStatus { id: usize },
     SerialAttach { id: usize },
     SerialDetach,
@@ -30,6 +31,7 @@ impl ManagementCommand {
             Self::VmStart { id, .. }
             | Self::VmStop { id }
             | Self::VmReset { id }
+            | Self::VmDelete { id }
             | Self::VmStatus { id }
             | Self::SerialAttach { id } => Some(id),
             Self::VmCreate { id, .. } => id,
@@ -38,7 +40,10 @@ impl ManagementCommand {
     }
 
     pub(crate) fn changes_vm_lifecycle(self) -> bool {
-        matches!(self, Self::VmStop { .. } | Self::VmReset { .. })
+        matches!(
+            self,
+            Self::VmStop { .. } | Self::VmReset { .. } | Self::VmDelete { .. }
+        )
     }
 }
 
@@ -74,6 +79,11 @@ pub(crate) fn parse_command(line: &[u8]) -> ManagementCommand {
                 ManagementCommand::VmReset { id }
             });
         }
+        if eq(operation, b"delete") || eq(operation, b"remove") {
+            return parse_vm_id(words).map_or(ManagementCommand::Invalid, |id| {
+                ManagementCommand::VmDelete { id }
+            });
+        }
         if eq(operation, b"status") || eq(operation, b"info") {
             return parse_vm_id(words).map_or(ManagementCommand::Invalid, |id| {
                 ManagementCommand::VmStatus { id }
@@ -93,6 +103,11 @@ pub(crate) fn parse_command(line: &[u8]) -> ManagementCommand {
     if eq(first, b"reset") {
         return parse_vm_id(words).map_or(ManagementCommand::Invalid, |id| {
             ManagementCommand::VmReset { id }
+        });
+    }
+    if eq(first, b"delete") || eq(first, b"remove") {
+        return parse_vm_id(words).map_or(ManagementCommand::Invalid, |id| {
+            ManagementCommand::VmDelete { id }
         });
     }
     if eq(first, b"list") && words.next().is_none() {
@@ -339,6 +354,14 @@ mod tests {
         assert_eq!(
             parse_command(b"vm stop 1"),
             ManagementCommand::VmStop { id: 1 }
+        );
+        assert_eq!(
+            parse_command(b"vm delete 1"),
+            ManagementCommand::VmDelete { id: 1 }
+        );
+        assert_eq!(
+            parse_command(b"remove 2"),
+            ManagementCommand::VmDelete { id: 2 }
         );
         assert_eq!(
             parse_command(b"serial attach 2"),

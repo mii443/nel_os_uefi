@@ -1,4 +1,3 @@
-use ::x86_64::structures::paging::{FrameAllocator, Size4KiB};
 use alloc::boxed::Box;
 
 use crate::{
@@ -26,7 +25,7 @@ pub const MAX_VCPU_HEAP_BYTES: usize = {
 
 pub trait VCpu {
     fn new(
-        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
         hardware_vcpu_id: usize,
         guest_memory_size: u64,
         passthrough: Option<PassthroughDescriptor>,
@@ -51,6 +50,9 @@ pub trait VCpu {
     /// Returns the existing VCPU and guest RAM to its boot state. Implementors
     /// must retain already allocated guest-memory mappings.
     fn reset(&mut self) -> Result<(), &'static str>;
+
+    /// Stops using all hardware state and returns frames owned by this VCPU.
+    fn destroy(self: Box<Self>, frame_allocator: &mut BitmapMemoryTable);
 
     /// Reports that another immediate entry would only poll a halted guest.
     /// The scheduler uses this to rotate early instead of busy-waiting for the
@@ -85,7 +87,7 @@ pub trait VCpu {
 }
 
 pub fn get_vcpu(
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    frame_allocator: &mut BitmapMemoryTable,
     hardware_vcpu_id: usize,
     guest_memory_size: u64,
     passthrough: Option<PassthroughDescriptor>,

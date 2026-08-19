@@ -1,8 +1,9 @@
+use alloc::boxed::Box;
 use raw_cpuid::cpuid;
 use x86_64::{
     instructions::interrupts,
     registers::control::{Cr4, Cr4Flags},
-    structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
+    structures::paging::{FrameAllocator, PhysFrame},
 };
 
 use crate::{
@@ -1712,6 +1713,25 @@ impl VCpu for AMDVCpu {
         Ok(())
     }
 
+    fn destroy(self: Box<Self>, frame_allocator: &mut BitmapMemoryTable) {
+        let AMDVCpu {
+            vmcb,
+            hsave,
+            host_vmcb_state,
+            npt,
+            permission_maps,
+            host_xsave_state,
+            guest_memory_size,
+            ..
+        } = *self;
+        npt.reclaim(frame_allocator, guest_memory_size);
+        permission_maps.reclaim(frame_allocator);
+        host_xsave_state.reclaim(frame_allocator);
+        frame_allocator.deallocate_frame(vmcb.frame);
+        frame_allocator.deallocate_frame(hsave);
+        frame_allocator.deallocate_frame(host_vmcb_state);
+    }
+
     fn is_idle(&self) -> bool {
         self.halted && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
     }
@@ -1749,7 +1769,7 @@ impl VCpu for AMDVCpu {
     }
 
     fn new(
-        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+        frame_allocator: &mut BitmapMemoryTable,
         hardware_vcpu_id: usize,
         guest_memory_size: u64,
         passthrough: Option<PassthroughDescriptor>,

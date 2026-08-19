@@ -1,4 +1,6 @@
-use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
+use x86_64::structures::paging::PhysFrame;
+
+use crate::memory::bitmap::BitmapMemoryTable;
 
 const PAGE_SIZE: u64 = 4096;
 const IOPM_PAGES: usize = 3;
@@ -40,47 +42,19 @@ fn allow_guest_state_msr(msrpm: &mut [u8], msr: u32) -> Result<(), &'static str>
     Ok(())
 }
 
-/// The SVM permission maps must occupy physically contiguous pages.  The
-/// generic allocator only hands out one frame at a time, so keep allocating
-/// until it returns a suitably long run.  Frames preceding the run remain
-/// reserved: the allocator has no deallocation operation, and reusing them
-/// behind its back would be unsafe.
-fn allocate_contiguous(
-    frame_allocator: &mut dyn FrameAllocator<Size4KiB>,
-    pages: usize,
-) -> Result<PhysFrame, &'static str> {
-    let mut run_start = None;
-    let mut run_len = 0usize;
-
-    while let Some(frame) = frame_allocator.allocate_frame() {
-        let address = frame.start_address().as_u64();
-        match run_start {
-            Some(start) if address == start + run_len as u64 * PAGE_SIZE => run_len += 1,
-            _ => {
-                run_start = Some(address);
-                run_len = 1;
-            }
-        }
-
-        if run_len == pages {
-            return Ok(PhysFrame::containing_address(x86_64::PhysAddr::new(
-                run_start.unwrap(),
-            )));
-        }
-    }
-
-    Err("No contiguous frames for AMD SVM permission map")
-}
-
 pub struct PermissionMaps {
     iopm: PhysFrame,
     msrpm: PhysFrame,
 }
 
 impl PermissionMaps {
-    pub fn new(frame_allocator: &mut dyn FrameAllocator<Size4KiB>) -> Result<Self, &'static str> {
-        let iopm = allocate_contiguous(frame_allocator, IOPM_PAGES)?;
-        let msrpm = allocate_contiguous(frame_allocator, MSRPM_PAGES)?;
+    pub fn new(frame_allocator: &mut BitmapMemoryTable) -> Result<Self, &'static str> {
+        let iopm = frame_allocator
+            .allocate_contiguous_frames(IOPM_PAGES, 1)
+            .ok_or("No contiguous frames for AMD SVM I/O permission map")?;
+        let msrpm = frame_allocator
+            .allocate_contiguous_frames(MSRPM_PAGES, 1)
+            .ok_or("No contiguous frames for AMD SVM MSR permission map")?;
 
         // A set bit requests interception.  Default-deny every I/O port and
         // every MSR covered by the architectural MSRPM ranges.
@@ -113,6 +87,11 @@ impl PermissionMaps {
 
     pub fn msrpm_base_pa(&self) -> u64 {
         self.msrpm.start_address().as_u64()
+    }
+
+    pub fn reclaim(self, allocator: &mut BitmapMemoryTable) {
+        allocator.deallocate_contiguous_frames(self.iopm, IOPM_PAGES);
+        allocator.deallocate_contiguous_frames(self.msrpm, MSRPM_PAGES);
     }
 }
 
