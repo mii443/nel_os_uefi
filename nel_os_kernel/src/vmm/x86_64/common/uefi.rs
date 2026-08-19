@@ -8,6 +8,10 @@ pub const RESET_VECTOR_CS_BASE: u64 = 0xffff_0000;
 // OVMF understands through the CMOS low/high-memory fields.
 pub const LOW_MEMORY_LIMIT: u64 = 0x8000_0000;
 pub const HIGH_MEMORY_BASE: u64 = 0x1_0000_0000;
+const CMOS_HIGH_MEMORY_UNIT_BYTES: u64 = 64 * 1024;
+const CMOS_HIGH_MEMORY_MAX_UNITS: u64 = (1 << 24) - 1;
+pub const MAX_FIRMWARE_MEMORY_SIZE: u64 =
+    LOW_MEMORY_LIMIT + CMOS_HIGH_MEMORY_MAX_UNITS * CMOS_HIGH_MEMORY_UNIT_BYTES;
 pub const PLATFORM_MMIO_PAGES: [u64; 5] = [
     0x8000_0000,
     0xfec0_0000,
@@ -30,6 +34,11 @@ pub fn low_memory_size(memory_size: u64) -> u64 {
 
 pub fn high_memory_size(memory_size: u64) -> u64 {
     memory_size.saturating_sub(LOW_MEMORY_LIMIT)
+}
+
+pub fn high_memory_cmos_units(memory_size: u64) -> u32 {
+    (high_memory_size(memory_size) / CMOS_HIGH_MEMORY_UNIT_BYTES).min(CMOS_HIGH_MEMORY_MAX_UNITS)
+        as u32
 }
 
 pub fn ram_range_containing(memory_size: u64, address: u64) -> Option<(u64, u64)> {

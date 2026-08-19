@@ -5,7 +5,7 @@ use core::{
 };
 
 use crate::{
-    constant::PKG_VERSION,
+    constant::{PAGE_SIZE, PKG_VERSION},
     cpuid, interrupt,
     memory::bitmap::BitmapMemoryTable,
     network::{ConnectionId, Ipv4Config, ManagementCommand, PassthroughDescriptor, VirtioNet},
@@ -18,6 +18,8 @@ use crate::{
 const HOST_RESERVE_MIB: usize = 128;
 const VCPU_OVERHEAD_MIB: usize = 8;
 const MANAGEMENT_HEAP_RESERVE_BYTES: usize = 16 * 1024;
+const BYTES_PER_MIB: usize = 1024 * 1024;
+const FRAMES_PER_MIB: usize = BYTES_PER_MIB / PAGE_SIZE;
 
 #[derive(Clone, Copy)]
 enum VmState {
@@ -86,6 +88,31 @@ fn percentage_tenths(value: u64, total: u64) -> u64 {
         return 0;
     }
     ((value as u128).saturating_mul(1000) / total as u128) as u64
+}
+
+fn committed_unbacked_frames(vms: &[VirtualMachine]) -> usize {
+    vms.iter().fold(0usize, |total, vm| {
+        let unbacked_bytes = vm.configured_memory.saturating_sub(vm.allocated_memory());
+        total.saturating_add(unbacked_bytes.div_ceil(PAGE_SIZE as u64) as usize)
+    })
+}
+
+fn max_new_guest_memory_mib(allocator: &BitmapMemoryTable, vms: &[VirtualMachine]) -> u32 {
+    max_new_guest_memory_mib_from_frames(
+        allocator.free_frame_count(),
+        committed_unbacked_frames(vms),
+    )
+}
+
+fn max_new_guest_memory_mib_from_frames(free_frames: usize, committed_frames: usize) -> u32 {
+    let reserve_frames = (HOST_RESERVE_MIB + VCPU_OVERHEAD_MIB) * FRAMES_PER_MIB;
+    let resource_mib = free_frames
+        .saturating_sub(reserve_frames)
+        .saturating_sub(committed_frames)
+        / FRAMES_PER_MIB;
+    let firmware_mib =
+        (vmm::x86_64::common::uefi::MAX_FIRMWARE_MEMORY_SIZE / BYTES_PER_MIB as u64) as usize;
+    resource_mib.min(firmware_mib).min(u32::MAX as usize) as u32
 }
 
 pub(crate) struct VmController {
@@ -698,7 +725,7 @@ fn lowest_free_vm_id(vms: &[VirtualMachine]) -> Option<usize> {
 }
 
 fn vm_registry_capacity(total_frames: usize) -> usize {
-    let total_mib = total_frames.saturating_mul(4) / 1024;
+    let total_mib = total_frames.saturating_mul(PAGE_SIZE) / BYTES_PER_MIB;
     total_mib.saturating_sub(HOST_RESERVE_MIB)
         / (vmm::MIN_GUEST_MEMORY_MIB as usize + VCPU_OVERHEAD_MIB)
 }
@@ -717,15 +744,21 @@ fn write_memory_info<E: ManagementEndpoint>(
     endpoint: &mut E,
     allocator: &BitmapMemoryTable,
     total_frames: usize,
+    vms: &[VirtualMachine],
 ) {
     let free_frames = allocator.free_frame_count();
     let used_frames = total_frames.saturating_sub(free_frames);
     let _ = write!(
         endpoint,
         "Host memory: total={} MiB used={} MiB free={} MiB\r\n",
-        total_frames * 4 / 1024,
-        used_frames * 4 / 1024,
-        free_frames * 4 / 1024
+        total_frames.saturating_mul(PAGE_SIZE) / BYTES_PER_MIB,
+        used_frames.saturating_mul(PAGE_SIZE) / BYTES_PER_MIB,
+        free_frames.saturating_mul(PAGE_SIZE) / BYTES_PER_MIB
+    );
+    let _ = write!(
+        endpoint,
+        "Max memory for a new VM: {} MiB (derived from current host capacity)\r\n",
+        max_new_guest_memory_mib(allocator, vms)
     );
 }
 
@@ -828,6 +861,7 @@ fn process_management_command<E: ManagementEndpoint>(
                 endpoint.prompt();
                 return serial_action;
             };
+            let max_memory_mib = max_new_guest_memory_mib(allocator, vms);
             if let Some(index) = find_vm_index(vms, vm_id) {
                 let _ = write!(
                     endpoint,
@@ -835,13 +869,17 @@ fn process_management_command<E: ManagementEndpoint>(
                     vm_id,
                     vms[index].state_text()
                 );
-            } else if !(vmm::MIN_GUEST_MEMORY_MIB..=vmm::MAX_GUEST_MEMORY_MIB).contains(&memory_mib)
-            {
+            } else if memory_mib < vmm::MIN_GUEST_MEMORY_MIB {
                 let _ = write!(
                     endpoint,
-                    "ERR guest memory must be {}-{} MiB.\r\n",
-                    vmm::MIN_GUEST_MEMORY_MIB,
-                    vmm::MAX_GUEST_MEMORY_MIB
+                    "ERR guest memory must be at least {} MiB.\r\n",
+                    vmm::MIN_GUEST_MEMORY_MIB
+                );
+            } else if memory_mib > max_memory_mib {
+                let _ = write!(
+                    endpoint,
+                    "ERR guest memory exceeds current host capacity (max {} MiB).\r\n",
+                    max_memory_mib
                 );
             } else if vms.len() >= vm_registry_capacity(total_frames) {
                 endpoint.write_bytes(
@@ -855,55 +893,42 @@ fn process_management_command<E: ManagementEndpoint>(
                 endpoint
                     .write_bytes(b"ERR management heap cannot allocate another VCPU safely.\r\n");
             } else {
-                let guest_frames = memory_mib as usize * 1024 / 4;
-                let reserved_frames = (HOST_RESERVE_MIB + VCPU_OVERHEAD_MIB) * 1024 / 4;
-                if allocator.free_frame_count() < guest_frames.saturating_add(reserved_frames) {
-                    let _ = write!(
-                        endpoint,
-                        "ERR insufficient host memory to create VM {} with {} MiB while retaining the management reserve.\r\n",
-                        vm_id, memory_mib
-                    );
+                let memory_size = memory_mib as u64 * BYTES_PER_MIB as u64;
+                // External IDs may be sparse. Use the dense registry index
+                // for hardware resources such as AMD ASIDs, and never
+                // recycle it because failed construction may have consumed
+                // frames that cannot be reclaimed until reboot.
+                let hardware_vcpu_id = vms.len();
+                let mut vm = VirtualMachine::new(vm_id, memory_size);
+                let assigned_nic = if vm_id == crate::management::DEFAULT_VM_ID {
+                    passthrough
                 } else {
-                    let memory_size = memory_mib as u64 * 1024 * 1024;
-                    // External IDs may be sparse. Use the dense registry index
-                    // for hardware resources such as AMD ASIDs, and never
-                    // recycle it because failed construction may have consumed
-                    // frames that cannot be reclaimed until reboot.
-                    let hardware_vcpu_id = vms.len();
-                    let mut vm = VirtualMachine::new(vm_id, memory_size);
-                    let assigned_nic = if vm_id == crate::management::DEFAULT_VM_ID {
-                        passthrough
-                    } else {
-                        None
-                    };
-                    match vmm::get_vcpu(allocator, hardware_vcpu_id, memory_size, assigned_nic) {
-                        Ok(new_vcpu) => {
-                            vm.vcpu = Some(new_vcpu);
-                            vm.state = VmState::Created;
-                            let _ = write!(
-                                endpoint,
-                                "VM {} created with {} MiB and {} vCPU; use 'vm start {}'.\r\n",
-                                vm_id,
-                                memory_mib,
-                                vmm::VCPUS_PER_VM,
-                                vm_id
-                            );
-                            info!(
-                                "VM {} created with {} MiB by management shell",
-                                vm_id, memory_mib
-                            );
-                        }
-                        Err(error) => {
-                            vm.state = VmState::Failed(error);
-                            let _ = write!(
-                                endpoint,
-                                "ERR unable to create VM {}: {}\r\n",
-                                vm_id, error
-                            );
-                        }
+                    None
+                };
+                match vmm::get_vcpu(allocator, hardware_vcpu_id, memory_size, assigned_nic) {
+                    Ok(new_vcpu) => {
+                        vm.vcpu = Some(new_vcpu);
+                        vm.state = VmState::Created;
+                        let _ = write!(
+                            endpoint,
+                            "VM {} created with {} MiB and {} vCPU; use 'vm start {}'.\r\n",
+                            vm_id,
+                            memory_mib,
+                            vmm::VCPUS_PER_VM,
+                            vm_id
+                        );
+                        info!(
+                            "VM {} created with {} MiB by management shell",
+                            vm_id, memory_mib
+                        );
                     }
-                    vms.push(vm);
+                    Err(error) => {
+                        vm.state = VmState::Failed(error);
+                        let _ =
+                            write!(endpoint, "ERR unable to create VM {}: {}\r\n", vm_id, error);
+                    }
                 }
+                vms.push(vm);
             }
         }
         ManagementCommand::VmStart { id, attach } => {
@@ -1042,7 +1067,7 @@ fn process_management_command<E: ManagementEndpoint>(
                 endpoint.write_bytes(b"VM serial is already detached from this console.\r\n");
             }
         }
-        ManagementCommand::InfoMemory => write_memory_info(endpoint, allocator, total_frames),
+        ManagementCommand::InfoMemory => write_memory_info(endpoint, allocator, total_frames, vms),
         ManagementCommand::InfoRuntime => write_runtime_info(
             endpoint,
             boot_tsc,
@@ -1060,7 +1085,7 @@ fn process_management_command<E: ManagementEndpoint>(
                 serial_drops,
                 block_capacity,
             );
-            write_memory_info(endpoint, allocator, total_frames);
+            write_memory_info(endpoint, allocator, total_frames, vms);
             write_vm_list(endpoint, vms);
         }
         ManagementCommand::Help => endpoint.write_help(),
@@ -1106,8 +1131,29 @@ mod tests {
 
     #[test]
     fn registry_capacity_scales_with_host_memory() {
-        let one_gib_frames = 1024 * 1024 / 4;
+        let one_gib_frames = 1024 * FRAMES_PER_MIB;
         assert_eq!(vm_registry_capacity(one_gib_frames), 12);
         assert_eq!(vm_registry_capacity(0), 0);
+    }
+
+    #[test]
+    fn guest_memory_limit_follows_runtime_capacity_and_commitments() {
+        let free_frames = 9_970 * FRAMES_PER_MIB;
+        let committed_frames = 4_096 * FRAMES_PER_MIB;
+        assert_eq!(
+            max_new_guest_memory_mib_from_frames(free_frames, committed_frames),
+            5_738
+        );
+        assert_eq!(max_new_guest_memory_mib_from_frames(0, 0), 0);
+    }
+
+    #[test]
+    fn guest_memory_limit_does_not_exceed_firmware_encoding() {
+        let firmware_mib =
+            (vmm::x86_64::common::uefi::MAX_FIRMWARE_MEMORY_SIZE / BYTES_PER_MIB as u64) as u32;
+        assert_eq!(
+            max_new_guest_memory_mib_from_frames(usize::MAX, 0),
+            firmware_mib
+        );
     }
 }

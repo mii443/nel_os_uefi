@@ -98,7 +98,7 @@ The shell supports:
 
 ```text
 vm list                show all created VMs
-vm create [ID] MEMORY  create a 256 MiB-4 GiB VM; RAM backing is allocated on demand
+vm create [ID] MEMORY  create a VM; the runtime limit follows available host RAM
 vm start [ID]          start a created VM, or resume it when stopped
 vm start [ID] -a       start/resume and attach its serial (`--attach` also works)
 vm stop [ID]           stop one VCPU while retaining its guest memory
@@ -115,19 +115,21 @@ exit
 
 For `vm create`, omitting `ID` selects the lowest unused ID. Because VM 0 is
 created during boot, the first manual create normally selects VM 1. Other
-commands default to VM 0 when `ID` is omitted. VM creation allocates and
-initializes the requested RAM but does not execute Linux; run `vm start [ID]`
-separately.
+commands default to VM 0 when `ID` is omitted. VM creation records the requested
+RAM size but does not allocate all of its backing or execute Linux; run
+`vm start [ID]` separately. Guest RAM is backed on demand while the VM runs.
 Stopping a VM retains its allocation and state while the other running VMs
 continue to execute. Memory may be specified in MiB by a bare number or with
-`M`, `MB`, or `MiB`; `G`, `GB`, and `GiB` are also accepted. The supported
-per-VM range is 64-768 MiB, subject to available host memory and a 128 MiB
-management reserve.
+`M`, `MB`, or `MiB`; `G`, `GB`, and `GiB` are also accepted. The minimum is 256
+MiB because the bundled UEFI Linux image cannot boot reliably below it. The
+upper limit is calculated at runtime from currently free host RAM, outstanding
+VM memory commitments, the management reserve, and the firmware-addressable
+memory range. `info memory` reports the current limit for a newly created VM.
 
-`vm list` and `info vm [ID]` report each VM's allocated/configured RAM ratio and
-cumulative CPU usage since creation. CPU usage is measured from TSC cycles spent
-executing that VCPU. Memory usage is the host-side guest-RAM allocation ratio,
-not Linux's internal free-page percentage.
+`vm list` and `info vm [ID]` report each VM's accessed working set, configured
+RAM, allocated host backing, and cumulative CPU usage since creation. CPU usage
+is measured from TSC cycles spent executing that VCPU. Memory usage is not
+Linux's internal free-page percentage.
 
 The same `nel>` management shell is available on the hypervisor's physical
 COM1 console as soon as kernel initialization completes. This local console

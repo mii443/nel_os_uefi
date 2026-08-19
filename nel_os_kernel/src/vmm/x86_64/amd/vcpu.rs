@@ -229,8 +229,7 @@ impl RtcState {
             .min(u16::MAX as u64) as u16;
         registers[0x34] = above_16m as u8;
         registers[0x35] = (above_16m >> 8) as u8;
-        let above_4g = (common::uefi::high_memory_size(guest_memory_size) / (64 * 1024))
-            .min(0x00ff_ffff) as u32;
+        let above_4g = common::uefi::high_memory_cmos_units(guest_memory_size);
         registers[0x5b] = above_4g as u8;
         registers[0x5c] = (above_4g >> 8) as u8;
         registers[0x5d] = (above_4g >> 16) as u8;
