@@ -11,6 +11,7 @@ use crate::{
     network::{ConnectionId, Ipv4Config, ManagementCommand, PassthroughDescriptor, VirtioNet},
     platform, serial,
     serial_console::SerialConsole,
+    storage::VirtioBlock,
     time, vmm, {error, info, warn},
 };
 
@@ -83,6 +84,7 @@ fn percentage_tenths(value: u64, total: u64) -> u64 {
 
 pub(crate) struct VmController {
     network: Option<VirtioNet>,
+    block: Option<VirtioBlock>,
     passthrough: Option<PassthroughDescriptor>,
     serial_console: SerialConsole,
     vms: Vec<VirtualMachine>,
@@ -98,12 +100,14 @@ pub(crate) struct VmController {
 impl VmController {
     pub(crate) fn new(
         network: Option<VirtioNet>,
+        block: Option<VirtioBlock>,
         passthrough: Option<PassthroughDescriptor>,
         total_frames: usize,
         boot_tsc: u64,
     ) -> Self {
         Self {
             network,
+            block,
             passthrough,
             serial_console: SerialConsole::new(),
             vms: Vec::new(),
@@ -322,6 +326,10 @@ impl VmController {
             .as_ref()
             .map_or(0, VirtioNet::dropped_transmits);
         let serial_drops = serial::guest_output_drop_count();
+        let block_capacity = self
+            .block
+            .as_ref()
+            .map(|device| (device.capacity_bytes(), device.capacity_sectors()));
         let source_owner = source.serial_owner();
         let endpoint_owns_serial = source_owner.is_some() && self.serial_owner == source_owner;
         let requested_vm = command.vm_id();
@@ -345,6 +353,7 @@ impl VmController {
                     network_config,
                     network_drops,
                     serial_drops,
+                    block_capacity,
                     self.passthrough,
                     attach_allowed,
                     endpoint_owns_serial,
@@ -360,6 +369,7 @@ impl VmController {
                 network_config,
                 network_drops,
                 serial_drops,
+                block_capacity,
                 self.passthrough,
                 attach_allowed,
                 endpoint_owns_serial,
@@ -376,6 +386,7 @@ impl VmController {
                     network_config,
                     network_drops,
                     serial_drops,
+                    block_capacity,
                     self.passthrough,
                     false,
                     false,
@@ -711,6 +722,7 @@ fn write_runtime_info<E: ManagementEndpoint>(
     config: Option<Ipv4Config>,
     dropped_transmits: u64,
     serial_output_drops: u64,
+    block_capacity: Option<(u64, u64)>,
 ) {
     let vendor = cpuid::get_vendor_id();
     let brand = cpuid::get_brand();
@@ -734,6 +746,16 @@ fn write_runtime_info<E: ManagementEndpoint>(
         "Guest serial output drops: {}\r\n",
         serial_output_drops
     );
+    if let Some((bytes, sectors)) = block_capacity {
+        let _ = write!(
+            endpoint,
+            "Host virtio-blk: {} MiB ({} sectors)\r\n",
+            bytes / (1024 * 1024),
+            sectors
+        );
+    } else {
+        let _ = endpoint.write_str("Host virtio-blk: unavailable\r\n");
+    }
     if let Some(tsc_khz) = interrupt::apic::GUEST_TSC_KHZ.get() {
         let current_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         let uptime_ms = current_tsc.wrapping_sub(boot_tsc) / *tsc_khz;
@@ -778,6 +800,7 @@ fn process_management_command<E: ManagementEndpoint>(
     network_config: Option<Ipv4Config>,
     network_drops: u64,
     serial_drops: u64,
+    block_capacity: Option<(u64, u64)>,
     passthrough: Option<PassthroughDescriptor>,
     attach_allowed: bool,
     endpoint_owns_serial: bool,
@@ -1026,6 +1049,7 @@ fn process_management_command<E: ManagementEndpoint>(
             network_config,
             network_drops,
             serial_drops,
+            block_capacity,
         ),
         ManagementCommand::InfoAll => {
             write_runtime_info(
@@ -1034,6 +1058,7 @@ fn process_management_command<E: ManagementEndpoint>(
                 network_config,
                 network_drops,
                 serial_drops,
+                block_capacity,
             );
             write_memory_info(endpoint, allocator, total_frames);
             write_vm_list(endpoint, vms);

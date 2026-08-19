@@ -6,6 +6,7 @@ const CONFIG_DATA: u16 = 0x0cfc;
 pub const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 pub const VIRTIO_NET_LEGACY_DEVICE_ID: u16 = 0x1000;
 pub const VIRTIO_NET_MODERN_DEVICE_ID: u16 = 0x1041;
+pub const VIRTIO_BLOCK_LEGACY_DEVICE_ID: u16 = 0x1001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PciAddress {
@@ -64,14 +65,22 @@ pub fn find_legacy_virtio_net() -> Option<PciAddress> {
 }
 
 pub fn find_nth_legacy_virtio_net(mut index: usize) -> Option<PciAddress> {
-    find_nth_virtio_net_matching(&mut index, false)
+    find_nth_virtio_device(&mut index, &[VIRTIO_NET_LEGACY_DEVICE_ID])
 }
 
 pub fn find_nth_virtio_net(mut index: usize) -> Option<PciAddress> {
-    find_nth_virtio_net_matching(&mut index, true)
+    find_nth_virtio_device(
+        &mut index,
+        &[VIRTIO_NET_LEGACY_DEVICE_ID, VIRTIO_NET_MODERN_DEVICE_ID],
+    )
 }
 
-fn find_nth_virtio_net_matching(index: &mut usize, include_modern: bool) -> Option<PciAddress> {
+pub fn find_legacy_virtio_block() -> Option<PciAddress> {
+    let mut index = 0;
+    find_nth_virtio_device(&mut index, &[VIRTIO_BLOCK_LEGACY_DEVICE_ID])
+}
+
+fn find_nth_virtio_device(index: &mut usize, device_ids: &[u16]) -> Option<PciAddress> {
     for bus in 0..=u8::MAX {
         for device in 0..32u8 {
             let first = PciAddress {
@@ -95,10 +104,7 @@ fn find_nth_virtio_net_matching(index: &mut usize, include_modern: bool) -> Opti
                     function,
                 };
                 let device_id = address.read_u16(2);
-                if address.read_u16(0) == VIRTIO_VENDOR_ID
-                    && (device_id == VIRTIO_NET_LEGACY_DEVICE_ID
-                        || include_modern && device_id == VIRTIO_NET_MODERN_DEVICE_ID)
-                {
+                if address.read_u16(0) == VIRTIO_VENDOR_ID && device_ids.contains(&device_id) {
                     if *index == 0 {
                         return Some(address);
                     }

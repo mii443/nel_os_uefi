@@ -11,6 +11,7 @@ readonly NET_MAC="${NEL_OS_NET_MAC:-52:54:00:12:34:56}"
 readonly GUEST_NET_MAC="${NEL_OS_GUEST_NET_MAC:-52:54:00:12:34:57}"
 readonly NET_BIND_ADDRESS="${NEL_OS_NET_BIND_ADDR:-127.0.0.1}"
 readonly NET_HOST_PORT="${NEL_OS_NET_HOST_PORT:-5555}"
+readonly BLOCK_SIZE_MIB="${NEL_OS_BLOCK_SIZE_MIB:-64}"
 readonly LOCAL_CACHE_BASE="${NEL_OS_LOCAL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/nel_os_uefi}"
 readonly RUNTIME_BASE="${NEL_OS_RUNTIME_BASE:-${XDG_RUNTIME_DIR:-/tmp}/nel_os_uefi-${UID}}"
 HOST_SLUG="$(hostname -s | tr -cd '[:alnum:]_.-')"
@@ -112,6 +113,29 @@ case "${NET_MODE}" in
 esac
 
 mkdir -p "${CARGO_TARGET_DIR}" "${RUNTIME_DIR}"
+
+if [[ -n "${NEL_OS_BLOCK_IMAGE:-}" ]]; then
+    if [[ ! -f "${NEL_OS_BLOCK_IMAGE}" ]]; then
+        echo "Host block image does not exist or is not a regular file: ${NEL_OS_BLOCK_IMAGE}" >&2
+        exit 2
+    fi
+    BLOCK_IMAGE="$(realpath -- "${NEL_OS_BLOCK_IMAGE}")"
+else
+    if [[ ! "${BLOCK_SIZE_MIB}" =~ ^[0-9]+$ ]] ||
+        ((10#${BLOCK_SIZE_MIB} < 1 || 10#${BLOCK_SIZE_MIB} > 1048576)); then
+        echo "Invalid NEL_OS_BLOCK_SIZE_MIB: ${BLOCK_SIZE_MIB}" >&2
+        exit 2
+    fi
+    BLOCK_IMAGE="${RUNTIME_DIR}/host-block.img"
+    if [[ ! -e "${BLOCK_IMAGE}" ]]; then
+        truncate -s "${BLOCK_SIZE_MIB}M" "${BLOCK_IMAGE}"
+    elif [[ ! -f "${BLOCK_IMAGE}" ]]; then
+        echo "Default host block image is not a regular file: ${BLOCK_IMAGE}" >&2
+        exit 2
+    fi
+fi
+readonly BLOCK_IMAGE
+
 "${SOURCE_DIR}/create-iso.sh" "${EFI_BINARY}" "${RUNTIME_DIR}"
 cp "${SOURCE_DIR}/OVMF_VARS.fd" "${RUNTIME_DIR}/OVMF_VARS.fd"
 
@@ -136,6 +160,7 @@ run_qemu() {
         -nographic \
         -drive "if=pflash,format=raw,readonly=on,file=${SOURCE_DIR}/OVMF_CODE.fd" \
         -drive "if=pflash,format=raw,file=${RUNTIME_DIR}/OVMF_VARS.fd" \
+        -drive "if=none,id=hypervisor_block,format=raw,file=${BLOCK_IMAGE}" \
         -cdrom "${RUNTIME_DIR}/nel_os.iso" \
         -boot d \
         -smp 1 \
@@ -143,6 +168,7 @@ run_qemu() {
         "${GUEST_NET_ARGS[@]}" \
         -device "virtio-net-pci,netdev=hypervisor_net,disable-modern=on,vectors=0,mac=${NET_MAC}" \
         -device "virtio-net-pci,netdev=guest_net,disable-legacy=on,iommu_platform=on,vectors=0,mac=${GUEST_NET_MAC}" \
+        -device "virtio-blk-pci,drive=hypervisor_block,disable-modern=on,vectors=0" \
         "${debug_args[@]}" \
         --no-shutdown --no-reboot
 }

@@ -17,6 +17,7 @@ pub mod network;
 pub mod platform;
 pub mod serial;
 mod serial_console;
+pub mod storage;
 pub mod time;
 mod vm_control;
 pub mod vmm;
@@ -196,6 +197,17 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
         }
     };
 
+    // The transitional virtio-blk function is retained by the outer kernel.
+    // Reading sector zero here verifies the complete legacy virtqueue path
+    // before VT-d switches all non-assigned devices to pass-through contexts.
+    let block_device = match storage::VirtioBlock::probe(&mut bitmap_table) {
+        Ok(device) => Some(device),
+        Err(error) => {
+            error!("Hypervisor block device unavailable: {}", error);
+            None
+        }
+    };
+
     // The second NIC is reserved for VM 0. Its DMA is isolated through the
     // virtual VT-d unit advertised by QEMU and mapped alongside EPT/NPT RAM.
     let passthrough_nic = match boot_info.rsdp {
@@ -221,6 +233,12 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
         info!("Boot VM 0 will start; use the local serial management shell");
     }
 
-    vm_control::VmController::new(network_device, passthrough_nic, usable_frame, boot_tsc)
-        .run(&mut bitmap_table);
+    vm_control::VmController::new(
+        network_device,
+        block_device,
+        passthrough_nic,
+        usable_frame,
+        boot_tsc,
+    )
+    .run(&mut bitmap_table);
 }

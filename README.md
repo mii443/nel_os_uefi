@@ -34,6 +34,25 @@ therefore not used for host-specific build or runtime state, and the AMD and
 Intel hosts can build and run independently. `NEL_OS_LOCAL_CACHE_DIR`,
 `NEL_OS_CARGO_TARGET_DIR`, and `NEL_OS_RUNTIME_BASE` override these locations.
 
+### Host virtio block device
+
+QEMU also gives the outer hypervisor one transitional virtio-blk device. The
+hypervisor initializes its legacy virtqueue and verifies it by reading sector
+0 during boot; the device is not passed through to VM 0. `info runtime` and
+`info all` report its capacity.
+
+By default, `./run.sh` creates a persistent 64 MiB raw image named
+`host-block.img` in the host-local runtime directory and reuses it on later
+runs. Set `NEL_OS_BLOCK_SIZE_MIB` to choose the initial size, or attach an
+existing raw image explicitly:
+
+```sh
+NEL_OS_BLOCK_IMAGE=/absolute/path/to/disk.img ./run.sh
+```
+
+The explicit image must already exist; the size setting does not resize an
+existing default or explicit image.
+
 On a new Ubuntu host, install the host tools and rustup once:
 
 ```sh
@@ -76,7 +95,7 @@ vm status [ID]         show one VM (`vm info` and `info vm` also work)
 serial attach [ID]     attach to one VM's COM1 byte stream
 serial detach          explicitly detach while at the management prompt
 info memory            show current host physical-memory use
-info runtime           show kernel, CPU, virtualization, uptime, and IPv4 data
+info runtime           show kernel, CPU, virtualization, disk, uptime, and IPv4 data
 info all               show runtime, memory, and all VM information
 help
 exit

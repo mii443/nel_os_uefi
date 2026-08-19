@@ -2,7 +2,7 @@
 
 mod management;
 mod passthrough;
-mod pci;
+pub(crate) mod pci;
 mod stack;
 mod virtio_net;
 
