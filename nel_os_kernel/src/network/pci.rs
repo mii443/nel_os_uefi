@@ -75,8 +75,7 @@ pub fn find_nth_virtio_net(mut index: usize) -> Option<PciAddress> {
     )
 }
 
-pub fn find_legacy_virtio_block() -> Option<PciAddress> {
-    let mut index = 0;
+pub fn find_nth_legacy_virtio_block(mut index: usize) -> Option<PciAddress> {
     find_nth_virtio_device(&mut index, &[VIRTIO_BLOCK_LEGACY_DEVICE_ID])
 }
 

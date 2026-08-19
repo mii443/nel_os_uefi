@@ -193,16 +193,28 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
         }
     };
 
-    // The outer kernel retains this transitional virtio-blk function and
-    // exposes its sectors through an emulated guest PCI function. The physical
-    // block function itself is never passed through to a VM.
-    let block_device = match storage::VirtioBlock::probe(&mut bitmap_table) {
-        Ok(device) => Some(device),
-        Err(error) => {
-            error!("Hypervisor block device unavailable: {}", error);
-            None
+    // The outer kernel retains every transitional virtio-blk function and
+    // exposes one selected backing device through each VM's emulated PCI
+    // function. Physical block functions are never passed through to a VM.
+    let mut block_devices = alloc::vec::Vec::new();
+    let mut block_index = 0usize;
+    loop {
+        match storage::VirtioBlock::probe_nth(&mut bitmap_table, block_index) {
+            Ok(Some(device)) => {
+                if block_devices.try_reserve(1).is_err() {
+                    error!("Unable to record host virtio-blk {}", block_index);
+                    break;
+                }
+                block_devices.push(device);
+                block_index += 1;
+            }
+            Ok(None) => break,
+            Err(error) => {
+                error!("Host virtio-blk {} unavailable: {}", block_index, error);
+                break;
+            }
         }
-    };
+    }
 
     // The second NIC is reserved for VM 0. Its DMA is isolated through the
     // virtual VT-d unit advertised by QEMU and mapped alongside EPT/NPT RAM.
@@ -231,7 +243,7 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
 
     vm_control::VmController::new(
         network_device,
-        block_device,
+        block_devices,
         passthrough_nic,
         usable_frame,
         boot_tsc,

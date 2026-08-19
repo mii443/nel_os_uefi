@@ -1196,19 +1196,24 @@ impl AMDVCpu {
         let control = &mut self.vmcb.get_raw_vmcb().control_area;
         control.event_injection = vector as u64 | EVENT_VALID;
         control.vmcb_clean_bits = 0;
-        let level_triggered =
-            io_interrupt.is_some_and(|(irq, _)| self.io_apic.is_level_triggered(irq));
-        self.local_apic.accept_interrupt(vector, level_triggered);
         if local_vector.is_some() {
+            self.local_apic.accept_interrupt(vector, false);
             self.local_apic.acknowledge_timer();
         } else if msi_vector.is_some() {
+            self.local_apic.accept_interrupt(vector, false);
             self.guest_block.acknowledge_msi();
         } else if let Some((irq, _)) = io_interrupt {
+            self.local_apic
+                .accept_interrupt(vector, self.io_apic.is_level_triggered(irq));
             // Delivery consumes the pending edge or sets remote-IRR for a
             // level input. A still-asserted level is offered again only after
             // the guest writes local-APIC EOI.
             self.io_apic.acknowledge(irq);
         } else if let Some(irq) = next_irq {
+            // Legacy PIC delivery bypasses the modeled local APIC. Its
+            // handler acknowledges only the 8259, so recording the vector in
+            // the local-APIC ISR would leave a stale in-service entry when an
+            // operating system later switches to APIC mode.
             self.legacy_timer.pic.acknowledge(irq);
         }
         Ok(())

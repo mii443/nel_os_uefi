@@ -37,10 +37,16 @@ struct VirtualMachine {
     configured_memory: u64,
     cpu_cycles: u64,
     accounting_start_tsc: u64,
+    disk_index: Option<usize>,
 }
 
 impl VirtualMachine {
-    fn new(id: usize, hardware_vcpu_id: usize, configured_memory: u64) -> Self {
+    fn new(
+        id: usize,
+        hardware_vcpu_id: usize,
+        configured_memory: u64,
+        disk_index: Option<usize>,
+    ) -> Self {
         Self {
             id,
             hardware_vcpu_id,
@@ -49,6 +55,7 @@ impl VirtualMachine {
             configured_memory,
             cpu_cycles: 0,
             accounting_start_tsc: unsafe { core::arch::x86_64::_rdtsc() },
+            disk_index,
         }
     }
 
@@ -119,7 +126,7 @@ fn max_new_guest_memory_mib_from_frames(free_frames: usize, committed_frames: us
 
 pub(crate) struct VmController {
     network: Option<VirtioNet>,
-    block: Option<VirtioBlock>,
+    blocks: Vec<VirtioBlock>,
     passthrough: Option<PassthroughDescriptor>,
     serial_console: SerialConsole,
     vms: Vec<VirtualMachine>,
@@ -135,14 +142,14 @@ pub(crate) struct VmController {
 impl VmController {
     pub(crate) fn new(
         network: Option<VirtioNet>,
-        block: Option<VirtioBlock>,
+        blocks: Vec<VirtioBlock>,
         passthrough: Option<PassthroughDescriptor>,
         total_frames: usize,
         boot_tsc: u64,
     ) -> Self {
         Self {
             network,
-            block,
+            blocks,
             passthrough,
             serial_console: SerialConsole::new(),
             vms: Vec::new(),
@@ -172,6 +179,7 @@ impl VmController {
             ManagementCommand::VmCreate {
                 id: Some(crate::management::DEFAULT_VM_ID),
                 memory_mib: vmm::DEFAULT_GUEST_MEMORY_MIB,
+                disk: (!self.blocks.is_empty()).then_some(0),
             },
             allocator,
         );
@@ -180,6 +188,7 @@ impl VmController {
             ManagementCommand::VmStart {
                 id: crate::management::DEFAULT_VM_ID,
                 attach: false,
+                disk: None,
             },
             allocator,
         );
@@ -323,6 +332,7 @@ impl VmController {
                 ManagementCommand::VmStart {
                     id: crate::management::DEFAULT_VM_ID,
                     attach: false,
+                    disk: None,
                 },
                 allocator,
             );
@@ -361,10 +371,6 @@ impl VmController {
             .as_ref()
             .map_or(0, VirtioNet::dropped_transmits);
         let serial_drops = serial::guest_output_drop_count();
-        let block_capacity = self
-            .block
-            .as_ref()
-            .map(|device| (device.capacity_bytes(), device.capacity_sectors()));
         let source_owner = source.serial_owner();
         let endpoint_owns_serial = source_owner.is_some() && self.serial_owner == source_owner;
         let requested_vm = command.vm_id();
@@ -388,7 +394,7 @@ impl VmController {
                     network_config,
                     network_drops,
                     serial_drops,
-                    block_capacity,
+                    &self.blocks,
                     self.passthrough,
                     attach_allowed,
                     endpoint_owns_serial,
@@ -404,7 +410,7 @@ impl VmController {
                 network_config,
                 network_drops,
                 serial_drops,
-                block_capacity,
+                &self.blocks,
                 self.passthrough,
                 attach_allowed,
                 endpoint_owns_serial,
@@ -421,7 +427,7 @@ impl VmController {
                     network_config,
                     network_drops,
                     serial_drops,
-                    block_capacity,
+                    &self.blocks,
                     self.passthrough,
                     false,
                     false,
@@ -497,9 +503,12 @@ impl VmController {
             .copied()
             .unwrap_or(1)
             .saturating_mul(vmm::VCPU_TIME_SLICE_MILLIS);
+        let disk_index = self.vms[vm_index].disk_index;
+        let mut block = disk_index.and_then(|index| self.blocks.get_mut(index));
         let result = match self.vms[vm_index].vcpu.as_mut() {
             Some(vcpu) => loop {
-                if let Err(error) = vcpu.run(allocator, self.block.as_mut()) {
+                if let Err(error) = vcpu.run(allocator, block.as_mut().map(|device| &mut **device))
+                {
                     break Err(error);
                 }
                 let now = unsafe { core::arch::x86_64::_rdtsc() };
@@ -662,6 +671,12 @@ fn write_vm_status<E: ManagementEndpoint>(endpoint: &mut E, vm_id: usize, vm: &V
     let cpu_usage = vm.cpu_usage_tenths(unsafe { core::arch::x86_64::_rdtsc() });
     let _ = write!(endpoint, "VM {} state: {}\r\n", vm_id, vm.state_text());
     let _ = write!(endpoint, "vCPUs: {}\r\n", vmm::VCPUS_PER_VM);
+    match vm.disk_index {
+        Some(index) => {
+            let _ = write!(endpoint, "Disk: {}\r\n", index);
+        }
+        None => endpoint.write_bytes(b"Disk: none\r\n"),
+    }
     let _ = write!(
         endpoint,
         "Memory usage: {}/{} MiB ({}.{:01}%)\r\n",
@@ -697,10 +712,20 @@ fn write_vm_list<E: ManagementEndpoint>(endpoint: &mut E, vms: &[VirtualMachine]
         let cpu_usage = vm.cpu_usage_tenths(now);
         let _ = write!(
             endpoint,
-            "VM {}: {}, {} vCPU, memory={}/{} MiB ({}.{:01}%), backing={} MiB, cpu={}.{:01}%\r\n",
+            "VM {}: {}, {} vCPU, disk=",
             vm.id,
             vm.state_text(),
             vmm::VCPUS_PER_VM,
+        );
+        match vm.disk_index {
+            Some(index) => {
+                let _ = write!(endpoint, "{}", index);
+            }
+            None => endpoint.write_bytes(b"none"),
+        }
+        let _ = write!(
+            endpoint,
+            ", memory={}/{} MiB ({}.{:01}%), backing={} MiB, cpu={}.{:01}%\r\n",
             vm.used_memory() / 1024 / 1024,
             vm.configured_memory / 1024 / 1024,
             memory_usage / 10,
@@ -714,6 +739,42 @@ fn write_vm_list<E: ManagementEndpoint>(endpoint: &mut E, vms: &[VirtualMachine]
 
 fn find_vm_index(vms: &[VirtualMachine], vm_id: usize) -> Option<usize> {
     vms.iter().position(|vm| vm.id == vm_id)
+}
+
+fn disk_owner(vms: &[VirtualMachine], disk: usize, except_vm: usize) -> Option<usize> {
+    vms.iter()
+        .find(|vm| vm.id != except_vm && vm.disk_index == Some(disk))
+        .map(|vm| vm.id)
+}
+
+fn write_disk_list<E: ManagementEndpoint>(
+    endpoint: &mut E,
+    blocks: &[VirtioBlock],
+    vms: &[VirtualMachine],
+) {
+    if blocks.is_empty() {
+        endpoint.write_bytes(b"No host disks available.\r\n");
+        return;
+    }
+    for (index, block) in blocks.iter().enumerate() {
+        let owner = vms
+            .iter()
+            .find(|vm| vm.disk_index == Some(index))
+            .map(|vm| vm.id);
+        let _ = write!(
+            endpoint,
+            "Disk {}: {} MiB ({} sectors), ",
+            index,
+            block.capacity_bytes() / BYTES_PER_MIB as u64,
+            block.capacity_sectors(),
+        );
+        match owner {
+            Some(id) => {
+                let _ = write!(endpoint, "VM {}\r\n", id);
+            }
+            None => endpoint.write_bytes(b"unassigned\r\n"),
+        }
+    }
 }
 
 fn lowest_free_vm_id(vms: &[VirtualMachine]) -> Option<usize> {
@@ -780,7 +841,7 @@ fn write_runtime_info<E: ManagementEndpoint>(
     config: Option<Ipv4Config>,
     dropped_transmits: u64,
     serial_output_drops: u64,
-    block_capacity: Option<(u64, u64)>,
+    blocks: &[VirtioBlock],
 ) {
     let vendor = cpuid::get_vendor_id();
     let brand = cpuid::get_brand();
@@ -804,15 +865,19 @@ fn write_runtime_info<E: ManagementEndpoint>(
         "Guest serial output drops: {}\r\n",
         serial_output_drops
     );
-    if let Some((bytes, sectors)) = block_capacity {
-        let _ = write!(
-            endpoint,
-            "Host virtio-blk: {} MiB ({} sectors)\r\n",
-            bytes / (1024 * 1024),
-            sectors
-        );
-    } else {
+    if blocks.is_empty() {
         let _ = endpoint.write_str("Host virtio-blk: unavailable\r\n");
+    } else {
+        let _ = write!(endpoint, "Host virtio-blk devices: {}\r\n", blocks.len());
+        for (index, block) in blocks.iter().enumerate() {
+            let _ = write!(
+                endpoint,
+                "  Disk {}: {} MiB ({} sectors)\r\n",
+                index,
+                block.capacity_bytes() / BYTES_PER_MIB as u64,
+                block.capacity_sectors(),
+            );
+        }
     }
     if let Some(tsc_khz) = interrupt::apic::GUEST_TSC_KHZ.get() {
         let current_tsc = unsafe { core::arch::x86_64::_rdtsc() };
@@ -858,7 +923,7 @@ fn process_management_command<E: ManagementEndpoint>(
     network_config: Option<Ipv4Config>,
     network_drops: u64,
     serial_drops: u64,
-    block_capacity: Option<(u64, u64)>,
+    blocks: &[VirtioBlock],
     passthrough: Option<PassthroughDescriptor>,
     attach_allowed: bool,
     endpoint_owns_serial: bool,
@@ -867,7 +932,11 @@ fn process_management_command<E: ManagementEndpoint>(
     let mut serial_action = SerialAction::None;
     match command {
         ManagementCommand::VmList => write_vm_list(endpoint, vms),
-        ManagementCommand::VmCreate { id, memory_mib } => {
+        ManagementCommand::VmCreate {
+            id,
+            memory_mib,
+            disk,
+        } => {
             let Some(vm_id) = id.or_else(|| lowest_free_vm_id(vms)) else {
                 endpoint.write_bytes(b"ERR no VM ID is available.\r\n");
                 endpoint.prompt();
@@ -880,6 +949,18 @@ fn process_management_command<E: ManagementEndpoint>(
                     "ERR VM {} already exists; state is {}.\r\n",
                     vm_id,
                     vms[index].state_text()
+                );
+            } else if let Some(disk) = disk
+                && disk >= blocks.len()
+            {
+                let _ = write!(endpoint, "ERR disk {} does not exist.\r\n", disk);
+            } else if let Some(disk) = disk
+                && let Some(owner) = disk_owner(vms, disk, vm_id)
+            {
+                let _ = write!(
+                    endpoint,
+                    "ERR disk {} is already attached to VM {}.\r\n",
+                    disk, owner
                 );
             } else if memory_mib < vmm::MIN_GUEST_MEMORY_MIB {
                 let _ = write!(
@@ -916,7 +997,7 @@ fn process_management_command<E: ManagementEndpoint>(
                     }
                     return serial_action;
                 };
-                let mut vm = VirtualMachine::new(vm_id, hardware_vcpu_id, memory_size);
+                let mut vm = VirtualMachine::new(vm_id, hardware_vcpu_id, memory_size, disk);
                 let assigned_nic = if vm_id == crate::management::DEFAULT_VM_ID {
                     passthrough
                 } else {
@@ -928,12 +1009,18 @@ fn process_management_command<E: ManagementEndpoint>(
                         vm.state = VmState::Created;
                         let _ = write!(
                             endpoint,
-                            "VM {} created with {} MiB and {} vCPU; use 'vm start {}'.\r\n",
+                            "VM {} created with {} MiB, {} vCPU, and disk ",
                             vm_id,
                             memory_mib,
                             vmm::VCPUS_PER_VM,
-                            vm_id
                         );
+                        match disk {
+                            Some(index) => {
+                                let _ = write!(endpoint, "{}", index);
+                            }
+                            None => endpoint.write_bytes(b"none"),
+                        }
+                        let _ = write!(endpoint, "; use 'vm start {}'.\r\n", vm_id);
                         info!(
                             "VM {} created with {} MiB by management shell",
                             vm_id, memory_mib
@@ -948,9 +1035,39 @@ fn process_management_command<E: ManagementEndpoint>(
                 vms.push(vm);
             }
         }
-        ManagementCommand::VmStart { id, attach } => {
+        ManagementCommand::VmStart { id, attach, disk } => {
             let vm_id = id;
             if let Some(vm_index) = find_vm_index(vms, vm_id) {
+                if let Some(disk) = disk {
+                    if disk >= blocks.len() {
+                        let _ = write!(endpoint, "ERR disk {} does not exist.\r\n", disk);
+                        if add_prompt {
+                            endpoint.prompt();
+                        }
+                        return serial_action;
+                    }
+                    if let Some(owner) = disk_owner(vms, disk, vm_id) {
+                        let _ = write!(
+                            endpoint,
+                            "ERR disk {} is already attached to VM {}.\r\n",
+                            disk, owner
+                        );
+                        if add_prompt {
+                            endpoint.prompt();
+                        }
+                        return serial_action;
+                    }
+                    if matches!(vms[vm_index].state, VmState::Running)
+                        && vms[vm_index].disk_index != Some(disk)
+                    {
+                        endpoint.write_bytes(b"ERR stop the VM before changing its disk.\r\n");
+                        if add_prompt {
+                            endpoint.prompt();
+                        }
+                        return serial_action;
+                    }
+                    vms[vm_index].disk_index = Some(disk);
+                }
                 let vm = &mut vms[vm_index];
                 match vm.state {
                     VmState::Running => {
@@ -1076,6 +1193,46 @@ fn process_management_command<E: ManagementEndpoint>(
                 write_missing_vm(endpoint, vm_id);
             }
         }
+        ManagementCommand::DiskList => write_disk_list(endpoint, blocks, vms),
+        ManagementCommand::DiskAttach { id, disk } => {
+            let Some(vm_index) = find_vm_index(vms, id) else {
+                write_missing_vm(endpoint, id);
+                if add_prompt {
+                    endpoint.prompt();
+                }
+                return serial_action;
+            };
+            if disk >= blocks.len() {
+                let _ = write!(endpoint, "ERR disk {} does not exist.\r\n", disk);
+            } else if matches!(vms[vm_index].state, VmState::Running) {
+                endpoint.write_bytes(b"ERR stop the VM before changing its disk.\r\n");
+            } else if let Some(owner) = disk_owner(vms, disk, id) {
+                let _ = write!(
+                    endpoint,
+                    "ERR disk {} is already attached to VM {}.\r\n",
+                    disk, owner
+                );
+            } else {
+                vms[vm_index].disk_index = Some(disk);
+                let _ = write!(endpoint, "Disk {} attached to VM {}.\r\n", disk, id);
+            }
+        }
+        ManagementCommand::DiskDetach { id } => {
+            let Some(vm_index) = find_vm_index(vms, id) else {
+                write_missing_vm(endpoint, id);
+                if add_prompt {
+                    endpoint.prompt();
+                }
+                return serial_action;
+            };
+            if matches!(vms[vm_index].state, VmState::Running) {
+                endpoint.write_bytes(b"ERR stop the VM before detaching its disk.\r\n");
+            } else if let Some(disk) = vms[vm_index].disk_index.take() {
+                let _ = write!(endpoint, "Disk {} detached from VM {}.\r\n", disk, id);
+            } else {
+                let _ = write!(endpoint, "VM {} has no disk attached.\r\n", id);
+            }
+        }
         ManagementCommand::SerialAttach { id } => {
             let vm_id = id;
             let Some(vm_index) = find_vm_index(vms, vm_id) else {
@@ -1121,7 +1278,7 @@ fn process_management_command<E: ManagementEndpoint>(
             network_config,
             network_drops,
             serial_drops,
-            block_capacity,
+            blocks,
         ),
         ManagementCommand::InfoAll => {
             write_runtime_info(
@@ -1130,7 +1287,7 @@ fn process_management_command<E: ManagementEndpoint>(
                 network_config,
                 network_drops,
                 serial_drops,
-                block_capacity,
+                blocks,
             );
             write_memory_info(endpoint, allocator, total_frames, vms);
             write_vm_list(endpoint, vms);
@@ -1168,11 +1325,11 @@ mod tests {
         let mut vms = Vec::new();
         assert_eq!(lowest_free_vm_id(&vms), Some(0));
 
-        vms.push(VirtualMachine::new(7, 0, 128 * 1024 * 1024));
+        vms.push(VirtualMachine::new(7, 0, 128 * 1024 * 1024, None));
         assert_eq!(lowest_free_vm_id(&vms), Some(0));
 
-        vms.push(VirtualMachine::new(0, 1, 128 * 1024 * 1024));
-        vms.push(VirtualMachine::new(2, 2, 128 * 1024 * 1024));
+        vms.push(VirtualMachine::new(0, 1, 128 * 1024 * 1024, None));
+        vms.push(VirtualMachine::new(2, 2, 128 * 1024 * 1024, None));
         assert_eq!(lowest_free_vm_id(&vms), Some(1));
         assert_eq!(lowest_free_hardware_vcpu_id(&vms), Some(3));
     }

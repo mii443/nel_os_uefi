@@ -1164,14 +1164,16 @@ mod tests {
             server.take_command(),
             Some(ManagementCommand::VmStart {
                 id: 0,
-                attach: false
+                attach: false,
+                disk: None,
             })
         );
         assert_eq!(
             server.take_command(),
             Some(ManagementCommand::VmStart {
                 id: 0,
-                attach: true
+                attach: true,
+                disk: None,
             })
         );
         assert_eq!(

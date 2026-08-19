@@ -139,6 +139,35 @@ else
 fi
 readonly BLOCK_IMAGE
 
+BLOCK_IMAGES=("${BLOCK_IMAGE}")
+block_index=1
+while :; do
+    block_variable="NEL_OS_BLOCK_IMAGE_${block_index}"
+    if [[ ! -v "${block_variable}" ]]; then
+        break
+    fi
+    block_image="${!block_variable}"
+    if [[ -z "${block_image}" || ! -f "${block_image}" ]]; then
+        echo "Host block image does not exist or is not a regular file: ${block_image:-<empty>}" >&2
+        exit 2
+    fi
+    BLOCK_IMAGES+=("$(realpath -- "${block_image}")")
+    ((block_index += 1))
+done
+
+BLOCK_DRIVE_ARGS=()
+BLOCK_DEVICE_ARGS=()
+for block_index in "${!BLOCK_IMAGES[@]}"; do
+    BLOCK_DRIVE_ARGS+=(
+        -drive
+        "if=none,id=hypervisor_block${block_index},format=raw,file=${BLOCK_IMAGES[block_index]}"
+    )
+    BLOCK_DEVICE_ARGS+=(
+        -device
+        "virtio-blk-pci,drive=hypervisor_block${block_index},disable-modern=on,vectors=0"
+    )
+done
+
 "${SOURCE_DIR}/create-iso.sh" "${EFI_BINARY}" "${RUNTIME_DIR}"
 cp "${SOURCE_DIR}/OVMF_VARS.fd" "${RUNTIME_DIR}/OVMF_VARS.fd"
 
@@ -163,7 +192,7 @@ run_qemu() {
         -nographic \
         -drive "if=pflash,format=raw,readonly=on,file=${SOURCE_DIR}/OVMF_CODE.fd" \
         -drive "if=pflash,format=raw,file=${RUNTIME_DIR}/OVMF_VARS.fd" \
-        -drive "if=none,id=hypervisor_block,format=raw,file=${BLOCK_IMAGE}" \
+        "${BLOCK_DRIVE_ARGS[@]}" \
         -cdrom "${RUNTIME_DIR}/nel_os.iso" \
         -boot d \
         -smp 1 \
@@ -171,7 +200,7 @@ run_qemu() {
         "${GUEST_NET_ARGS[@]}" \
         -device "virtio-net-pci,netdev=hypervisor_net,disable-modern=on,vectors=0,mac=${NET_MAC}" \
         -device "virtio-net-pci,netdev=guest_net,disable-legacy=on,iommu_platform=on,vectors=0,mac=${GUEST_NET_MAC}" \
-        -device "virtio-blk-pci,drive=hypervisor_block,disable-modern=on,vectors=0" \
+        "${BLOCK_DEVICE_ARGS[@]}" \
         "${debug_args[@]}" \
         --no-shutdown --no-reboot
 }

@@ -36,11 +36,12 @@ Intel hosts can build and run independently. `NEL_OS_LOCAL_CACHE_DIR`,
 
 ### Host virtio block device
 
-QEMU also gives the outer hypervisor one transitional virtio-blk device. The
-block device is retained by the hypervisor and is never passed through to VM
-0. Instead, the outer kernel implements a separate legacy virtio-blk PCI
-device for the VM and services its virtqueue from the host-owned backing
-device. `info runtime` and `info all` report the backing device capacity.
+QEMU gives the outer hypervisor one or more transitional virtio-blk devices.
+The block devices are retained by the hypervisor and are never passed through
+to a VM. Instead, the outer kernel implements a separate legacy virtio-blk PCI
+device for each VM and services its virtqueue from the selected host-owned
+backing device. `disk list`, `info runtime`, and `info all` report the available
+devices and capacities.
 
 VM 0 starts at the architectural x86 reset vector in its own OVMF firmware.
 That firmware discovers the emulated virtio-blk device, reads a normal GPT
@@ -64,6 +65,26 @@ An explicit image must already exist and be UEFI bootable; it is attached
 without being modified. This allows another Linux distribution or another
 UEFI-capable operating system image to use the same virtual disk interface.
 `NEL_OS_BLOCK_SIZE_MIB` applies only when the default image is generated.
+
+Additional images can be exposed as disk 1, disk 2, and so on by setting
+contiguous numbered variables starting at `NEL_OS_BLOCK_IMAGE_1`. Disk 0 is the
+default/generated image and is assigned to the automatically started VM 0.
+For example, keep Linux on VM 0 and make a decompressed FreeBSD raw image
+available to a VM created later from the management shell:
+
+```sh
+xz -dk FreeBSD-14.4-RELEASE-amd64-BASIC-CLOUDINIT-ufs.raw.xz
+NEL_OS_BLOCK_IMAGE_1=/path/to/FreeBSD-14.4-RELEASE-amd64-BASIC-CLOUDINIT-ufs.raw ./run.sh
+```
+
+The bare-metal hypervisor cannot open a new path from the outer host after it
+has booted. Images must therefore be exposed at `./run.sh` time, but any exposed
+disk can subsequently be assigned, detached, and booted freely from the
+management shell. To boot only FreeBSD as VM 0, set its raw image as disk 0:
+
+```sh
+NEL_OS_BLOCK_IMAGE=/path/to/freebsd.raw ./run.sh
+```
 
 On a new Ubuntu host, install the host tools and rustup once:
 
@@ -98,13 +119,18 @@ The shell supports:
 
 ```text
 vm list                show all created VMs
-vm create [ID] MEMORY  create a VM; the runtime limit follows available host RAM
-vm start [ID]          start a created VM, or resume it when stopped
+vm create [ID] MEMORY [--disk DISK]
+                        create a VM and optionally assign a host disk
+vm start [ID] [--disk DISK]
+                        start/resume a VM, optionally selecting its disk
 vm start [ID] -a       start/resume and attach its serial (`--attach` also works)
 vm stop [ID]           stop one VCPU while retaining its guest memory
 vm reset [ID]          reset one VM in place and start it
 vm delete [ID]         delete a VM and release its host memory (`remove` also works)
 vm status [ID]         show one VM (`vm info` and `info vm` also work)
+disk list              list exposed host disks and their VM owners
+disk attach VM DISK    assign a disk to a stopped VM
+disk detach VM         detach the disk from a stopped VM
 serial attach [ID]     attach to one VM's COM1 byte stream
 serial detach          explicitly detach while at the management prompt
 info memory            show current host physical-memory use
@@ -130,6 +156,19 @@ MiB because the bundled UEFI Linux image cannot boot reliably below it. The
 upper limit is calculated at runtime from currently free host RAM, outstanding
 VM memory commitments, the management reserve, and the firmware-addressable
 memory range. `info memory` reports the current limit for a newly created VM.
+
+For example, when Linux is disk 0 and FreeBSD is disk 1, start FreeBSD in VM 1
+without restarting the hypervisor:
+
+```text
+nel> disk list
+nel> vm create 1 512M --disk 1
+nel> vm start 1 --attach
+```
+
+Disk assignment is operating-system agnostic. A disk can be changed only while
+its VM is stopped, and one disk can belong to only one VM at a time. `vm delete`
+releases its disk assignment as well as its memory.
 
 `vm list` and `info vm [ID]` report each VM's accessed working set, configured
 RAM, allocated host backing, and cumulative CPU usage since creation. CPU usage

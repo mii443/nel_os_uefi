@@ -1,20 +1,46 @@
 pub(crate) const BANNER: &[u8] =
     b"nel hypervisor management shell\r\nType 'help' for commands.\r\nnel> ";
 pub(crate) const PROMPT: &[u8] = b"nel> ";
-pub(crate) const HELP: &[u8] = b"Commands:\r\n  vm list\r\n  vm create [ID] MEMORY\r\n  vm start [ID] [--attach|-a]\r\n  vm stop|reset|delete|status [ID]\r\n  serial attach [ID]\r\n  serial detach\r\n  info memory|runtime|all\r\n  info vm [ID]\r\n  help\r\n  exit\r\nVMs are created dynamically. Omitting ID from 'vm create' selects the lowest free ID; other commands default to VM 0. MEMORY is MiB unless suffixed M/MiB/G/GiB.\r\n";
+pub(crate) const HELP: &[u8] = b"Commands:\r\n  vm list\r\n  vm create [ID] MEMORY [--disk DISK]\r\n  vm start [ID] [--disk DISK] [--attach|-a]\r\n  vm stop|reset|delete|status [ID]\r\n  disk list\r\n  disk attach VM DISK\r\n  disk detach VM\r\n  serial attach [ID]\r\n  serial detach\r\n  info memory|runtime|all\r\n  info vm [ID]\r\n  help\r\n  exit\r\nVMs are created dynamically. Omitting ID from 'vm create' selects the lowest free ID; other commands default to VM 0. MEMORY is MiB unless suffixed M/MiB/G/GiB. Disks are host virtio-blk indices and may be changed only while a VM is not running.\r\n";
 
 pub const DEFAULT_VM_ID: usize = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagementCommand {
     VmList,
-    VmCreate { id: Option<usize>, memory_mib: u32 },
-    VmStart { id: usize, attach: bool },
-    VmStop { id: usize },
-    VmReset { id: usize },
-    VmDelete { id: usize },
-    VmStatus { id: usize },
-    SerialAttach { id: usize },
+    VmCreate {
+        id: Option<usize>,
+        memory_mib: u32,
+        disk: Option<usize>,
+    },
+    VmStart {
+        id: usize,
+        attach: bool,
+        disk: Option<usize>,
+    },
+    VmStop {
+        id: usize,
+    },
+    VmReset {
+        id: usize,
+    },
+    VmDelete {
+        id: usize,
+    },
+    VmStatus {
+        id: usize,
+    },
+    DiskList,
+    DiskAttach {
+        id: usize,
+        disk: usize,
+    },
+    DiskDetach {
+        id: usize,
+    },
+    SerialAttach {
+        id: usize,
+    },
     SerialDetach,
     InfoMemory,
     InfoRuntime,
@@ -33,6 +59,8 @@ impl ManagementCommand {
             | Self::VmReset { id }
             | Self::VmDelete { id }
             | Self::VmStatus { id }
+            | Self::DiskAttach { id, .. }
+            | Self::DiskDetach { id }
             | Self::SerialAttach { id } => Some(id),
             Self::VmCreate { id, .. } => id,
             _ => None,
@@ -68,6 +96,9 @@ pub(crate) fn parse_command(line: &[u8]) -> ManagementCommand {
         }
         if eq(operation, b"start") {
             return parse_start(words);
+        }
+        if eq(operation, b"disk") {
+            return parse_disk(words);
         }
         if eq(operation, b"stop") {
             return parse_vm_id(words).map_or(ManagementCommand::Invalid, |id| {
@@ -112,6 +143,10 @@ pub(crate) fn parse_command(line: &[u8]) -> ManagementCommand {
     }
     if eq(first, b"list") && words.next().is_none() {
         return ManagementCommand::VmList;
+    }
+
+    if eq(first, b"disk") {
+        return parse_disk(words);
     }
 
     if eq(first, b"serial") {
@@ -160,16 +195,26 @@ pub(crate) fn parse_command(line: &[u8]) -> ManagementCommand {
 }
 
 fn parse_start<'a>(words: impl Iterator<Item = &'a [u8]>) -> ManagementCommand {
+    let mut words = words.peekable();
     let mut id = DEFAULT_VM_ID;
     let mut saw_id = false;
     let mut attach = false;
+    let mut disk = None;
 
-    for word in words {
+    while let Some(word) = words.next() {
         if eq(word, b"--attach") || eq(word, b"-a") {
             if attach {
                 return ManagementCommand::Invalid;
             }
             attach = true;
+        } else if eq(word, b"--disk") || eq(word, b"-d") {
+            if disk.is_some() {
+                return ManagementCommand::Invalid;
+            }
+            let Some(value) = words.next().and_then(parse_usize) else {
+                return ManagementCommand::Invalid;
+            };
+            disk = Some(value);
         } else if !saw_id {
             let Some(parsed) = parse_usize(word) else {
                 return ManagementCommand::Invalid;
@@ -181,17 +226,34 @@ fn parse_start<'a>(words: impl Iterator<Item = &'a [u8]>) -> ManagementCommand {
         }
     }
 
-    ManagementCommand::VmStart { id, attach }
+    ManagementCommand::VmStart { id, attach, disk }
 }
 
-fn parse_create<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> ManagementCommand {
-    let Some(first) = words.next() else {
+fn parse_create<'a>(words: impl Iterator<Item = &'a [u8]>) -> ManagementCommand {
+    let mut words = words.peekable();
+    let mut first = None;
+    let mut second = None;
+    let mut disk = None;
+    while let Some(word) = words.next() {
+        if eq(word, b"--disk") || eq(word, b"-d") {
+            if disk.is_some() {
+                return ManagementCommand::Invalid;
+            }
+            let Some(value) = words.next().and_then(parse_usize) else {
+                return ManagementCommand::Invalid;
+            };
+            disk = Some(value);
+        } else if first.is_none() {
+            first = Some(word);
+        } else if second.is_none() {
+            second = Some(word);
+        } else {
+            return ManagementCommand::Invalid;
+        }
+    }
+    let Some(first) = first else {
         return ManagementCommand::Invalid;
     };
-    let second = words.next();
-    if words.next().is_some() {
-        return ManagementCommand::Invalid;
-    }
 
     let (id, memory) = match second {
         Some(memory) => {
@@ -205,7 +267,44 @@ fn parse_create<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> ManagementComm
     let Some(memory_mib) = parse_memory_mib(memory) else {
         return ManagementCommand::Invalid;
     };
-    ManagementCommand::VmCreate { id, memory_mib }
+    ManagementCommand::VmCreate {
+        id,
+        memory_mib,
+        disk,
+    }
+}
+
+fn parse_disk<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> ManagementCommand {
+    let Some(operation) = words.next() else {
+        return ManagementCommand::Invalid;
+    };
+    if eq(operation, b"list") && words.next().is_none() {
+        return ManagementCommand::DiskList;
+    }
+    if eq(operation, b"attach") {
+        let (Some(id), Some(disk)) = (
+            words.next().and_then(parse_usize),
+            words.next().and_then(parse_usize),
+        ) else {
+            return ManagementCommand::Invalid;
+        };
+        return if words.next().is_none() {
+            ManagementCommand::DiskAttach { id, disk }
+        } else {
+            ManagementCommand::Invalid
+        };
+    }
+    if eq(operation, b"detach") {
+        let Some(id) = words.next().and_then(parse_usize) else {
+            return ManagementCommand::Invalid;
+        };
+        return if words.next().is_none() {
+            ManagementCommand::DiskDetach { id }
+        } else {
+            ManagementCommand::Invalid
+        };
+    }
+    ManagementCommand::Invalid
 }
 
 fn parse_vm_id<'a>(mut words: impl Iterator<Item = &'a [u8]>) -> Option<usize> {
@@ -293,14 +392,16 @@ mod tests {
             parse_command(b"start"),
             ManagementCommand::VmStart {
                 id: 0,
-                attach: false
+                attach: false,
+                disk: None,
             }
         );
         assert_eq!(
             parse_command(b" VM START -a "),
             ManagementCommand::VmStart {
                 id: 0,
-                attach: true
+                attach: true,
+                disk: None,
             }
         );
         assert_eq!(
@@ -320,35 +421,40 @@ mod tests {
             parse_command(b"vm create 2 128MiB"),
             ManagementCommand::VmCreate {
                 id: Some(2),
-                memory_mib: 128
+                memory_mib: 128,
+                disk: None,
             }
         );
         assert_eq!(
             parse_command(b"vm create 1G"),
             ManagementCommand::VmCreate {
                 id: None,
-                memory_mib: 1024
+                memory_mib: 1024,
+                disk: None,
             }
         );
         assert_eq!(
             parse_command(b"vm create 4096 128M"),
             ManagementCommand::VmCreate {
                 id: Some(4096),
-                memory_mib: 128
+                memory_mib: 128,
+                disk: None,
             }
         );
         assert_eq!(
             parse_command(b"vm start 3 --attach"),
             ManagementCommand::VmStart {
                 id: 3,
-                attach: true
+                attach: true,
+                disk: None,
             }
         );
         assert_eq!(
             parse_command(b"vm start -a 2"),
             ManagementCommand::VmStart {
                 id: 2,
-                attach: true
+                attach: true,
+                disk: None,
             }
         );
         assert_eq!(
@@ -368,6 +474,36 @@ mod tests {
             ManagementCommand::SerialAttach { id: 2 }
         );
         assert_eq!(parse_command(b"vm list"), ManagementCommand::VmList);
+    }
+
+    #[test]
+    fn parses_disk_selection_commands() {
+        assert_eq!(
+            parse_command(b"vm create 2 512M --disk 1"),
+            ManagementCommand::VmCreate {
+                id: Some(2),
+                memory_mib: 512,
+                disk: Some(1),
+            }
+        );
+        assert_eq!(
+            parse_command(b"vm start 2 --disk 1 -a"),
+            ManagementCommand::VmStart {
+                id: 2,
+                attach: true,
+                disk: Some(1),
+            }
+        );
+        assert_eq!(parse_command(b"disk list"), ManagementCommand::DiskList);
+        assert_eq!(parse_command(b"vm disk list"), ManagementCommand::DiskList);
+        assert_eq!(
+            parse_command(b"vm disk attach 2 1"),
+            ManagementCommand::DiskAttach { id: 2, disk: 1 }
+        );
+        assert_eq!(
+            parse_command(b"disk detach 2"),
+            ManagementCommand::DiskDetach { id: 2 }
+        );
     }
 
     #[test]

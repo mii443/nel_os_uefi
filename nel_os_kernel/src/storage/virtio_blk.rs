@@ -197,9 +197,20 @@ pub struct VirtioBlock {
 }
 
 impl VirtioBlock {
-    pub fn probe(allocator: &mut dyn FrameAllocator<Size4KiB>) -> Result<Self, &'static str> {
-        let pci_address = pci::find_legacy_virtio_block()
-            .ok_or("no transitional virtio-blk PCI device was found")?;
+    pub fn probe_nth(
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+        index: usize,
+    ) -> Result<Option<Self>, &'static str> {
+        let Some(pci_address) = pci::find_nth_legacy_virtio_block(index) else {
+            return Ok(None);
+        };
+        Self::probe_at(allocator, pci_address).map(Some)
+    }
+
+    fn probe_at(
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+        pci_address: PciAddress,
+    ) -> Result<Self, &'static str> {
         let io_base = pci::io_bar(pci_address).ok_or("virtio-blk has no legacy I/O BAR")?;
         pci::enable_io_bus_mastering(pci_address);
 
