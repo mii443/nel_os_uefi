@@ -11,6 +11,12 @@ use crate::vmm::x86_64::intel::{vmread, vmwrite};
 
 type MsrIndex = u32;
 
+const EFER_SCE: u64 = 1 << 0;
+const EFER_LME: u64 = 1 << 8;
+const EFER_LMA: u64 = 1 << 10;
+const EFER_NXE: u64 = 1 << 11;
+const EFER_SUPPORTED: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
+
 const MAX_NUM_ENTS: usize = 4096 / core::mem::size_of::<SavedMsr>();
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -222,21 +228,22 @@ impl ShadowMsr {
                 // Lock bit (0) | Enable VMX inside SMX (1) | Enable VMX outside SMX (2)
                 Self::set_ret_val(vcpu, 0x5)
             }
-            0x48 => Self::set_ret_val(vcpu, 0),  // IA32_SPEC_CTRL
-            0x122 => Self::set_ret_val(vcpu, 0), // IA32_TSX_CTRL
-            0x560 => Self::set_ret_val(vcpu, 0), // IA32_RTIT_OUTPUT_BASE
-            0x561 => Self::set_ret_val(vcpu, 0), // IA32_RTIT_OUTPUT_MASK_PTRS
-            0x570 => Self::set_ret_val(vcpu, 0), // IA32_RTIT_CTL
-            0x571 => Self::set_ret_val(vcpu, 0), // IA32_RTIT_STATUS
-            0x572 => Self::set_ret_val(vcpu, 0), // IA32_CR3_MATCH
-            0x580 => Self::set_ret_val(vcpu, 0), // IA32_ADDR0_START
-            0x581 => Self::set_ret_val(vcpu, 0), // IA32_ADDR0_END
-            0x582 => Self::set_ret_val(vcpu, 0), // IA32_ADDR1_START
-            0x583 => Self::set_ret_val(vcpu, 0), // IA32_ADDR1_END
-            0x584 => Self::set_ret_val(vcpu, 0), // IA32_ADDR2_START
-            0x585 => Self::set_ret_val(vcpu, 0), // IA32_ADDR2_END
-            0x586 => Self::set_ret_val(vcpu, 0), // IA32_ADDR3_START
-            0x587 => Self::set_ret_val(vcpu, 0), // IA32_ADDR3_END
+            0x17 => Self::set_ret_val(vcpu, read_msr(0x17)), // IA32_PLATFORM_ID
+            0x48 => Self::set_ret_val(vcpu, 0),              // IA32_SPEC_CTRL
+            0x122 => Self::set_ret_val(vcpu, 0),             // IA32_TSX_CTRL
+            0x560 => Self::set_ret_val(vcpu, 0),             // IA32_RTIT_OUTPUT_BASE
+            0x561 => Self::set_ret_val(vcpu, 0),             // IA32_RTIT_OUTPUT_MASK_PTRS
+            0x570 => Self::set_ret_val(vcpu, 0),             // IA32_RTIT_CTL
+            0x571 => Self::set_ret_val(vcpu, 0),             // IA32_RTIT_STATUS
+            0x572 => Self::set_ret_val(vcpu, 0),             // IA32_CR3_MATCH
+            0x580 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR0_START
+            0x581 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR0_END
+            0x582 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR1_START
+            0x583 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR1_END
+            0x584 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR2_START
+            0x585 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR2_END
+            0x586 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR3_START
+            0x587 => Self::set_ret_val(vcpu, 0),             // IA32_ADDR3_END
             x86::msr::IA32_FS_BASE => Self::set_ret_val(vcpu, vmread(vmcs::guest::FS_BASE)?),
             x86::msr::IA32_GS_BASE => Self::set_ret_val(vcpu, vmread(vmcs::guest::GS_BASE)?),
             x86::msr::IA32_KERNEL_GSBASE => Self::shadow_read(vcpu, msr_kind)?,
@@ -253,7 +260,7 @@ impl ShadowMsr {
             x86::msr::SYSENTER_EIP_MSR => {
                 Self::set_ret_val(vcpu, vmread(vmcs::guest::IA32_SYSENTER_EIP)?)
             }
-            0x1b => Self::shadow_read(vcpu, msr_kind)?,
+            0x1b => Self::set_ret_val(vcpu, vcpu.guest_apic_base),
             0x8b => Self::set_ret_val(vcpu, 0x8701021),
             0xc0011029 => Self::set_ret_val(vcpu, 0x3000310e08202),
             0xc0010000 => Self::set_ret_val(vcpu, 0x130076),
@@ -293,15 +300,15 @@ impl ShadowMsr {
             x86::msr::SYSENTER_ESP_MSR => vmwrite(vmcs::guest::IA32_SYSENTER_ESP, value)?,
             x86::msr::IA32_EFER => {
                 info!("Setting IA32_EFER: {:#x}", value);
-                if value == 0xd01 || value == 0x100 {
-                    vmwrite(vmcs::guest::IA32_EFER_FULL, value)?
-                } else {
-                    return Err("Invalid guest IA32_EFER value");
-                }
+                let current = vmread(vmcs::guest::IA32_EFER_FULL)?;
+                let cr0 = vmread(vmcs::guest::CR0)?;
+                let value = validate_efer_write(value, current, cr0)?;
+                vmwrite(vmcs::guest::IA32_EFER_FULL, value)?;
+                super::cr::update_ia32e(vcpu)?;
             }
             x86::msr::IA32_FS_BASE => vmwrite(vmcs::guest::FS_BASE, value)?,
             x86::msr::IA32_GS_BASE => vmwrite(vmcs::guest::GS_BASE, value)?,
-            0x1b => Self::shadow_write(vcpu, msr_kind)?,
+            0x1b => vcpu.guest_apic_base = value & 0xffff_f000 | (value & 0xd00),
             0xc0010007 => Self::shadow_write(vcpu, msr_kind)?,
             0xc0010117 => Self::shadow_write(vcpu, msr_kind)?,
 
@@ -309,5 +316,37 @@ impl ShadowMsr {
         }
 
         Ok(())
+    }
+}
+
+fn validate_efer_write(value: u64, current: u64, cr0: u64) -> Result<u64, &'static str> {
+    if value & !EFER_SUPPORTED != 0 {
+        return Err("Invalid guest IA32_EFER value");
+    }
+    if cr0 & (1 << 31) != 0 && (value ^ current) & EFER_LME != 0 {
+        return Err("Guest IA32_EFER.LME cannot change while paging is enabled");
+    }
+
+    // LMA is read-only. Preserve it here; update_ia32e derives it again from
+    // LME, CR0.PG, and CR4.PAE after the write.
+    Ok((value & !EFER_LMA) | (current & EFER_LMA))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EFER_LMA, validate_efer_write};
+
+    #[test]
+    fn efer_write_accepts_ovmf_and_linux_values() {
+        assert_eq!(validate_efer_write(0x100, 0, 0).unwrap(), 0x100);
+        assert_eq!(validate_efer_write(0xd00, 0x500, 1 << 31).unwrap(), 0xd00);
+        assert_eq!(validate_efer_write(0xd01, 0x500, 1 << 31).unwrap(), 0xd01);
+    }
+
+    #[test]
+    fn efer_write_preserves_read_only_lma_and_rejects_invalid_changes() {
+        assert_eq!(validate_efer_write(0x100, EFER_LMA, 0).unwrap(), 0x500);
+        assert!(validate_efer_write(0, 0x100, 1 << 31).is_err());
+        assert!(validate_efer_write(1 << 63, 0, 0).is_err());
     }
 }

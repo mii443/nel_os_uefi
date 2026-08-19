@@ -75,6 +75,7 @@ pub struct IntelVCpu {
     guest_memory_allocated: u64,
     pub host_msr: ShadowMsr,
     pub guest_msr: ShadowMsr,
+    pub(super) guest_apic_base: u64,
     pub ia32e_enabled: bool,
     pub pic: super::io::Pic,
     io_bitmap: IOBitmap,
@@ -130,13 +131,18 @@ impl IntelVCpu {
                     cpuid::handle_cpuid_vmexit(self);
                     self.step_next_inst()?;
                 }
-                VmxExitReason::RDMSR => {
-                    if msr::ShadowMsr::handle_read_msr_vmexit(self).is_ok() {
-                        self.step_next_inst()?;
-                    } else {
+                VmxExitReason::RDMSR => match msr::ShadowMsr::handle_read_msr_vmexit(self) {
+                    Ok(()) => self.step_next_inst()?,
+                    Err(error) => {
+                        info!(
+                            "Guest RDMSR {:#x} failed at RIP={:#x}: {}",
+                            self.guest_registers.rcx,
+                            vmread(vmcs::guest::RIP)?,
+                            error
+                        );
                         self.pic.inject_exception(13, Some(0))?;
                     }
-                }
+                },
                 VmxExitReason::WRMSR => {
                     if msr::ShadowMsr::handle_wrmsr_vmexit(self).is_ok() {
                         self.step_next_inst()?;
@@ -327,7 +333,14 @@ impl IntelVCpu {
                     return Err("Ept Violation");
                 }
                 VmxExitReason::TRIPLE_FAULT => {
-                    info!("Triple fault detected");
+                    info!(
+                        "Triple fault detected at RIP={:#x}, CR0={:#x}, CR3={:#x}, CR4={:#x}, EFER={:#x}",
+                        vmread(vmcs::guest::RIP)?,
+                        vmread(vmcs::guest::CR0)?,
+                        vmread(vmcs::guest::CR3)?,
+                        vmread(vmcs::guest::CR4)?,
+                        vmread(vmcs::guest::IA32_EFER_FULL)?
+                    );
                     return Err("Triple fault");
                 }
                 VmxExitReason::VMX_PREEMPTION_TIMER_EXPIRED => {
@@ -336,10 +349,17 @@ impl IntelVCpu {
                     // gives the outer scheduler a chance to switch VCPUs.
                 }
                 VmxExitReason::EXCEPTION => {
+                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO)?;
                     if interrupted_event {
+                        info!(
+                            "VMX exception during event delivery: exit={:#x} vectoring={:#x} RIP={:#x} CR2={:#x}",
+                            vmexit_intr_info,
+                            vmread(vmcs::ro::IDT_VECTORING_INFO)?,
+                            vmread(vmcs::guest::RIP)?,
+                            self.guest_cr2
+                        );
                         return Err("VMX exception collided with interrupted event delivery");
                     }
-                    let vmexit_intr_info = vmread(vmcs::ro::VMEXIT_INTERRUPTION_INFO)?;
                     let vector = (vmexit_intr_info & 0xFF) as u32;
                     let has_error_code = (vmexit_intr_info & (1 << 11)) != 0;
 
@@ -659,16 +679,12 @@ impl IntelVCpu {
 
     fn setup_guest_state(&mut self) -> Result<(), &'static str> {
         use x86::{controlregs::*, vmx::vmcs};
-        let cr0 = Cr0::CR0_EXTENSION_TYPE;
-        vmwrite(vmcs::guest::CR0, cr0.bits() as u64)?;
+        let cr0 = super::cr::adjust_cr0(Cr0::CR0_EXTENSION_TYPE.bits() as u64);
+        vmwrite(vmcs::guest::CR0, cr0)?;
         vmwrite(vmcs::guest::CR3, 0)?;
         // VMCLEAR resets the VMCS launch state but does not clear guest-state
         // fields. Never derive boot CR4 from the previous Linux instance.
-        vmwrite(
-            vmcs::guest::CR4,
-            Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits()
-                & !Cr4Flags::PHYSICAL_ADDRESS_EXTENSION.bits(),
-        )?;
+        vmwrite(vmcs::guest::CR4, super::cr::adjust_cr4(0))?;
 
         vmwrite(vmcs::guest::CS_BASE, common::uefi::RESET_VECTOR_CS_BASE)?;
         vmwrite(vmcs::guest::SS_BASE, 0)?;
@@ -1165,6 +1181,7 @@ impl VCpu for IntelVCpu {
         self.guest_fx_state = FxState::guest_default();
         self.host_msr.clear();
         self.guest_msr.clear();
+        self.guest_apic_base = 0xfee0_0900;
         self.ia32e_enabled = false;
         let tsc_khz = interrupt::apic::GUEST_TSC_KHZ
             .get()
@@ -1284,6 +1301,7 @@ impl VCpu for IntelVCpu {
             guest_memory_allocated: 0,
             host_msr,
             guest_msr,
+            guest_apic_base: 0xfee0_0900,
             ia32e_enabled: false,
             pic: super::io::Pic::new(tsc_khz, guest_memory_size),
             io_bitmap: IOBitmap::new(frame_allocator),

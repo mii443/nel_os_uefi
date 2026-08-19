@@ -157,7 +157,10 @@ pub fn setup_exit_controls() -> Result<(), &'static str> {
 
     exit_ctrl.write()?;
 
-    vmwrite(0x4004, 1u64 << x86::irq::INVALID_OPCODE_VECTOR)?;
+    vmwrite(
+        x86::vmx::vmcs::control::EXCEPTION_BITMAP,
+        1u64 << x86::irq::INVALID_OPCODE_VECTOR,
+    )?;
 
     Ok(())
 }

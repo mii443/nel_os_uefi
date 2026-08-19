@@ -68,7 +68,8 @@ fn passthrough_write(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<(), &'static
 pub fn update_ia32e(vcpu: &mut IntelVCpu) -> Result<(), &'static str> {
     let cr0 = vmread(x86::vmx::vmcs::guest::CR0)?;
     let cr4 = vmread(x86::vmx::vmcs::guest::CR4)?;
-    let ia32e_enabled = (cr0 & 1 << 31) != 0 && (cr4 & 1 << 5) != 0;
+    let mut efer = vmread(x86::vmx::vmcs::guest::IA32_EFER_FULL)?;
+    let ia32e_enabled = ia32e_active(cr0, cr4, efer);
 
     vcpu.ia32e_enabled = ia32e_enabled;
 
@@ -76,29 +77,20 @@ pub fn update_ia32e(vcpu: &mut IntelVCpu) -> Result<(), &'static str> {
     entry_ctrl.set_ia32e_mode_guest(ia32e_enabled);
     entry_ctrl.write()?;
 
-    let mut efer = vmread(x86::vmx::vmcs::guest::IA32_EFER_FULL)?;
-
-    let lma = (vcpu.ia32e_enabled as u64) << 10;
-    if lma != 0 {
-        efer |= lma;
+    // LME is software-controlled through WRMSR. LMA is read-only state
+    // derived from LME, CR0.PG, and CR4.PAE.
+    if ia32e_enabled {
+        efer |= 1 << 10;
     } else {
-        efer &= !lma;
+        efer &= !(1 << 10);
     }
-
-    let lme = if cr0 & (1 << 31) != 0 {
-        efer & (1 << 10)
-    } else {
-        efer & !(1 << 8)
-    };
-    if lme != 0 {
-        efer |= lme;
-    } else {
-        efer &= lme;
-    }
-
     vmwrite(x86::vmx::vmcs::guest::IA32_EFER_FULL, efer)?;
 
     Ok(())
+}
+
+fn ia32e_active(cr0: u64, cr4: u64, efer: u64) -> bool {
+    cr0 & (1 << 31) != 0 && cr4 & (1 << 5) != 0 && efer & (1 << 8) != 0
 }
 
 pub fn adjust_cr0(value: u64) -> u64 {
@@ -107,7 +99,11 @@ pub fn adjust_cr0(value: u64) -> u64 {
     let cr0_fixed0 = read_msr(x86::msr::IA32_VMX_CR0_FIXED0);
     let cr0_fixed1 = read_msr(x86::msr::IA32_VMX_CR0_FIXED1);
 
-    result |= cr0_fixed0;
+    // With unrestricted-guest execution, PE and PG are explicitly exempt
+    // from IA32_VMX_CR0_FIXED0. All other required bits (notably NE on older
+    // Intel CPUs) still have to be set for VM entry.
+    let unrestricted_exceptions = (1 << 0) | (1 << 31);
+    result |= cr0_fixed0 & !unrestricted_exceptions;
     result &= cr0_fixed1;
 
     result
@@ -175,7 +171,7 @@ fn get_value(vcpu: &mut IntelVCpu, qual: &QualCr) -> Result<u64, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_cr8;
+    use super::{ia32e_active, validate_cr8};
 
     #[test]
     fn cr8_accepts_all_architectural_priority_values() {
@@ -188,5 +184,13 @@ mod tests {
     fn cr8_rejects_reserved_bits() {
         assert!(validate_cr8(16).is_err());
         assert!(validate_cr8(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn long_mode_requires_paging_pae_and_lme() {
+        assert!(ia32e_active(1 << 31, 1 << 5, 1 << 8));
+        assert!(!ia32e_active(0, 1 << 5, 1 << 8));
+        assert!(!ia32e_active(1 << 31, 0, 1 << 8));
+        assert!(!ia32e_active(1 << 31, 1 << 5, 0));
     }
 }
