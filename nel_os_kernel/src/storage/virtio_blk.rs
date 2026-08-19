@@ -38,9 +38,11 @@ const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 const REQUEST_QUEUE: u16 = 0;
 const REQUEST_HEADER_OFFSET: u64 = 0;
 const REQUEST_DATA_OFFSET: u64 = 512;
-const REQUEST_STATUS_OFFSET: u64 = 1024;
 const SECTOR_SIZE: usize = 512;
 const BUFFER_SIZE: usize = Size4KiB::SIZE as usize;
+const MAX_TRANSFER_BYTES: usize = 64 * 1024;
+const REQUEST_STATUS_OFFSET: u64 = REQUEST_DATA_OFFSET + MAX_TRANSFER_BYTES as u64;
+const REQUEST_MEMORY_BYTES: usize = REQUEST_STATUS_OFFSET as usize + 1;
 const REQUEST_TIMEOUT_MILLIS: usize = 1_000;
 const REQUEST_SPIN_LIMIT: usize = 10_000_000;
 
@@ -191,6 +193,7 @@ pub struct VirtioBlock {
     io_base: u16,
     queue: VirtQueue,
     _request_memory: PhysFrame<Size4KiB>,
+    _request_memory_pages: usize,
     request_address: u64,
     capacity_sectors: u64,
 }
@@ -213,13 +216,18 @@ impl VirtioBlock {
         let queue = VirtQueue::create(io_base, REQUEST_QUEUE, allocator).inspect_err(|_| {
             fail_device(io_base);
         })?;
-        let Some(request_memory) = allocator.allocate_frame() else {
-            fail_device(io_base);
-            return Err("no DMA frame for virtio-blk requests");
-        };
+        let request_memory_pages = REQUEST_MEMORY_BYTES.div_ceil(BUFFER_SIZE);
+        let request_memory =
+            allocate_contiguous(allocator, request_memory_pages).inspect_err(|_| {
+                fail_device(io_base);
+            })?;
         let request_address = request_memory.start_address().as_u64();
         unsafe {
-            core::ptr::write_bytes(request_address as *mut u8, 0, BUFFER_SIZE);
+            core::ptr::write_bytes(
+                request_address as *mut u8,
+                0,
+                request_memory_pages * BUFFER_SIZE,
+            );
         }
 
         let capacity_sectors = read_config_u64(io_base + DEVICE_CONFIG);
@@ -241,6 +249,7 @@ impl VirtioBlock {
             io_base,
             queue,
             _request_memory: request_memory,
+            _request_memory_pages: request_memory_pages,
             request_address,
             capacity_sectors,
         };
@@ -271,20 +280,38 @@ impl VirtioBlock {
         sector: u64,
         output: &mut [u8; SECTOR_SIZE],
     ) -> Result<(), &'static str> {
+        let data = self.read_sectors(sector, 1)?;
+        output.copy_from_slice(data);
+        Ok(())
+    }
+
+    pub const fn max_transfer_sectors(&self) -> usize {
+        MAX_TRANSFER_BYTES / SECTOR_SIZE
+    }
+
+    pub fn read_sectors(
+        &mut self,
+        sector: u64,
+        sector_count: usize,
+    ) -> Result<&[u8], &'static str> {
+        if sector_count == 0 || sector_count > self.max_transfer_sectors() {
+            return Err("virtio-blk read has an invalid transfer size");
+        }
+        let data_length = sector_count
+            .checked_mul(SECTOR_SIZE)
+            .ok_or("virtio-blk read size overflow")?;
         self.submit(
             VIRTIO_BLK_T_IN,
             sector,
             self.request_address + REQUEST_DATA_OFFSET,
-            SECTOR_SIZE as u32,
+            data_length as u32,
         )?;
-        let data = unsafe {
+        Ok(unsafe {
             slice::from_raw_parts(
                 (self.request_address + REQUEST_DATA_OFFSET) as *const u8,
-                SECTOR_SIZE,
+                data_length,
             )
-        };
-        output.copy_from_slice(data);
-        Ok(())
+        })
     }
 
     pub fn write_sector(

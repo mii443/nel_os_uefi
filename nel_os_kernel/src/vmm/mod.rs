@@ -12,7 +12,10 @@ pub mod x86_64;
 
 pub const VCPUS_PER_VM: usize = 1;
 pub const DEFAULT_GUEST_MEMORY_MIB: u32 = 256;
-pub const MIN_GUEST_MEMORY_MIB: u32 = 64;
+// The bundled EFI Linux image needs enough contiguous RAM for the compressed
+// image, its decompressed kernel, initrd, and OVMF allocations at the same
+// time. At 128 MiB the EFI stub fails with EFI_OUT_OF_RESOURCES.
+pub const MIN_GUEST_MEMORY_MIB: u32 = 256;
 pub const MAX_GUEST_MEMORY_MIB: u32 = 768;
 pub const VCPU_TIME_SLICE_MILLIS: u64 = 4;
 pub const MAX_VCPU_HEAP_BYTES: usize = {

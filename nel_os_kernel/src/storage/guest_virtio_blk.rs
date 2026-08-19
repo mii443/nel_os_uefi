@@ -363,7 +363,6 @@ impl GuestVirtioBlock {
         let mut descriptor_id = header.next;
         let mut transferred = 0u32;
         let mut traversed = 1u16;
-        let mut sector_buffer = [0u8; SECTOR_SIZE];
 
         loop {
             if traversed >= QUEUE_SIZE {
@@ -387,24 +386,35 @@ impl GuestVirtioBlock {
                 return Err("guest virtio-blk data descriptor is not sector aligned");
             }
             let sectors = descriptor.length as usize / SECTOR_SIZE;
-            for index in 0..sectors {
-                let address = descriptor.address + (index * SECTOR_SIZE) as u64;
-                match request_type {
-                    0 if descriptor.flags & DESC_F_WRITE != 0 => {
-                        backend.read_sector(sector, &mut sector_buffer)?;
-                        memory.write_slice(address, &sector_buffer)?;
+            match request_type {
+                0 if descriptor.flags & DESC_F_WRITE != 0 => {
+                    let mut index = 0;
+                    while index < sectors {
+                        let count = (sectors - index).min(backend.max_transfer_sectors());
+                        let data = backend.read_sectors(sector, count)?;
+                        memory
+                            .write_slice(descriptor.address + (index * SECTOR_SIZE) as u64, data)?;
+                        index += count;
+                        sector = sector
+                            .checked_add(count as u64)
+                            .ok_or("guest virtio-blk sector overflow")?;
+                        transferred = transferred.saturating_add((count * SECTOR_SIZE) as u32);
                     }
-                    1 if descriptor.flags & DESC_F_WRITE == 0 => {
+                }
+                1 if descriptor.flags & DESC_F_WRITE == 0 => {
+                    let mut sector_buffer = [0u8; SECTOR_SIZE];
+                    for index in 0..sectors {
+                        let address = descriptor.address + (index * SECTOR_SIZE) as u64;
                         memory.read_slice(address, &mut sector_buffer)?;
                         backend.write_sector(sector, &sector_buffer)?;
+                        sector = sector
+                            .checked_add(1)
+                            .ok_or("guest virtio-blk sector overflow")?;
+                        transferred = transferred.saturating_add(SECTOR_SIZE as u32);
                     }
-                    0 | 1 => return Err("guest virtio-blk data descriptor has invalid flags"),
-                    _ => {}
                 }
-                sector = sector
-                    .checked_add(1)
-                    .ok_or("guest virtio-blk sector overflow")?;
-                transferred = transferred.saturating_add(SECTOR_SIZE as u32);
+                0 | 1 => return Err("guest virtio-blk data descriptor has invalid flags"),
+                _ => {}
             }
             descriptor_id = descriptor.next;
         }
