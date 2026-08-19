@@ -37,21 +37,27 @@ Intel hosts can build and run independently. `NEL_OS_LOCAL_CACHE_DIR`,
 ### Host virtio block device
 
 QEMU also gives the outer hypervisor one transitional virtio-blk device. The
-hypervisor initializes its legacy virtqueue and verifies it by reading sector
-0 during boot; the device is not passed through to VM 0. `info runtime` and
-`info all` report its capacity.
+Linux `bzImage` and initramfs used by VM 0 live on this device instead of the
+UEFI ISO. During boot, the outer kernel reads both payloads through its legacy
+virtqueue and then loads them into guest RAM. The block device is retained by
+the hypervisor rather than passed through to VM 0. `info runtime` and `info
+all` report its capacity.
 
-By default, `./run.sh` creates a persistent 64 MiB raw image named
-`host-block.img` in the host-local runtime directory and reuses it on later
-runs. Set `NEL_OS_BLOCK_SIZE_MIB` to choose the initial size, or attach an
-existing raw image explicitly:
+By default, `./run.sh` regenerates a 64 MiB raw boot bundle named
+`host-block.img` in the host-local runtime directory from
+`nel_os_bootloader/bzImage` and `rootfs-n.cpio.gz`. Set
+`NEL_OS_BLOCK_SIZE_MIB` to choose its size. To build and attach another boot
+bundle explicitly:
 
 ```sh
-NEL_OS_BLOCK_IMAGE=/absolute/path/to/disk.img ./run.sh
+./nel_os_bootloader/create-linux-disk.sh /tmp/linux.img 64 \
+    ./nel_os_bootloader/bzImage ./nel_os_bootloader/rootfs-n.cpio.gz
+NEL_OS_BLOCK_IMAGE=/tmp/linux.img ./run.sh
 ```
 
-The explicit image must already exist; the size setting does not resize an
-existing default or explicit image.
+An explicit image must already exist and use the NEL boot-bundle format; it is
+attached without being modified. `NEL_OS_BLOCK_SIZE_MIB` applies only when the
+default bundle is generated.
 
 On a new Ubuntu host, install the host tools and rustup once:
 

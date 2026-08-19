@@ -41,6 +41,7 @@ const REQUEST_DATA_OFFSET: u64 = 512;
 const REQUEST_STATUS_OFFSET: u64 = 1024;
 const SECTOR_SIZE: usize = 512;
 const BUFFER_SIZE: usize = Size4KiB::SIZE as usize;
+const MAX_TRANSFER_SECTORS: u64 = 2048;
 const REQUEST_TIMEOUT_MILLIS: usize = 1_000;
 const REQUEST_SPIN_LIMIT: usize = 10_000_000;
 
@@ -49,6 +50,14 @@ const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+
+const BOOT_IMAGE_MAGIC: &[u8; 8] = b"NELBOOT1";
+const BOOT_IMAGE_FIELD_WIDTH: usize = 16;
+const BOOT_IMAGE_KERNEL_SECTOR_OFFSET: usize = 8;
+const BOOT_IMAGE_KERNEL_SIZE_OFFSET: usize = 24;
+const BOOT_IMAGE_INITRAMFS_SECTOR_OFFSET: usize = 40;
+const BOOT_IMAGE_INITRAMFS_SIZE_OFFSET: usize = 56;
+const MAX_BOOT_COMPONENT_SIZE: u64 = 128 * 1024 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -195,6 +204,13 @@ pub struct VirtioBlock {
     capacity_sectors: u64,
 }
 
+pub struct LinuxBootImage {
+    pub kernel_address: u64,
+    pub kernel_size: u64,
+    pub initramfs_address: u64,
+    pub initramfs_size: u64,
+}
+
 impl VirtioBlock {
     pub fn probe(allocator: &mut dyn FrameAllocator<Size4KiB>) -> Result<Self, &'static str> {
         let pci_address = pci::find_legacy_virtio_block()
@@ -247,15 +263,13 @@ impl VirtioBlock {
         let mut first_sector = [0u8; SECTOR_SIZE];
         device.read_sector(0, &mut first_sector)?;
         info!(
-            "Host virtio-blk at {:02x}:{:02x}.{} I/O {:#x}, {} sectors ({} MiB), sector-0 signature {:02x}{:02x}",
+            "Host virtio-blk at {:02x}:{:02x}.{} I/O {:#x}, {} sectors ({} MiB), sector 0 readable",
             device.pci_address.bus,
             device.pci_address.device,
             device.pci_address.function,
             device.io_base,
             device.capacity_sectors,
             device.capacity_bytes() / 1024 / 1024,
-            first_sector[511],
-            first_sector[510],
         );
         Ok(device)
     }
@@ -273,7 +287,12 @@ impl VirtioBlock {
         sector: u64,
         output: &mut [u8; SECTOR_SIZE],
     ) -> Result<(), &'static str> {
-        self.submit(VIRTIO_BLK_T_IN, sector)?;
+        self.submit(
+            VIRTIO_BLK_T_IN,
+            sector,
+            self.request_address + REQUEST_DATA_OFFSET,
+            SECTOR_SIZE as u32,
+        )?;
         let data = unsafe {
             slice::from_raw_parts(
                 (self.request_address + REQUEST_DATA_OFFSET) as *const u8,
@@ -299,11 +318,106 @@ impl VirtioBlock {
             )
         };
         data.copy_from_slice(input);
-        self.submit(VIRTIO_BLK_T_OUT, sector)
+        self.submit(
+            VIRTIO_BLK_T_OUT,
+            sector,
+            self.request_address + REQUEST_DATA_OFFSET,
+            SECTOR_SIZE as u32,
+        )
     }
 
-    fn submit(&mut self, request_type: u32, sector: u64) -> Result<(), &'static str> {
-        if sector >= self.capacity_sectors {
+    pub fn load_linux_boot_image(
+        &mut self,
+        allocator: &mut dyn FrameAllocator<Size4KiB>,
+    ) -> Result<LinuxBootImage, &'static str> {
+        let mut header = [0u8; SECTOR_SIZE];
+        self.read_sector(0, &mut header)?;
+        if &header[..BOOT_IMAGE_MAGIC.len()] != BOOT_IMAGE_MAGIC {
+            return Err("virtio-blk does not contain a NEL Linux boot image");
+        }
+
+        let kernel_sector = parse_hex_u64(
+            &header[BOOT_IMAGE_KERNEL_SECTOR_OFFSET
+                ..BOOT_IMAGE_KERNEL_SECTOR_OFFSET + BOOT_IMAGE_FIELD_WIDTH],
+        )?;
+        let kernel_size = parse_hex_u64(
+            &header[BOOT_IMAGE_KERNEL_SIZE_OFFSET
+                ..BOOT_IMAGE_KERNEL_SIZE_OFFSET + BOOT_IMAGE_FIELD_WIDTH],
+        )?;
+        let initramfs_sector = parse_hex_u64(
+            &header[BOOT_IMAGE_INITRAMFS_SECTOR_OFFSET
+                ..BOOT_IMAGE_INITRAMFS_SECTOR_OFFSET + BOOT_IMAGE_FIELD_WIDTH],
+        )?;
+        let initramfs_size = parse_hex_u64(
+            &header[BOOT_IMAGE_INITRAMFS_SIZE_OFFSET
+                ..BOOT_IMAGE_INITRAMFS_SIZE_OFFSET + BOOT_IMAGE_FIELD_WIDTH],
+        )?;
+
+        let kernel_end = validate_component(kernel_sector, kernel_size, self.capacity_sectors)?;
+        let initramfs_end =
+            validate_component(initramfs_sector, initramfs_size, self.capacity_sectors)?;
+        if kernel_sector < initramfs_end && initramfs_sector < kernel_end {
+            return Err("Linux boot image components overlap");
+        }
+
+        let kernel_address = allocate_image_buffer(allocator, kernel_size)?;
+        self.load_component(kernel_sector, kernel_size, kernel_address)?;
+        let initramfs_address = allocate_image_buffer(allocator, initramfs_size)?;
+        self.load_component(initramfs_sector, initramfs_size, initramfs_address)?;
+
+        info!(
+            "Loaded Linux from host virtio-blk: kernel {} bytes, initramfs {} bytes",
+            kernel_size, initramfs_size
+        );
+        Ok(LinuxBootImage {
+            kernel_address,
+            kernel_size,
+            initramfs_address,
+            initramfs_size,
+        })
+    }
+
+    fn load_component(
+        &mut self,
+        start_sector: u64,
+        size: u64,
+        destination: u64,
+    ) -> Result<(), &'static str> {
+        let total_sectors = size
+            .checked_add(SECTOR_SIZE as u64 - 1)
+            .ok_or("Linux boot component size overflowed")?
+            / SECTOR_SIZE as u64;
+        let mut transferred_sectors = 0u64;
+        while transferred_sectors < total_sectors {
+            let sectors = (total_sectors - transferred_sectors).min(MAX_TRANSFER_SECTORS);
+            let length = u32::try_from(sectors * SECTOR_SIZE as u64)
+                .map_err(|_| "virtio-blk transfer is too large")?;
+            self.submit(
+                VIRTIO_BLK_T_IN,
+                start_sector + transferred_sectors,
+                destination + transferred_sectors * SECTOR_SIZE as u64,
+                length,
+            )?;
+            transferred_sectors += sectors;
+        }
+        Ok(())
+    }
+
+    fn submit(
+        &mut self,
+        request_type: u32,
+        sector: u64,
+        data_address: u64,
+        data_length: u32,
+    ) -> Result<(), &'static str> {
+        if data_length == 0 || data_length as usize % SECTOR_SIZE != 0 {
+            return Err("virtio-blk transfer is not sector aligned");
+        }
+        let sectors = u64::from(data_length) / SECTOR_SIZE as u64;
+        if sector
+            .checked_add(sectors)
+            .is_none_or(|end| end > self.capacity_sectors)
+        {
             return Err("virtio-blk request is beyond the device capacity");
         }
 
@@ -331,8 +445,8 @@ impl VirtioBlock {
         );
         self.queue.set_descriptor(
             1,
-            self.request_address + REQUEST_DATA_OFFSET,
-            SECTOR_SIZE as u32,
+            data_address,
+            data_length,
             VIRTQ_DESC_F_NEXT
                 | if request_type == VIRTIO_BLK_T_IN {
                     VIRTQ_DESC_F_WRITE
@@ -357,7 +471,12 @@ impl VirtioBlock {
         let start = time::get_ticks();
         for _ in 0..REQUEST_SPIN_LIMIT {
             if let Some(used) = self.queue.pop_used() {
-                if used.id != 0 || used.length > (SECTOR_SIZE + 1) as u32 {
+                let expected_length = if request_type == VIRTIO_BLK_T_IN {
+                    data_length.saturating_add(1)
+                } else {
+                    1
+                };
+                if used.id != 0 || used.length != expected_length {
                     return Err("virtio-blk returned an invalid used descriptor");
                 }
                 let _ = io_read_u8(self.io_base + ISR_STATUS);
@@ -409,6 +528,61 @@ fn allocate_contiguous(
         }
     }
     Err("no contiguous DMA memory for a virtio-blk queue")
+}
+
+fn allocate_image_buffer(
+    allocator: &mut dyn FrameAllocator<Size4KiB>,
+    size: u64,
+) -> Result<u64, &'static str> {
+    let size = usize::try_from(size).map_err(|_| "Linux boot component is too large")?;
+    let pages = size.div_ceil(BUFFER_SIZE);
+    allocate_contiguous(allocator, pages)
+        .map(|frame| frame.start_address().as_u64())
+        .map_err(|_| "no contiguous host memory for a Linux boot component")
+}
+
+fn validate_component(
+    start_sector: u64,
+    size: u64,
+    capacity_sectors: u64,
+) -> Result<u64, &'static str> {
+    if start_sector == 0 || size == 0 {
+        return Err("Linux boot image contains an empty component");
+    }
+    if size > MAX_BOOT_COMPONENT_SIZE {
+        return Err("Linux boot image component exceeds the host limit");
+    }
+    let sectors = size
+        .checked_add(SECTOR_SIZE as u64 - 1)
+        .ok_or("Linux boot image component size overflowed")?
+        / SECTOR_SIZE as u64;
+    let end = start_sector
+        .checked_add(sectors)
+        .ok_or("Linux boot image component range overflowed")?;
+    if end > capacity_sectors {
+        return Err("Linux boot image component exceeds the block device");
+    }
+    Ok(end)
+}
+
+fn parse_hex_u64(bytes: &[u8]) -> Result<u64, &'static str> {
+    let mut value = 0u64;
+    if bytes.len() != BOOT_IMAGE_FIELD_WIDTH {
+        return Err("Linux boot image header has an invalid field width");
+    }
+    for &byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'f' => u64::from(byte - b'a' + 10),
+            b'A'..=b'F' => u64::from(byte - b'A' + 10),
+            _ => return Err("Linux boot image header contains non-hexadecimal data"),
+        };
+        value = value
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or("Linux boot image header value overflowed")?;
+    }
+    Ok(value)
 }
 
 const fn align_up(value: usize, alignment: usize) -> usize {
@@ -463,5 +637,11 @@ mod tests {
             (used_offset + 6 + core::mem::size_of::<UsedElement>() * size).div_ceil(BUFFER_SIZE),
             2
         );
+    }
+
+    #[test]
+    fn parses_boot_image_header_fields() {
+        assert_eq!(parse_hex_u64(b"0000000000da5400"), Ok(14_308_352));
+        assert!(parse_hex_u64(b"00000000000000xz").is_err());
     }
 }

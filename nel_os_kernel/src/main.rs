@@ -182,11 +182,6 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
         info!("Interrupts enabled");
     }
 
-    BZIMAGE_ADDR.call_once(|| boot_info.bzimage_addr);
-    BZIMAGE_SIZE.call_once(|| boot_info.bzimage_size);
-    ROOTFS_ADDR.call_once(|| boot_info.rootfs_addr);
-    ROOTFS_SIZE.call_once(|| boot_info.rootfs_size);
-
     // The first NIC remains owned by the outer kernel for management traffic.
     let network_device = match network::VirtioNet::probe(&mut bitmap_table) {
         Ok(device) => Some(device),
@@ -198,10 +193,24 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
     };
 
     // The transitional virtio-blk function is retained by the outer kernel.
-    // Reading sector zero here verifies the complete legacy virtqueue path
-    // before VT-d switches all non-assigned devices to pass-through contexts.
+    // Load VM boot payloads before VT-d switches all non-assigned devices to
+    // pass-through contexts. The device remains available to the host after
+    // translation is enabled.
     let block_device = match storage::VirtioBlock::probe(&mut bitmap_table) {
-        Ok(device) => Some(device),
+        Ok(mut device) => {
+            match device.load_linux_boot_image(&mut bitmap_table) {
+                Ok(image) => {
+                    BZIMAGE_ADDR.call_once(|| image.kernel_address);
+                    BZIMAGE_SIZE.call_once(|| image.kernel_size);
+                    ROOTFS_ADDR.call_once(|| image.initramfs_address);
+                    ROOTFS_SIZE.call_once(|| image.initramfs_size);
+                }
+                Err(error) => {
+                    error!("Unable to load Linux from host virtio-blk: {}", error);
+                }
+            }
+            Some(device)
+        }
         Err(error) => {
             error!("Hypervisor block device unavailable: {}", error);
             None

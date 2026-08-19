@@ -35,14 +35,22 @@ impl<const N: usize> fmt::Write for StackText<N> {
 
 pub fn load_kernel(vcpu: &mut dyn VCpu) -> Result<(), &'static str> {
     info!("Loading kernel into guest memory");
-    let kernel_addr = BZIMAGE_ADDR.get().unwrap();
-    let kernel_size = BZIMAGE_SIZE.get().unwrap();
+    let kernel_addr = BZIMAGE_ADDR
+        .get()
+        .ok_or("Linux kernel was not loaded from host virtio-blk")?;
+    let kernel_size = BZIMAGE_SIZE
+        .get()
+        .ok_or("Linux kernel size is unavailable")?;
 
     let kernel =
         unsafe { core::slice::from_raw_parts(*kernel_addr as *const u8, *kernel_size as usize) };
 
-    let initrd_addr = crate::ROOTFS_ADDR.get().unwrap();
-    let initrd_size = crate::ROOTFS_SIZE.get().unwrap();
+    let initrd_addr = crate::ROOTFS_ADDR
+        .get()
+        .ok_or("Linux initramfs was not loaded from host virtio-blk")?;
+    let initrd_size = crate::ROOTFS_SIZE
+        .get()
+        .ok_or("Linux initramfs size is unavailable")?;
 
     let initrd =
         unsafe { core::slice::from_raw_parts(*initrd_addr as *const u8, *initrd_size as usize) };

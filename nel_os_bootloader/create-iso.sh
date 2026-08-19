@@ -50,8 +50,6 @@ mmd -i "${FAT_IMAGE}" ::/EFI
 mmd -i "${FAT_IMAGE}" ::/EFI/BOOT
 mcopy -i "${FAT_IMAGE}" "${EFI_BINARY}" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "${FAT_IMAGE}" "${KERNEL_BINARY}" ::/nel_os_kernel.elf
-mcopy -i "${FAT_IMAGE}" "${SOURCE_DIR}/bzImage" ::/bzImage
-mcopy -i "${FAT_IMAGE}" "${SOURCE_DIR}/rootfs-n.cpio.gz" ::/rootfs-n.cpio.gz
 
 mkdir "${ISO_ROOT}"
 cp "${FAT_IMAGE}" "${ISO_ROOT}/fat.img"
