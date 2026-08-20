@@ -5,13 +5,13 @@ use core::{
 };
 
 use x86_64::{
-    PhysAddr,
     instructions::port::Port,
-    structures::paging::{FrameAllocator, PageSize, PhysFrame, Size4KiB},
+    structures::paging::{PageSize, PhysFrame, Size4KiB},
 };
 
 use crate::{
     info,
+    memory::bitmap::BitmapMemoryTable,
     network::pci::{self, PciAddress},
 };
 
@@ -89,7 +89,7 @@ impl VirtQueue {
     fn create(
         io_base: u16,
         index: u16,
-        allocator: &mut dyn FrameAllocator<Size4KiB>,
+        allocator: &mut BitmapMemoryTable,
     ) -> Result<Self, &'static str> {
         io_write_u16(io_base + QUEUE_SELECT, index);
         let size = io_read_u16(io_base + QUEUE_SIZE);
@@ -101,7 +101,9 @@ impl VirtQueue {
         let used_offset = align_up(available_offset + 6 + 2 * size as usize, BUFFER_SIZE);
         let bytes = used_offset + 6 + core::mem::size_of::<UsedElement>() * size as usize;
         let pages = bytes.div_ceil(BUFFER_SIZE);
-        let memory = allocate_contiguous(allocator, pages)?;
+        let memory = allocator
+            .allocate_contiguous_frames(pages, 1)
+            .ok_or("no contiguous DMA memory for a virtio-blk queue")?;
         let physical = memory.start_address().as_u64();
         if physical >> 12 > u32::MAX as u64 {
             return Err("virtio-blk queue memory is above its 44-bit DMA limit");
@@ -200,7 +202,7 @@ pub struct VirtioBlock {
 
 impl VirtioBlock {
     pub fn probe_nth(
-        allocator: &mut dyn FrameAllocator<Size4KiB>,
+        allocator: &mut BitmapMemoryTable,
         index: usize,
     ) -> Result<Option<Self>, &'static str> {
         let Some(pci_address) = pci::find_nth_legacy_virtio_block(index) else {
@@ -210,7 +212,7 @@ impl VirtioBlock {
     }
 
     fn probe_at(
-        allocator: &mut dyn FrameAllocator<Size4KiB>,
+        allocator: &mut BitmapMemoryTable,
         pci_address: PciAddress,
     ) -> Result<Self, &'static str> {
         let io_base = pci::io_bar(pci_address).ok_or("virtio-blk has no legacy I/O BAR")?;
@@ -228,8 +230,10 @@ impl VirtioBlock {
             fail_device(io_base);
         })?;
         let request_memory_pages = REQUEST_MEMORY_BYTES.div_ceil(BUFFER_SIZE);
-        let request_memory =
-            allocate_contiguous(allocator, request_memory_pages).inspect_err(|_| {
+        let request_memory = allocator
+            .allocate_contiguous_frames(request_memory_pages, 1)
+            .ok_or("no contiguous DMA memory for virtio-blk requests")
+            .inspect_err(|_| {
                 fail_device(io_base);
             })?;
         let request_address = request_memory.start_address().as_u64();
@@ -489,31 +493,6 @@ impl Drop for VirtioBlock {
     fn drop(&mut self) {
         io_write_u8(self.io_base + DEVICE_STATUS, 0);
     }
-}
-
-fn allocate_contiguous(
-    allocator: &mut dyn FrameAllocator<Size4KiB>,
-    pages: usize,
-) -> Result<PhysFrame<Size4KiB>, &'static str> {
-    let mut run_start = None;
-    let mut run_length = 0usize;
-    while let Some(frame) = allocator.allocate_frame() {
-        let address = frame.start_address().as_u64();
-        match run_start {
-            Some(start) if address == start + run_length as u64 * Size4KiB::SIZE => {
-                run_length += 1;
-            }
-            _ => {
-                run_start = Some(address);
-                run_length = 1;
-            }
-        }
-        if run_length == pages {
-            return PhysFrame::from_start_address(PhysAddr::new(run_start.unwrap()))
-                .map_err(|_| "virtio-blk DMA allocation was not page aligned");
-        }
-    }
-    Err("no contiguous DMA memory for a virtio-blk queue")
 }
 
 const fn align_up(value: usize, alignment: usize) -> usize {

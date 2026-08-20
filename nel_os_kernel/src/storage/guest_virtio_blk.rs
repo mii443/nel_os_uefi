@@ -16,11 +16,16 @@ const VIRTIO_BLOCK_DEVICE_ID: u16 = 0x1001;
 const QUEUE_SIZE: u16 = 128;
 const SECTOR_SIZE: usize = 512;
 const STATUS_DRIVER_OK: u8 = 4;
+const STATUS_FAILED: u8 = 128;
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 const VIRTIO_BLK_T_GET_ID: u32 = 8;
 const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 const DEVICE_ID: &[u8] = b"NEL_OS_DISK";
+// Keep device emulation cooperative: guest-controlled queues are serviced in
+// small batches and resumed before the next guest entry.
+const MAX_REQUESTS_PER_SERVICE: u16 = 1;
+const MAX_TRANSFER_BYTES: u64 = 16 * 1024 * 1024;
 
 pub trait GuestMemory {
     fn read_u8(&mut self, address: u64) -> Result<u8, &'static str>;
@@ -54,14 +59,20 @@ pub trait GuestMemory {
 
     fn read_slice(&mut self, address: u64, output: &mut [u8]) -> Result<(), &'static str> {
         for (offset, byte) in output.iter_mut().enumerate() {
-            *byte = self.read_u8(address + offset as u64)?;
+            let address = address
+                .checked_add(offset as u64)
+                .ok_or("guest memory read address overflow")?;
+            *byte = self.read_u8(address)?;
         }
         Ok(())
     }
 
     fn write_slice(&mut self, address: u64, input: &[u8]) -> Result<(), &'static str> {
         for (offset, &byte) in input.iter().enumerate() {
-            self.write_u8(address + offset as u64, byte)?;
+            let address = address
+                .checked_add(offset as u64)
+                .ok_or("guest memory write address overflow")?;
+            self.write_u8(address, byte)?;
         }
         Ok(())
     }
@@ -357,6 +368,14 @@ impl GuestVirtioBlock {
         Ok(())
     }
 
+    pub fn service_pending<M: GuestMemory>(
+        &mut self,
+        memory: &mut M,
+        backend: &mut VirtioBlock,
+    ) -> Result<(), &'static str> {
+        self.process_queue(memory, backend)
+    }
+
     fn process_queue<M: GuestMemory>(
         &mut self,
         memory: &mut M,
@@ -369,7 +388,14 @@ impl GuestVirtioBlock {
         let available = base + u64::from(QUEUE_SIZE) * 16;
         let used = align_up(available + 6 + u64::from(QUEUE_SIZE) * 2, 4096);
         let available_index = memory.read_u16(available + 2)?;
-        while self.last_available_index != available_index {
+        let pending = available_index.wrapping_sub(self.last_available_index);
+        if pending > QUEUE_SIZE {
+            self.device_status |= STATUS_FAILED;
+            return Err("guest virtio-blk available index exceeds the queue size");
+        }
+
+        let request_count = pending.min(MAX_REQUESTS_PER_SERVICE);
+        for _ in 0..request_count {
             let slot = self.last_available_index % QUEUE_SIZE;
             let head = memory.read_u16(available + 4 + u64::from(slot) * 2)?;
             let written = self.process_request(base, head, memory, backend)?;
@@ -381,7 +407,7 @@ impl GuestVirtioBlock {
             memory.write_u16(used + 2, used_index.wrapping_add(1))?;
             self.last_available_index = self.last_available_index.wrapping_add(1);
         }
-        if memory.read_u16(available)? & VRING_AVAIL_F_NO_INTERRUPT == 0 {
+        if request_count != 0 && memory.read_u16(available)? & VRING_AVAIL_F_NO_INTERRUPT == 0 {
             self.isr_status |= 1;
             self.interrupt_pending = true;
             self.msi_signaled = false;
@@ -407,7 +433,11 @@ impl GuestVirtioBlock {
         }
         let request_type = memory.read_u32(header.address)?;
         let request_supported = matches!(request_type, 0 | 1 | VIRTIO_BLK_T_GET_ID);
-        let mut sector = memory.read_u64(header.address + 8)?;
+        let sector_address = header
+            .address
+            .checked_add(8)
+            .ok_or("guest virtio-blk header address overflow")?;
+        let mut sector = memory.read_u64(sector_address)?;
         let mut descriptor_id = header.next;
         let mut traversed = 1u16;
         let mut data_descriptors = [Descriptor {
@@ -452,6 +482,9 @@ impl GuestVirtioBlock {
         if matches!(request_type, 0 | 1) && data_length % SECTOR_SIZE as u64 != 0 {
             return Err("guest virtio-blk transfer is not sector aligned");
         }
+        if data_length > MAX_TRANSFER_BYTES {
+            return Err("guest virtio-blk transfer exceeds the service limit");
+        }
         let transferred =
             u32::try_from(data_length).map_err(|_| "guest virtio-blk transfer is too large")?;
 
@@ -460,7 +493,11 @@ impl GuestVirtioBlock {
             for descriptor in &data_descriptors[..data_descriptor_count] {
                 for offset in 0..descriptor.length as usize {
                     let value = DEVICE_ID.get(id_offset).copied().unwrap_or(0);
-                    memory.write_u8(descriptor.address + offset as u64, value)?;
+                    let address = descriptor
+                        .address
+                        .checked_add(offset as u64)
+                        .ok_or("guest virtio-blk data address overflow")?;
+                    memory.write_u8(address, value)?;
                     id_offset = id_offset.saturating_add(1);
                 }
             }
@@ -483,10 +520,11 @@ impl GuestVirtioBlock {
                         continue;
                     }
                     let count = descriptor_remaining.min(data.len() - data_offset);
-                    memory.write_slice(
-                        descriptor.address + descriptor_offset as u64,
-                        &data[data_offset..data_offset + count],
-                    )?;
+                    let address = descriptor
+                        .address
+                        .checked_add(descriptor_offset as u64)
+                        .ok_or("guest virtio-blk data address overflow")?;
+                    memory.write_slice(address, &data[data_offset..data_offset + count])?;
                     descriptor_offset += count;
                     data_offset += count;
                     if descriptor_offset == descriptor.length as usize {
@@ -507,8 +545,12 @@ impl GuestVirtioBlock {
                 while descriptor_offset < descriptor.length as usize {
                     let count = (descriptor.length as usize - descriptor_offset)
                         .min(SECTOR_SIZE - sector_offset);
+                    let address = descriptor
+                        .address
+                        .checked_add(descriptor_offset as u64)
+                        .ok_or("guest virtio-blk data address overflow")?;
                     memory.read_slice(
-                        descriptor.address + descriptor_offset as u64,
+                        address,
                         &mut sector_buffer[sector_offset..sector_offset + count],
                     )?;
                     descriptor_offset += count;

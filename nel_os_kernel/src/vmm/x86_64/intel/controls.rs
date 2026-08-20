@@ -7,7 +7,13 @@ const VMX_PREEMPTION_TIMER: u32 = 1 << 6;
 const CR8_LOAD_EXITING: u32 = 1 << 19;
 const CR8_STORE_EXITING: u32 = 1 << 20;
 const MOV_DR_EXITING: u32 = 1 << 23;
+const ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 const ENABLE_RDTSCP: u32 = 1 << 3;
+const ENABLE_EPT: u32 = 1 << 1;
+const UNRESTRICTED_GUEST: u32 = 1 << 7;
+const EPT_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
+const EPT_MEMORY_TYPE_WB: u64 = 1 << 14;
+const EPT_ACCESSED_DIRTY: u64 = 1 << 21;
 
 fn apply_vmx_fixed_bits(value: u32, capability_msr: u64) -> u32 {
     let must_be_one = capability_msr as u32;
@@ -36,7 +42,52 @@ pub fn preemption_timer_ticks(tsc_khz: u64, slice_millis: u64, timer_shift: u8) 
     ticks.min(u32::MAX as u64) as u32
 }
 
+pub fn required_capabilities_supported() -> Result<(), &'static str> {
+    let basic_msr = common::read_msr(0x480);
+    let pin_capabilities = if basic_msr & (1 << 55) != 0 {
+        common::read_msr(0x48d)
+    } else {
+        common::read_msr(0x481)
+    };
+    require_allowed_one(
+        pin_capabilities,
+        VMX_PREEMPTION_TIMER,
+        "VMX preemption timer is required but unsupported",
+    )?;
+
+    let primary_capabilities = if basic_msr & (1 << 55) != 0 {
+        common::read_msr(0x48e)
+    } else {
+        common::read_msr(0x482)
+    };
+    require_allowed_one(
+        primary_capabilities,
+        ACTIVATE_SECONDARY_CONTROLS,
+        "secondary VM-execution controls are required but unsupported",
+    )?;
+
+    let secondary_capabilities = common::read_msr(x86::msr::IA32_VMX_PROCBASED_CTLS2);
+    require_allowed_one(
+        secondary_capabilities,
+        ENABLE_EPT | UNRESTRICTED_GUEST,
+        "EPT and unrestricted guest execution are required but unsupported",
+    )?;
+
+    let ept_capabilities = common::read_msr(x86::msr::IA32_VMX_EPT_VPID_CAP);
+    if ept_capabilities & (EPT_PAGE_WALK_LENGTH_4 | EPT_MEMORY_TYPE_WB)
+        != EPT_PAGE_WALK_LENGTH_4 | EPT_MEMORY_TYPE_WB
+    {
+        return Err("4-level write-back EPT is required but unsupported");
+    }
+    Ok(())
+}
+
+pub fn ept_accessed_dirty_supported() -> bool {
+    common::read_msr(x86::msr::IA32_VMX_EPT_VPID_CAP) & EPT_ACCESSED_DIRTY != 0
+}
+
 pub fn setup_exec_controls() -> Result<u8, &'static str> {
+    required_capabilities_supported()?;
     let basic_msr = common::read_msr(0x480);
     // VMCS fields are architecturally undefined after VMCLEAR. Build every
     // control value from the capability MSR rather than preserving whatever
@@ -70,8 +121,8 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
     };
     require_allowed_one(
         primary_capabilities,
-        CR8_LOAD_EXITING | CR8_STORE_EXITING,
-        "CR8 load/store exiting is required but unsupported",
+        CR8_LOAD_EXITING | CR8_STORE_EXITING | ACTIVATE_SECONDARY_CONTROLS,
+        "required primary VM-execution controls are unsupported",
     )?;
     require_allowed_one(
         primary_capabilities,
@@ -100,6 +151,11 @@ pub fn setup_exec_controls() -> Result<u8, &'static str> {
     } else {
         0
     };
+    require_allowed_one(
+        secondary_capabilities,
+        ENABLE_EPT | UNRESTRICTED_GUEST,
+        "EPT and unrestricted guest execution are required but unsupported",
+    )?;
     raw_secondary_exec_ctrl = apply_vmx_fixed_bits(raw_secondary_exec_ctrl, secondary_capabilities);
 
     let mut secondary_exec_ctrl =

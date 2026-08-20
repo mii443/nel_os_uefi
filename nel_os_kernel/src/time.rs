@@ -2,10 +2,14 @@ use core::arch::asm;
 use core::sync::atomic::AtomicUsize;
 
 pub static TICKS: AtomicUsize = AtomicUsize::new(0);
+const HOST_TIMER_PERIOD_MILLIS: usize = 4;
 
 #[inline(always)]
 pub fn tick() {
-    TICKS.fetch_add(1, core::sync::atomic::Ordering::Release);
+    TICKS.fetch_add(
+        HOST_TIMER_PERIOD_MILLIS,
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 #[inline(always)]

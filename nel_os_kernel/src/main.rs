@@ -109,8 +109,6 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
         max_range = max_range.max(range.end);
     }
     info!("Usable memory: {}MiB", count / 1024 / 1024);
-    memory::bitmap::MAX_MEMORY.call_once(|| max_range as usize * 2);
-
     let mut bitmap_table = BitmapMemoryTable::init(&boot_info.usable_memory);
     info!(
         "Memory bitmap initialized: {} -> {}",
@@ -127,7 +125,8 @@ pub extern "sysv64" fn main(boot_info: &nel_os_common::BootInfo) -> ! {
     info!("Usable memory in bitmap: {}MiB", usable_frame * 4 / 1024);
 
     let mut mapper = {
-        let lv4_table_ptr = paging::init_page_table(&mut bitmap_table);
+        let lv4_table_ptr = paging::init_page_table(&mut bitmap_table, max_range)
+            .expect("failed to build the physical direct map");
         let lv4_table = unsafe { &mut *lv4_table_ptr };
         unsafe { OffsetPageTable::new(lv4_table, VirtAddr::new(0x0)) }
     };

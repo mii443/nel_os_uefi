@@ -20,9 +20,14 @@ impl Vmcb {
         Ok(Vmcb { frame })
     }
 
-    pub fn get_raw_vmcb(&self) -> &mut RawVmcb {
+    pub fn get_raw_vmcb(&mut self) -> &mut RawVmcb {
         let ptr = self.frame.start_address().as_u64() as *mut RawVmcb;
         unsafe { &mut *ptr }
+    }
+
+    pub fn get_raw_vmcb_readonly(&self) -> &RawVmcb {
+        let ptr = self.frame.start_address().as_u64() as *const RawVmcb;
+        unsafe { &*ptr }
     }
 }
 

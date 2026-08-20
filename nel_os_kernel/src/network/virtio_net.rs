@@ -1,16 +1,17 @@
 use core::{
+    arch::x86_64::_rdrand64_step,
     ptr::{read_volatile, write_volatile},
     slice,
     sync::atomic::{Ordering, fence},
 };
 
+use raw_cpuid::cpuid;
 use x86_64::{
-    PhysAddr,
     instructions::port::Port,
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size4KiB},
 };
 
-use crate::{info, time, warn};
+use crate::{info, memory::bitmap::BitmapMemoryTable, time, warn};
 
 use super::{
     ManagementCommand,
@@ -82,7 +83,7 @@ impl VirtQueue {
     fn create(
         io_base: u16,
         index: u16,
-        allocator: &mut dyn FrameAllocator<Size4KiB>,
+        allocator: &mut BitmapMemoryTable,
     ) -> Result<Self, &'static str> {
         io_write_u16(io_base + QUEUE_SELECT, index);
         let size = io_read_u16(io_base + QUEUE_SIZE);
@@ -94,7 +95,9 @@ impl VirtQueue {
         let used_offset = align_up(available_offset + 6 + 2 * size as usize, BUFFER_SIZE);
         let bytes = used_offset + 6 + core::mem::size_of::<UsedElement>() * size as usize;
         let pages = bytes.div_ceil(BUFFER_SIZE);
-        let memory = allocate_contiguous(allocator, pages)?;
+        let memory = allocator
+            .allocate_contiguous_frames(pages, 1)
+            .ok_or("no contiguous DMA memory for a virtio-net queue")?;
         let physical = memory.start_address().as_u64();
         if physical >> 12 > u32::MAX as u64 {
             return Err("virtio legacy queue memory is above its 44-bit DMA limit");
@@ -209,7 +212,7 @@ pub struct VirtioNet {
 }
 
 impl VirtioNet {
-    pub fn probe(allocator: &mut dyn FrameAllocator<Size4KiB>) -> Result<Self, &'static str> {
+    pub fn probe(allocator: &mut BitmapMemoryTable) -> Result<Self, &'static str> {
         let pci_address = pci::find_legacy_virtio_net()
             .ok_or("no transitional virtio-net PCI device was found")?;
         let io_base = pci::io_bar(pci_address).ok_or("virtio-net has no legacy I/O BAR")?;
@@ -274,6 +277,16 @@ impl VirtioNet {
         fence(Ordering::SeqCst);
         receive.notify(io_base);
 
+        let mut stack = NetworkStack::new(mac);
+        if let Some(token) = generate_management_token() {
+            stack.require_management_auth(token);
+            let token = unsafe { core::str::from_utf8_unchecked(&token) };
+            info!("Management authentication token: {}", token);
+        } else {
+            stack.disable_remote_management();
+            warn!("RDRAND unavailable; remote TCP/UDP management is disabled");
+        }
+
         let device = Self {
             pci_address,
             io_base,
@@ -286,7 +299,7 @@ impl VirtioNet {
             pending_transmit: [0; MAX_ETHERNET_FRAME],
             pending_transmit_len: 0,
             dropped_transmits: 0,
-            stack: NetworkStack::new(mac),
+            stack,
         };
         info!(
             "Host-only virtio-net at {:02x}:{:02x}.{} I/O {:#x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -548,29 +561,31 @@ impl Drop for VirtioNet {
     }
 }
 
-fn allocate_contiguous(
-    allocator: &mut dyn FrameAllocator<Size4KiB>,
-    pages: usize,
-) -> Result<PhysFrame<Size4KiB>, &'static str> {
-    let mut run_start = None;
-    let mut run_length = 0usize;
-    while let Some(frame) = allocator.allocate_frame() {
-        let address = frame.start_address().as_u64();
-        match run_start {
-            Some(start) if address == start + run_length as u64 * Size4KiB::SIZE => {
-                run_length += 1;
-            }
-            _ => {
-                run_start = Some(address);
-                run_length = 1;
+fn generate_management_token() -> Option<super::management::AuthToken> {
+    if cpuid!(1, 0).ecx & (1 << 30) == 0 {
+        return None;
+    }
+    let mut entropy = [0u64; 2];
+    for word in &mut entropy {
+        let mut generated = false;
+        for _ in 0..16 {
+            if unsafe { _rdrand64_step(word) } == 1 {
+                generated = true;
+                break;
             }
         }
-        if run_length == pages {
-            return PhysFrame::from_start_address(PhysAddr::new(run_start.unwrap()))
-                .map_err(|_| "virtio-net DMA allocation was not page aligned");
+        if !generated {
+            return None;
         }
     }
-    Err("no contiguous DMA memory for a virtio-net queue")
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = [0u8; 32];
+    for (index, byte) in entropy.into_iter().flat_map(u64::to_le_bytes).enumerate() {
+        token[index * 2] = HEX[(byte >> 4) as usize];
+        token[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    Some(token)
 }
 
 const fn align_up(value: usize, alignment: usize) -> usize {

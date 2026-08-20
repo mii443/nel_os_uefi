@@ -8,8 +8,10 @@ use crate::vmm::x86_64::common::cpuid::{
     hypervisor_vendor_leaf,
 };
 use crate::vmm::x86_64::intel::vcpu::IntelVCpu;
+use crate::vmm::x86_64::intel::vmread;
 
 pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
+    let guest_osxsave = vmread(x86::vmx::vmcs::guest::CR4).unwrap_or(0) & (1 << 18) != 0;
     let regs = &mut vcpu.guest_registers;
 
     let brand_string: &[u8; 48] = b"mii Hypervisor CPU on Intel VT-x               \0";
@@ -64,6 +66,10 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
         }
         VmxLeaf::EXTENDED_ENUMERATION => match regs.rcx {
             0 => {
+                if cpuid!(0x1, 0).ecx & (1 << 26) == 0 {
+                    invalid(vcpu);
+                    return;
+                }
                 regs.rax = 0b11;
                 regs.rbx = 576;
                 regs.rcx = 576;
@@ -162,7 +168,7 @@ pub fn handle_cpuid_vmexit(vcpu: &mut IntelVCpu) {
         }
         VmxLeaf::VERSION_AND_FEATURE_INFO => {
             let version_and_feature_info = cpuid!(0x1, 0);
-            let ecx = guest_leaf1_ecx(version_and_feature_info.ecx);
+            let ecx = guest_leaf1_ecx(version_and_feature_info.ecx, guest_osxsave);
 
             let edx = guest_leaf1_edx();
 
@@ -221,17 +227,17 @@ fn guest_extended_feature_edx(host_edx: u32) -> u32 {
     }
 }
 
-fn guest_leaf1_ecx(host_ecx: u32) -> u32 {
+fn guest_leaf1_ecx(host_ecx: u32, guest_osxsave: bool) -> u32 {
     FeatureInfoEcx::new()
-        .with_pcid(true)
-        .with_sse4_1(true)
-        .with_sse4_2(true)
+        .with_pcid(host_ecx & (1 << 17) != 0)
+        .with_sse4_1(host_ecx & (1 << 19) != 0)
+        .with_sse4_2(host_ecx & (1 << 20) != 0)
         // x2APIC MSR exits provide exact timer reads and writes. A shared
         // xAPIC page cannot represent a counter that changes while the guest
         // is running and causes Linux timer calibration to drift badly.
-        .with_x2apic(true)
-        .with_xsave(true)
-        .with_osxsave(true)
+        .with_x2apic(host_ecx & (1 << 21) != 0)
+        .with_xsave(host_ecx & (1 << 26) != 0)
+        .with_osxsave(host_ecx & (1 << 27) != 0 && guest_osxsave)
         .with_rdrand(host_ecx & (1 << 30) != 0)
         .with_hypervisor(true)
         .into()
@@ -434,15 +440,22 @@ mod tests {
 
     #[test]
     fn native_random_features_follow_the_host() {
-        assert_eq!(guest_leaf1_ecx(0) & (1 << 30), 0);
-        assert_ne!(guest_leaf1_ecx(1 << 30) & (1 << 30), 0);
+        assert_eq!(guest_leaf1_ecx(0, false) & (1 << 30), 0);
+        assert_ne!(guest_leaf1_ecx(1 << 30, false) & (1 << 30), 0);
         assert_eq!(guest_leaf7_ebx(0) & (1 << 18), 0);
         assert_ne!(guest_leaf7_ebx(1 << 18) & (1 << 18), 0);
     }
 
     #[test]
     fn leaf1_identifies_a_hypervisor() {
-        assert_ne!(guest_leaf1_ecx(0) & (1 << 31), 0);
+        assert_ne!(guest_leaf1_ecx(0, false) & (1 << 31), 0);
+    }
+
+    #[test]
+    fn osxsave_requires_host_support_and_guest_cr4_enablement() {
+        assert_eq!(guest_leaf1_ecx(1 << 27, false) & (1 << 27), 0);
+        assert_eq!(guest_leaf1_ecx(0, true) & (1 << 27), 0);
+        assert_ne!(guest_leaf1_ecx(1 << 27, true) & (1 << 27), 0);
     }
 
     #[test]

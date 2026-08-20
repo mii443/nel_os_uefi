@@ -474,11 +474,11 @@ pub struct Eptp {
 }
 
 impl Eptp {
-    pub fn init(lv4_table: &PhysFrame) -> Self {
+    pub fn init(lv4_table: &PhysFrame, dirty_accessed: bool) -> Self {
         Eptp::new()
             .with_typ(6)
             .with_level(3)
-            .with_dirty_accessed(true)
+            .with_dirty_accessed(dirty_accessed)
             .with_enforce_access_rights(false)
             .with_phys(lv4_table.start_address().as_u64() >> 12)
     }

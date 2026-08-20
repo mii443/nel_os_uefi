@@ -41,6 +41,8 @@ use crate::{
         },
     },
 };
+
+const MAX_FW_CFG_STRING_IO_BYTES: u64 = 64 * 1024;
 const TEMP_STACK_SIZE: usize = 4096;
 const GUEST_MEMORY_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 static mut TEMP_STACK: [u8; TEMP_STACK_SIZE + 0x10] = [0; TEMP_STACK_SIZE + 0x10];
@@ -230,7 +232,8 @@ impl IntelVCpu {
                             } else {
                                 1
                             };
-                            if count > self.guest_memory_size {
+                            if count > self.guest_memory_size || count > MAX_FW_CFG_STRING_IO_BYTES
+                            {
                                 Err("Intel guest fw_cfg transfer is too large")
                             } else {
                                 let es_base = vmread(vmcs::guest::ES_BASE)?;
@@ -739,7 +742,10 @@ impl IntelVCpu {
             }
         }
 
-        let eptp = ept::Eptp::init(&self.ept.root_table);
+        let eptp = ept::Eptp::init(
+            &self.ept.root_table,
+            controls::ept_accessed_dirty_supported(),
+        );
         vmwrite(x86::vmx::vmcs::control::EPTP_FULL, u64::from(eptp))?;
 
         Ok(())
@@ -1277,9 +1283,12 @@ impl VCpu for IntelVCpu {
     fn run(
         &mut self,
         frame_allocator: &mut BitmapMemoryTable,
-        block: Option<&mut VirtioBlock>,
+        mut block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str> {
         self.prepare(frame_allocator)?;
+        if let Some(device) = block.as_deref_mut() {
+            self.guest_block.service_pending(&mut self.ept, device)?;
+        }
         // A different VM may have made its VMCS current since this VM's
         // previous time slice (or since this VM was created).
         self.vmcs.load()?;
@@ -1495,7 +1504,7 @@ impl VCpu for IntelVCpu {
         let vmcs = vmcs::Vmcs::new(frame_allocator)?;
 
         let ept = ept::Ept::new(frame_allocator)?;
-        let eptp = ept::Eptp::init(&ept.root_table);
+        let eptp = ept::Eptp::init(&ept.root_table, controls::ept_accessed_dirty_supported());
         let host_xsave_state = HostXsaveState::new(frame_allocator)?;
         let host_xsave_addr = host_xsave_state.addr();
         let host_xsave_mask = host_xsave_state.mask();
@@ -1567,6 +1576,13 @@ impl VCpu for IntelVCpu {
         let msr = common::read_msr(0x3a);
         if msr & (1 << 2) == 0 && msr & 1 != 0 {
             info!("VMX is not enabled in the BIOS");
+            return false;
+        }
+        if let Err(error) = controls::required_capabilities_supported() {
+            info!(
+                "Intel virtualization requirements are unavailable: {}",
+                error
+            );
             return false;
         }
         true

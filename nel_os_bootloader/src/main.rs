@@ -40,10 +40,17 @@ fn read_file(name: &CStr16) -> Box<[u8]> {
         .unwrap();
     let mut file = file_info.into_regular_file().unwrap();
 
-    let file_size = file.get_boxed_info::<FileInfo>().unwrap().file_size();
-    let mut buf = vec![0; file_size as usize];
-
-    let read_size = file.read(&mut buf).unwrap();
+    let file_size = usize::try_from(file.get_boxed_info::<FileInfo>().unwrap().file_size())
+        .expect("File is too large for this platform");
+    let mut buf = vec![0; file_size];
+    let mut read_size = 0;
+    while read_size < buf.len() {
+        let count = file
+            .read(&mut buf[read_size..])
+            .expect("Failed to read file");
+        assert!(count != 0, "File ended before its reported size");
+        read_size = read_size.checked_add(count).expect("File size overflow");
+    }
     println!("file {} size: {}", name, read_size);
 
     buf.into_boxed_slice()
@@ -61,6 +68,8 @@ fn load_file_to_loader_data(name: &CStr16) -> (u64, u64) {
         .get_boxed_info::<FileInfo>()
         .expect("Failed to get file info")
         .file_size();
+    assert!(file_size != 0, "Guest firmware is empty");
+    let file_size_usize = usize::try_from(file_size).expect("Guest firmware is too large");
     let page_ptr = uefi::boot::allocate_pages(
         AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
@@ -68,50 +77,149 @@ fn load_file_to_loader_data(name: &CStr16) -> (u64, u64) {
     )
     .expect("Failed to allocate pages")
     .as_ptr();
-    let buffer = unsafe { slice::from_raw_parts_mut(page_ptr, file_size as usize) };
-    let read_size = file.read(buffer).expect("Failed to read file");
+    let buffer = unsafe { slice::from_raw_parts_mut(page_ptr, file_size_usize) };
+    let mut read_size = 0;
+    while read_size < buffer.len() {
+        let count = file
+            .read(&mut buffer[read_size..])
+            .expect("Failed to read guest firmware");
+        assert!(count != 0, "Guest firmware ended before its reported size");
+        read_size = read_size
+            .checked_add(count)
+            .expect("Guest firmware size overflow");
+    }
     println!("file {} size: {}", name, read_size);
     (page_ptr as u64, file_size)
 }
 
 fn load_elf(bin: Box<[u8]>) -> u64 {
     let elf = elf::Elf::parse(&bin).expect("Failed to parse elf");
+    assert!(elf.is_64, "Kernel must be a 64-bit ELF image");
+    assert!(elf.little_endian, "Kernel ELF must be little-endian");
+    assert!(
+        elf.header.e_type == elf::header::ET_EXEC,
+        "Kernel ELF must be an executable image"
+    );
+    assert!(
+        elf.header.e_machine == elf::header::EM_X86_64,
+        "Kernel ELF is not x86-64"
+    );
     let mut dest_start = u64::MAX;
     let mut dest_end = 0u64;
+    let mut load_segments = 0usize;
+    let mut entry_is_executable = false;
 
-    elf.program_headers
-        .iter()
-        .filter(|header| header.p_type == elf::program_header::PT_LOAD)
-        .for_each(|header| {
-            dest_start = dest_start.min(header.p_vaddr);
-            dest_end = dest_end.max(header.p_vaddr + header.p_memsz);
-        });
+    for (index, header) in elf.program_headers.iter().enumerate() {
+        if header.p_type != elf::program_header::PT_LOAD {
+            continue;
+        }
+        load_segments += 1;
+        assert!(
+            header.p_filesz <= header.p_memsz,
+            "ELF segment file size exceeds memory size"
+        );
+        let file_end = header
+            .p_offset
+            .checked_add(header.p_filesz)
+            .expect("ELF segment file range overflow");
+        assert!(
+            file_end <= bin.len() as u64,
+            "ELF segment exceeds the kernel file"
+        );
+        let memory_end = header
+            .p_vaddr
+            .checked_add(header.p_memsz)
+            .expect("ELF segment memory range overflow");
+        assert!(
+            memory_end <= 1u64 << 47,
+            "Kernel ELF is outside physical address space"
+        );
+        assert!(
+            header.p_align == 0 || header.p_align.is_power_of_two(),
+            "Invalid ELF alignment"
+        );
+        if header.p_align > 1 {
+            assert!(
+                header.p_vaddr % header.p_align == header.p_offset % header.p_align,
+                "ELF segment file and memory alignment disagree"
+            );
+        }
+        assert!(
+            header.p_flags & (elf::program_header::PF_W | elf::program_header::PF_X)
+                != elf::program_header::PF_W | elf::program_header::PF_X,
+            "Writable and executable ELF segments are rejected"
+        );
+        for previous in elf.program_headers[..index]
+            .iter()
+            .filter(|previous| previous.p_type == elf::program_header::PT_LOAD)
+        {
+            let previous_end = previous
+                .p_vaddr
+                .checked_add(previous.p_memsz)
+                .expect("ELF segment memory range overflow");
+            assert!(
+                header.p_memsz == 0
+                    || previous.p_memsz == 0
+                    || memory_end <= previous.p_vaddr
+                    || previous_end <= header.p_vaddr,
+                "ELF load segments overlap"
+            );
+        }
+        if header.p_flags & elf::program_header::PF_X != 0
+            && (header.p_vaddr..memory_end).contains(&elf.entry)
+        {
+            entry_is_executable = true;
+        }
+        dest_start = dest_start.min(header.p_vaddr);
+        dest_end = dest_end.max(memory_end);
+    }
+    assert!(
+        load_segments != 0,
+        "Kernel ELF contains no loadable segments"
+    );
+    assert!(
+        entry_is_executable,
+        "Kernel entry point is not in an executable segment"
+    );
+
+    let allocation_start = dest_start & !4095;
+    assert!(
+        allocation_start != 0,
+        "Kernel ELF may not be loaded at physical address zero"
+    );
+    let allocation_end = dest_end
+        .checked_add(4095)
+        .map(|end| end & !4095)
+        .expect("Kernel allocation range overflow");
+    let page_count = allocation_end
+        .checked_sub(allocation_start)
+        .map(|size| size / 4096)
+        .and_then(|pages| usize::try_from(pages).ok())
+        .filter(|pages| *pages != 0)
+        .expect("Kernel allocation range is invalid");
 
     uefi::boot::allocate_pages(
-        AllocateType::Address(dest_start),
+        AllocateType::Address(allocation_start),
         MemoryType::LOADER_DATA,
-        dest_end
-            .checked_sub(dest_start)
-            .and_then(|size| size.checked_add(4095))
-            .map(|size| size / 4096)
-            .unwrap_or(0) as usize,
+        page_count,
     )
     .expect("Failed to allocate pages");
 
-    elf.program_headers
+    unsafe {
+        core::ptr::write_bytes(allocation_start as *mut u8, 0, page_count * 4096);
+    }
+
+    for header in elf
+        .program_headers
         .iter()
         .filter(|header| header.p_type == elf::program_header::PT_LOAD)
-        .for_each(|header| {
-            let dest = unsafe {
-                slice::from_raw_parts_mut(header.p_vaddr as *mut u8, header.p_memsz as usize)
-            };
-
-            let file_size = header.p_filesz as usize;
-            let offset = header.p_offset as usize;
-
-            dest[..file_size].copy_from_slice(&bin[offset..offset + file_size]);
-            dest[file_size..].fill(0);
-        });
+    {
+        let memory_size = usize::try_from(header.p_memsz).expect("ELF segment is too large");
+        let file_size = usize::try_from(header.p_filesz).expect("ELF segment is too large");
+        let offset = usize::try_from(header.p_offset).expect("ELF file offset is too large");
+        let dest = unsafe { slice::from_raw_parts_mut(header.p_vaddr as *mut u8, memory_size) };
+        dest[..file_size].copy_from_slice(&bin[offset..offset + file_size]);
+    }
 
     elf.entry
 }

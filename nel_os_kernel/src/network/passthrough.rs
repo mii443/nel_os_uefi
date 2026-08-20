@@ -43,8 +43,7 @@ impl PassthroughDescriptor {
         let address =
             pci::find_nth_virtio_net(1).ok_or("a second virtio-net PCI device was not found")?;
         let io_base = pci::io_bar(address).unwrap_or(0);
-        let iommu_base = find_dmar_register_base(rsdp)
-            .ok_or("ACPI DMAR does not describe a segment-zero Intel IOMMU")?;
+        let iommu_base = find_dmar_register_base(rsdp, address)?;
         let mut bars = [0u32; 6];
         let mut bar_masks = [0u32; 6];
         for index in 0..6 {
@@ -96,6 +95,7 @@ pub struct PassthroughNic {
     bar_probe: [bool; 6],
     fault_reported: bool,
     last_interrupt_poll_tsc: u64,
+    last_interrupt_level: bool,
     last_fault_poll_tsc: u64,
     interrupt_poll_cycles: u64,
     fault_poll_cycles: u64,
@@ -120,6 +120,7 @@ impl PassthroughNic {
             bar_probe: [false; 6],
             fault_reported: false,
             last_interrupt_poll_tsc: 0,
+            last_interrupt_level: false,
             last_fault_poll_tsc: 0,
             interrupt_poll_cycles: tsc_khz.saturating_mul(4),
             fault_poll_cycles: tsc_khz.saturating_mul(1_000),
@@ -199,6 +200,7 @@ impl PassthroughNic {
 
     pub fn poll_interrupt_level(&mut self) -> (u8, bool) {
         if self.command & 0x6 != 0x6 {
+            self.last_interrupt_level = false;
             return (GUEST_IRQ, false);
         }
 
@@ -206,11 +208,10 @@ impl PassthroughNic {
         if self.last_interrupt_poll_tsc != 0
             && now.wrapping_sub(self.last_interrupt_poll_tsc) < self.interrupt_poll_cycles
         {
-            // The physical INTx status was already offered to the guest on the
-            // sampling pass. Holding the cached level high would re-inject the
-            // same interrupt repeatedly until the next expensive host PCI
-            // read, even after the guest consumed the virtio ISR.
-            return (GUEST_IRQ, false);
+            // INTx is level-triggered. Preserve the sampled level until the
+            // next physical PCI status read; clearing it here can lose an
+            // interrupt while the guest temporarily blocks injection.
+            return (GUEST_IRQ, self.last_interrupt_level);
         }
         self.last_interrupt_poll_tsc = now;
 
@@ -235,6 +236,7 @@ impl PassthroughNic {
         // the guest driver can determine why the device interrupted.
         const PCI_STATUS_INTERRUPT: u16 = 1 << 3;
         let asserted = self.descriptor.address.read_u16(0x06) & PCI_STATUS_INTERRUPT != 0;
+        self.last_interrupt_level = asserted;
         (GUEST_IRQ, asserted)
     }
 
@@ -244,6 +246,7 @@ impl PassthroughNic {
         self.bar_probe = [false; 6];
         self.fault_reported = false;
         self.last_interrupt_poll_tsc = 0;
+        self.last_interrupt_level = false;
         self.last_fault_poll_tsc = 0;
         if self.descriptor.io_base != 0 {
             unsafe { Port::<u8>::new(self.descriptor.io_base + 18).write(0) };
@@ -301,6 +304,9 @@ impl PassthroughNic {
             self.command = command as u16 & 0x0007;
             if self.command != old_command {
                 self.last_interrupt_poll_tsc = 0;
+                if self.command & 0x6 != 0x6 {
+                    self.last_interrupt_level = false;
+                }
             }
             if old_command & (1 << 2) == 0 && self.command & (1 << 2) != 0 {
                 fence(Ordering::SeqCst);
@@ -367,6 +373,10 @@ impl DmaDomain {
         allocator: &mut dyn FrameAllocator<Size4KiB>,
     ) -> Result<Self, &'static str> {
         let cap = unsafe { mmio_read_u64(descriptor.iommu_base + IOMMU_CAP) };
+        let ecap = unsafe { mmio_read_u64(descriptor.iommu_base + IOMMU_ECAP) };
+        if ecap & (1 << 6) == 0 {
+            return Err("Intel IOMMU lacks pass-through translation for host-owned devices");
+        }
         let sagaw = ((cap >> 8) & 0x1f) as u8;
         let (agaw, levels) = if sagaw & (1 << 2) != 0 {
             (2u64, 4u8)
@@ -570,10 +580,62 @@ fn merge(target: &mut u32, byte_offset: u16, size: u8, value: u32) {
     *target = (*target & !mask) | ((value << shift) & mask);
 }
 
-fn find_dmar_register_base(rsdp: u64) -> Option<u64> {
+fn select_unique(candidate: &mut Option<u64>, base: u64) -> Result<(), &'static str> {
+    if candidate.is_some_and(|current| current != base) {
+        return Err("ACPI DMAR assigns the passthrough device to multiple IOMMUs");
+    }
+    *candidate = Some(base);
+    Ok(())
+}
+
+fn scope_matches_target(
+    scope: u64,
+    scope_length: usize,
+    target: PciAddress,
+) -> Result<bool, &'static str> {
+    if scope_length < 8 || (scope_length - 6) % 2 != 0 {
+        return Err("ACPI DMAR contains a malformed device scope");
+    }
+    let scope_type = unsafe { read_unaligned(scope as *const u8) };
+    if scope_type != 1 && scope_type != 2 {
+        return Ok(false);
+    }
+
+    let mut bus = unsafe { read_unaligned((scope + 5) as *const u8) };
+    let path_entries = (scope_length - 6) / 2;
+    for index in 0..path_entries {
+        let device = unsafe { read_unaligned((scope + 6 + (index * 2) as u64) as *const u8) };
+        let function = unsafe { read_unaligned((scope + 7 + (index * 2) as u64) as *const u8) };
+        if device >= 32 || function >= 8 {
+            return Err("ACPI DMAR device scope contains an invalid PCI path");
+        }
+        let address = PciAddress {
+            bus,
+            device,
+            function,
+        };
+        let last = index + 1 == path_entries;
+        if last {
+            if scope_type == 1 {
+                return Ok(address == target);
+            }
+            let secondary = address.read_u8(0x19);
+            let subordinate = address.read_u8(0x1a);
+            return Ok(address == target
+                || (secondary != 0 && secondary <= target.bus && target.bus <= subordinate));
+        }
+        bus = address.read_u8(0x19);
+        if bus == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+fn find_dmar_register_base(rsdp: u64, target: PciAddress) -> Result<u64, &'static str> {
     unsafe {
         if rsdp == 0 || core::slice::from_raw_parts(rsdp as *const u8, 8) != b"RSD PTR " {
-            return None;
+            return Err("ACPI RSDP is missing or invalid");
         }
         let revision = *((rsdp + 15) as *const u8);
         let (root, entry_size) = if revision >= 2 {
@@ -583,9 +645,11 @@ fn find_dmar_register_base(rsdp: u64) -> Option<u64> {
         };
         let length = read_unaligned((root + 4) as *const u32) as usize;
         if length < 36 || length > 1024 * 1024 {
-            return None;
+            return Err("ACPI root table has an invalid length");
         }
         let entries = (length - 36) / entry_size;
+        let mut scoped_match = None;
+        let mut include_all_match = None;
         for index in 0..entries {
             let pointer = root + 36 + (index * entry_size) as u64;
             let table_address = if entry_size == 8 {
@@ -598,7 +662,7 @@ fn find_dmar_register_base(rsdp: u64) -> Option<u64> {
             }
             let table_length = read_unaligned((table_address + 4) as *const u32) as usize;
             if table_length < 48 || table_length > 1024 * 1024 {
-                return None;
+                return Err("ACPI DMAR has an invalid length");
             }
             let mut offset = 48usize;
             while offset + 16 <= table_length {
@@ -606,19 +670,43 @@ fn find_dmar_register_base(rsdp: u64) -> Option<u64> {
                 let typ = read_unaligned(structure as *const u16);
                 let structure_length = read_unaligned((structure + 2) as *const u16) as usize;
                 if structure_length < 4 || offset + structure_length > table_length {
-                    return None;
+                    return Err("ACPI DMAR contains a malformed remapping structure");
                 }
-                // QEMU may describe endpoint scopes instead of setting the
-                // INCLUDE_PCI_ALL flag. The register block still controls the
-                // complete segment-zero translation root programmed here.
-                if typ == 0 && read_unaligned((structure + 6) as *const u16) == 0 {
-                    return Some(read_unaligned((structure + 8) as *const u64));
+                if typ == 0 {
+                    if structure_length < 16 {
+                        return Err("ACPI DMAR contains a truncated DRHD");
+                    }
+                    let segment = read_unaligned((structure + 6) as *const u16);
+                    if segment == 0 {
+                        let base = read_unaligned((structure + 8) as *const u64);
+                        let flags = read_unaligned((structure + 4) as *const u8);
+                        if flags & 1 != 0 {
+                            select_unique(&mut include_all_match, base)?;
+                        }
+                        let mut scope_offset = 16usize;
+                        while scope_offset < structure_length {
+                            if scope_offset + 2 > structure_length {
+                                return Err("ACPI DMAR contains a truncated device scope");
+                            }
+                            let scope = structure + scope_offset as u64;
+                            let scope_length = read_unaligned((scope + 1) as *const u8) as usize;
+                            if scope_length < 6 || scope_offset + scope_length > structure_length {
+                                return Err("ACPI DMAR contains a malformed device scope");
+                            }
+                            if scope_matches_target(scope, scope_length, target)? {
+                                select_unique(&mut scoped_match, base)?;
+                            }
+                            scope_offset += scope_length;
+                        }
+                    }
                 }
                 offset += structure_length;
             }
         }
+        scoped_match
+            .or(include_all_match)
+            .ok_or("ACPI DMAR does not assign the passthrough device to an Intel IOMMU")
     }
-    None
 }
 
 #[cfg(test)]

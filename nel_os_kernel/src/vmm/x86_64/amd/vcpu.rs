@@ -12,7 +12,6 @@ use crate::{
     network::{PassthroughDescriptor, PassthroughNic},
     serial,
     storage::{GuestVirtioBlock, VirtioBlock},
-    time,
     vmm::{
         VCpu,
         x86_64::{
@@ -31,6 +30,8 @@ use crate::{
         },
     },
 };
+
+const MAX_FW_CFG_STRING_IO_BYTES: u64 = 64 * 1024;
 
 pub struct AMDVCpu {
     initialized: bool,
@@ -1133,7 +1134,7 @@ impl AMDVCpu {
             self.io_apic.eoi();
         }
         self.io_apic.synchronize();
-        let hpet_counter = (time::get_ticks() as u64).wrapping_mul(14_318);
+        let hpet_counter = common::timer::hpet_counter();
         self.npt
             .set_slice(0xfed0_00f0, &hpet_counter.to_le_bytes())?;
         if self.legacy_timer.pit.poll() {
@@ -1292,13 +1293,18 @@ impl AMDVCpu {
                 return Err("AMD guest attempted unsupported string I/O");
             }
             let count = if is_rep { self.guest_registers.rcx } else { 1 };
-            if count > self.guest_memory_size {
+            if count > self.guest_memory_size || count > MAX_FW_CFG_STRING_IO_BYTES {
                 return Err("AMD guest fw_cfg transfer is too large");
             }
             let decrement = self.vmcb.get_raw_vmcb().state_save_area.rflags & (1 << 10) != 0;
             for _ in 0..count {
-                let address =
-                    self.vmcb.get_raw_vmcb().state_save_area.es.base + self.guest_registers.rdi;
+                let address = self
+                    .vmcb
+                    .get_raw_vmcb()
+                    .state_save_area
+                    .es
+                    .base
+                    .wrapping_add(self.guest_registers.rdi);
                 let value = self.fw_cfg.read_u8(self.guest_memory_size);
                 self.npt.set(address, value)?;
                 self.guest_registers.rdi = if decrement {
@@ -1675,11 +1681,14 @@ impl VCpu for AMDVCpu {
     fn run(
         &mut self,
         frame_allocator: &mut BitmapMemoryTable,
-        block: Option<&mut VirtioBlock>,
+        mut block: Option<&mut VirtioBlock>,
     ) -> Result<(), &'static str> {
         interrupts::without_interrupts(|| {
             let result = (|| unsafe {
                 self.prepare(frame_allocator)?;
+                if let Some(device) = block.as_deref_mut() {
+                    self.guest_block.service_pending(&mut self.npt, device)?;
+                }
 
                 {
                     let vmcb = self.vmcb.get_raw_vmcb();
@@ -1857,7 +1866,13 @@ impl VCpu for AMDVCpu {
 
     fn is_idle(&self) -> bool {
         self.halted
-            && self.vmcb.get_raw_vmcb().control_area.event_injection & (1 << 31) == 0
+            && self
+                .vmcb
+                .get_raw_vmcb_readonly()
+                .control_area
+                .event_injection
+                & (1 << 31)
+                == 0
             && !self.local_apic.has_pending_timer()
             && self.guest_block.pending_msi_vector().is_none()
             && !self.io_apic.has_pending_interrupt()
@@ -2001,6 +2016,17 @@ impl VCpu for AMDVCpu {
 
         if common::read_msr(0xc001_0114) & (1 << 4) != 0 {
             error!("SVM disabled by BIOS");
+            return false;
+        }
+
+        const REQUIRED_SVM_FEATURES: u32 = (1 << 0) | (1 << 3) | (1 << 10);
+        let svm = cpuid!(0x8000_000a);
+        if svm.ebx < 2 {
+            error!("SVM does not provide a usable guest ASID");
+            return false;
+        }
+        if svm.edx & REQUIRED_SVM_FEATURES != REQUIRED_SVM_FEATURES {
+            error!("SVM requires nested paging, NRIP save, and pause filtering");
             return false;
         }
 

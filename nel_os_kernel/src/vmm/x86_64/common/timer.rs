@@ -2,6 +2,17 @@
 
 /// ACPI PM timer clock frequency mandated by the ACPI specification.
 const ACPI_PM_HZ: u128 = 3_579_545;
+const HPET_HZ: u128 = 14_318_180;
+
+pub fn hpet_counter() -> u64 {
+    let tsc_khz = crate::interrupt::apic::GUEST_TSC_KHZ
+        .get()
+        .copied()
+        .unwrap_or(1_000_000)
+        .max(1);
+    let tsc = unsafe { x86::time::rdtsc() };
+    (u128::from(tsc) * HPET_HZ / (u128::from(tsc_khz) * 1_000)) as u64
+}
 
 pub struct AcpiPmTimer {
     start_tsc: u64,

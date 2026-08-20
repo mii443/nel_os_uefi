@@ -27,6 +27,8 @@ const MILLIS_PER_SECOND: usize = 1_000;
 const START_COMMAND: &[u8] = b"start";
 const START_RESPONSE: &[u8] = b"OK starting Linux VM\n";
 const COMMAND_ERROR_RESPONSE: &[u8] = b"ERR send: start\n";
+const AUTH_COMMAND_ERROR_RESPONSE: &[u8] = b"ERR send: start <token>\n";
+const MANAGEMENT_DISABLED_RESPONSE: &[u8] = b"ERR remote management disabled\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv4Config {
@@ -70,6 +72,8 @@ pub struct NetworkStack {
     lease_expiry_tick: usize,
     config: Option<Ipv4Config>,
     start_requested: bool,
+    remote_management_enabled: bool,
+    management_token: Option<super::management::AuthToken>,
     management: super::management::ManagementListener,
 }
 
@@ -92,8 +96,21 @@ impl NetworkStack {
             lease_expiry_tick: 0,
             config: None,
             start_requested: false,
+            remote_management_enabled: true,
+            management_token: None,
             management: super::management::ManagementListener::new(),
         }
+    }
+
+    pub fn require_management_auth(&mut self, token: super::management::AuthToken) {
+        self.management.require_auth(token);
+        self.management_token = Some(token);
+    }
+
+    pub fn disable_remote_management(&mut self) {
+        self.remote_management_enabled = false;
+        self.management_token = None;
+        self.management.disable();
     }
 
     pub fn ipv4_config(&self) -> Option<Ipv4Config> {
@@ -294,6 +311,9 @@ impl NetworkStack {
                 .config
                 .is_some_and(|config| ip[16..20] == config.address) =>
             {
+                if !self.remote_management_enabled {
+                    return None;
+                }
                 let config = self.config.unwrap();
                 self.management.handle_ipv4(
                     frame,
@@ -382,9 +402,20 @@ impl NetworkStack {
             return None;
         }
         let command = trim_ascii(&udp[UDP_HEADER_LEN..udp_len]);
-        let reply = if command.eq_ignore_ascii_case(START_COMMAND) {
+        let authenticated_start = if let Some(token) = self.management_token.as_ref() {
+            command
+                .strip_prefix(b"start ")
+                .is_some_and(|candidate| super::management::auth_token_matches(candidate, token))
+        } else {
+            command.eq_ignore_ascii_case(START_COMMAND)
+        };
+        let reply = if !self.remote_management_enabled {
+            MANAGEMENT_DISABLED_RESPONSE
+        } else if authenticated_start {
             self.start_requested = true;
             START_RESPONSE
+        } else if self.management_token.is_some() {
+            AUTH_COMMAND_ERROR_RESPONSE
         } else {
             COMMAND_ERROR_RESPONSE
         };

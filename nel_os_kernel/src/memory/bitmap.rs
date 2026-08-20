@@ -1,19 +1,12 @@
 use core::slice;
 
 use nel_os_common::memory::{self, UsableMemory};
-use spin::Once;
 use x86_64::{
     PhysAddr,
     structures::paging::{FrameAllocator, PhysFrame, Size4KiB},
 };
 
 use crate::constant::{BITS_PER_ENTRY, PAGE_SIZE};
-
-pub static MAX_MEMORY: Once<usize> = Once::new();
-
-pub fn get_entry_count() -> usize {
-    MAX_MEMORY.get().unwrap_or(&0) / PAGE_SIZE / BITS_PER_ENTRY
-}
 
 pub struct BitmapMemoryTable {
     pub used_map: &'static mut [usize],
@@ -29,10 +22,25 @@ impl BitmapMemoryTable {
             max_addr = max_addr.max(range.end);
         }
 
-        let entry_count = get_entry_count();
-        let bitmap_size = entry_count * core::mem::size_of::<usize>();
-
-        let bitmap_addr = ((max_addr as usize).saturating_sub(bitmap_size)) & !(PAGE_SIZE - 1);
+        let max_addr = usize::try_from(max_addr).expect("physical address space is too large");
+        let frame_count = max_addr.div_ceil(PAGE_SIZE);
+        assert!(frame_count != 0, "usable physical memory map is empty");
+        let entry_count = frame_count.div_ceil(BITS_PER_ENTRY);
+        let bitmap_size = entry_count
+            .checked_mul(core::mem::size_of::<usize>())
+            .expect("physical memory bitmap is too large");
+        let bitmap_frames = bitmap_size.div_ceil(PAGE_SIZE);
+        let bitmap_bytes = bitmap_frames * PAGE_SIZE;
+        let bitmap_addr = usable_memory
+            .ranges()
+            .iter()
+            .rev()
+            .find_map(|range| {
+                let start = (range.start as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+                let end = (range.end as usize) & !(PAGE_SIZE - 1);
+                (end >= start.saturating_add(bitmap_bytes)).then_some(end - bitmap_bytes)
+            })
+            .expect("no usable range can hold the physical memory bitmap");
 
         let used_map = unsafe {
             let ptr = bitmap_addr as *mut usize;
@@ -45,8 +53,8 @@ impl BitmapMemoryTable {
 
         let mut table = Self {
             used_map,
-            start: 0,
-            end: usize::MAX,
+            start: frame_count,
+            end: frame_count,
             free_frames: 0,
         };
 
@@ -60,18 +68,18 @@ impl BitmapMemoryTable {
         table.set_frame(0, false);
 
         let bitmap_start_frame = Self::addr_to_pfn(bitmap_addr);
-        let bitmap_frames = bitmap_size.div_ceil(PAGE_SIZE);
         for i in 0..bitmap_frames {
             table.set_frame(bitmap_start_frame + i, false);
         }
 
-        for i in 0..entry_count {
-            let index = entry_count - i - 1;
-            if table.used_map[index] != 0 {
-                let offset = 63 - table.used_map[index].leading_zeros();
-                table.end = index * BITS_PER_ENTRY + (BITS_PER_ENTRY - offset as usize);
-                break;
-            }
+        if let Some((index, entry)) = table
+            .used_map
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| **entry != 0)
+        {
+            table.end = index * BITS_PER_ENTRY + (usize::BITS - entry.leading_zeros()) as usize;
         }
 
         table
@@ -131,11 +139,16 @@ impl BitmapMemoryTable {
     }
 
     pub fn set_range(&mut self, range: &memory::Range) {
-        let start = Self::addr_to_pfn(range.start as usize);
-        let size = (range.end - range.start) / PAGE_SIZE as u64;
+        let start_addr = (range.start as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let end_addr = (range.end as usize) & !(PAGE_SIZE - 1);
+        if start_addr >= end_addr {
+            return;
+        }
+        let start = Self::addr_to_pfn(start_addr);
+        let size = (end_addr - start_addr) / PAGE_SIZE;
 
         for i in 0..size {
-            self.set_frame(start + i as usize, true);
+            self.set_frame(start + i, true);
         }
     }
 
@@ -163,6 +176,9 @@ impl BitmapMemoryTable {
 
     pub fn get_bit(&self, frame: usize) -> bool {
         let index = Self::frame_to_index(frame);
+        if index >= self.used_map.len() {
+            return false;
+        }
         let offset = Self::frame_to_offset(frame);
 
         (self.used_map[index] & (1usize << offset)) != 0

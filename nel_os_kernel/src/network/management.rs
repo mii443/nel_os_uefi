@@ -16,8 +16,12 @@ const TCP_MAX_RETRANSMITS: u8 = 5;
 const TCP_SYN_COOKIE_PERIOD_MILLIS: u64 = 30_000;
 const TCP_CLOSE_TIMEOUT_MILLIS: u64 = 10_000;
 const TCP_IDLE_TIMEOUT_MILLIS: u64 = 15 * 60 * 1000;
+const TCP_AUTH_TIMEOUT_MILLIS: u64 = 10_000;
+const AUTH_TOKEN_LEN: usize = 32;
+const AUTH_PROMPT: &[u8] = b"Authentication required. Enter: auth <token>\r\nauth> ";
 pub(super) const MAX_MANAGEMENT_CONNECTIONS: usize = 4;
 pub(crate) type ConnectionId = usize;
+pub(crate) type AuthToken = [u8; AUTH_TOKEN_LEN];
 
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -160,6 +164,19 @@ impl ManagementListener {
             connections: [const { ManagementServer::new() }; MAX_MANAGEMENT_CONNECTIONS],
             next_command: 0,
             next_poll: 0,
+        }
+    }
+
+    pub fn require_auth(&mut self, token: AuthToken) {
+        for connection in &mut self.connections {
+            connection.require_auth(token);
+        }
+    }
+
+    pub fn disable(&mut self) {
+        for connection in &mut self.connections {
+            connection.enabled = false;
+            connection.reset();
         }
     }
 
@@ -321,6 +338,11 @@ impl ManagementListener {
 }
 
 pub struct ManagementServer {
+    enabled: bool,
+    auth_required: bool,
+    authenticated: bool,
+    auth_failures: u8,
+    auth_token: AuthToken,
     state: TcpState,
     peer_mac: [u8; 6],
     peer_ip: [u8; 4],
@@ -351,6 +373,11 @@ pub struct ManagementServer {
 impl ManagementServer {
     pub const fn new() -> Self {
         Self {
+            enabled: true,
+            auth_required: false,
+            authenticated: true,
+            auth_failures: 0,
+            auth_token: [0; AUTH_TOKEN_LEN],
             state: TcpState::Closed,
             peer_mac: [0; 6],
             peer_ip: [0; 4],
@@ -377,6 +404,12 @@ impl ManagementServer {
             last_input_was_cr: false,
             commands: CommandQueue::new(),
         }
+    }
+
+    fn require_auth(&mut self, token: AuthToken) {
+        self.auth_required = true;
+        self.auth_token = token;
+        self.reset();
     }
 
     pub fn take_command(&mut self) -> Option<ManagementCommand> {
@@ -472,6 +505,9 @@ impl ManagementServer {
             TcpState::CloseWait | TcpState::LastAck => {
                 (self.last_activity_at, TCP_CLOSE_TIMEOUT_MILLIS)
             }
+            TcpState::Established if !self.authenticated => {
+                (self.last_activity_at, TCP_AUTH_TIMEOUT_MILLIS)
+            }
             TcpState::Established => (self.last_activity_at, TCP_IDLE_TIMEOUT_MILLIS),
             TcpState::Closed => (now, 0),
         };
@@ -492,6 +528,9 @@ impl ManagementServer {
         now: usize,
         response: &mut [u8],
     ) -> Option<usize> {
+        if !self.enabled {
+            return None;
+        }
         let now = management_clock_millis(now);
         let tcp_offset = ETHERNET_HEADER_LEN.checked_add(ip_header_len)?;
         let tcp_len = ip_total_len.checked_sub(ip_header_len)?;
@@ -590,7 +629,11 @@ impl ManagementServer {
             self.send_next = acknowledgement;
             self.state = TcpState::Established;
             self.last_activity_at = now;
-            self.output.push_slice(BANNER);
+            self.output.push_slice(if self.authenticated {
+                BANNER
+            } else {
+                AUTH_PROMPT
+            });
             return self.emit(local_mac, local_ip, now, response);
         }
 
@@ -736,7 +779,11 @@ impl ManagementServer {
 
     fn finish_or_prompt(&mut self) {
         if self.line_len == 0 {
-            self.enqueue_command(ManagementCommand::Prompt);
+            if self.authenticated {
+                self.enqueue_command(ManagementCommand::Prompt);
+            } else {
+                self.output.push_slice(b"auth> ");
+            }
             return;
         }
         self.finish_line();
@@ -759,6 +806,22 @@ impl ManagementServer {
     }
 
     fn finish_line(&mut self) {
+        if !self.authenticated {
+            if auth_line_matches(&self.line[..self.line_len], &self.auth_token) {
+                self.authenticated = true;
+                self.auth_failures = 0;
+                self.output.push_slice(BANNER);
+            } else {
+                self.auth_failures = self.auth_failures.saturating_add(1);
+                self.output.push_slice(b"ERR authentication failed\r\n");
+                if self.auth_failures >= 3 {
+                    self.request_close();
+                } else {
+                    self.output.push_slice(b"auth> ");
+                }
+            }
+            return;
+        }
         let command = parse_command(&self.line[..self.line_len]);
         self.enqueue_command(command);
     }
@@ -919,6 +982,8 @@ impl ManagementServer {
     }
 
     fn reset(&mut self) {
+        self.authenticated = !self.auth_required;
+        self.auth_failures = 0;
         self.state = TcpState::Closed;
         self.peer_mac = [0; 6];
         self.peer_ip = [0; 4];
@@ -939,6 +1004,24 @@ impl ManagementServer {
         self.last_input_was_cr = false;
         self.commands.clear();
     }
+}
+
+pub(crate) fn auth_token_matches(candidate: &[u8], token: &AuthToken) -> bool {
+    if candidate.len() != token.len() {
+        return false;
+    }
+    candidate
+        .iter()
+        .zip(token)
+        .fold(0u8, |difference, (&left, &right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn auth_line_matches(line: &[u8], token: &AuthToken) -> bool {
+    line.strip_prefix(b"auth ")
+        .is_some_and(|candidate| auth_token_matches(candidate, token))
 }
 
 #[allow(clippy::too_many_arguments)]

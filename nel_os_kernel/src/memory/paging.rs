@@ -9,22 +9,34 @@ use x86_64::{
 
 use crate::info;
 
-pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> *mut PageTable {
+const PML4_ENTRY_BYTES: u64 = 512 * Size1GiB::SIZE;
+const LOWER_HALF_PML4_ENTRIES: usize = 256;
+
+pub fn init_page_table(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    physical_end: u64,
+) -> Result<*mut PageTable, &'static str> {
+    if physical_end == 0 {
+        return Err("physical memory map is empty");
+    }
+    let required_entries = physical_end.div_ceil(PML4_ENTRY_BYTES) as usize;
+    if required_entries > LOWER_HALF_PML4_ENTRIES {
+        return Err("physical memory exceeds the 4-level direct-map address space");
+    }
+
     let (lv4_frame, lv4_table) = new_page_table(frame_allocator);
-    let (lv3_frame, lv3_table) = new_page_table(frame_allocator);
 
     let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::ACCESSED;
 
     let lv4: &mut PageTable = unsafe { &mut *lv4_table };
-
-    lv4[0].set_frame(lv3_frame, base_flags);
-
-    unsafe {
-        let lv3: &mut PageTable = &mut *lv3_table;
-
-        for (index, lv3_pte) in lv3.iter_mut().enumerate() {
+    for lv4_index in 0..required_entries {
+        let (lv3_frame, lv3_table) = new_page_table(frame_allocator);
+        lv4[lv4_index].set_frame(lv3_frame, base_flags);
+        let lv3: &mut PageTable = unsafe { &mut *lv3_table };
+        for (lv3_index, lv3_pte) in lv3.iter_mut().enumerate() {
+            let address = lv4_index as u64 * PML4_ENTRY_BYTES + lv3_index as u64 * Size1GiB::SIZE;
             lv3_pte.set_addr(
-                PhysAddr::new(index as u64 * Size1GiB::SIZE),
+                PhysAddr::new(address),
                 base_flags | PageTableFlags::HUGE_PAGE,
             );
         }
@@ -36,18 +48,19 @@ pub fn init_page_table(frame_allocator: &mut impl FrameAllocator<Size4KiB>) -> *
         Cr3::write(lv4_frame, Cr3Flags::empty());
     }
 
-    lv4_table
+    Ok(lv4_table)
 }
 
 fn new_page_table(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> (PhysFrame, *mut PageTable) {
     let frame = frame_allocator.allocate_frame().unwrap();
+    let address = frame.start_address().as_u64();
+    unsafe {
+        core::ptr::write_bytes(address as *mut u8, 0, Size4KiB::SIZE as usize);
+    }
 
-    (
-        frame,
-        VirtAddr::new(frame.start_address().as_u64()).as_mut_ptr(),
-    )
+    (frame, VirtAddr::new(address).as_mut_ptr())
 }
 
 pub fn get_active_level_4_table() -> &'static mut PageTable {

@@ -15,7 +15,11 @@ is no fixed VM-slot count; creation is limited by available host memory and
 hardware virtualization resources. VCPUs are scheduled round-robin on QEMU's
 one hypervisor CPU. After management DHCP succeeds, the hypervisor exposes a
 TCP management shell on port `5555`. The legacy UDP `start` command remains
-available and is idempotent for the already-running VM 0.
+available and is idempotent for the already-running VM 0. A fresh 128-bit
+management token is printed only on the physical serial console at each boot;
+TCP and UDP management requests must present it. If the CPU cannot provide
+RDRAND entropy, remote management is disabled while the local console remains
+available.
 
 ### Shared checkout and local builds
 
@@ -125,6 +129,10 @@ From another terminal, open the interactive management shell:
 nc 127.0.0.1 5555
 ```
 
+Enter `auth <token>` at the authentication prompt, using the token printed by
+the hypervisor during startup. Authentication must complete within 10 seconds;
+three failed attempts close the connection.
+
 The shell supports:
 
 ```text
@@ -213,7 +221,7 @@ serial buffers.
 The UDP start command remains available:
 
 ```sh
-printf 'start\n' | nc -u -w 2 127.0.0.1 5555
+printf 'start %s\n' "$NEL_OS_MANAGEMENT_TOKEN" | nc -u -w 2 127.0.0.1 5555
 ```
 
 `NEL_OS_NET_BIND_ADDR` and `NEL_OS_NET_HOST_PORT` change the host-side bind
@@ -275,16 +283,20 @@ the address printed in the serial console's `DHCP lease` message:
 nc <hypervisor-dhcp-address> 5555
 ```
 
+Authenticate with `auth <token>` using the boot token shown on the physical
+serial console.
+
 Or use the compatibility UDP start command:
 
 ```sh
-printf 'start\n' | nc -u -w 2 <hypervisor-dhcp-address> 5555
+printf 'start %s\n' "$NEL_OS_MANAGEMENT_TOKEN" | nc -u -w 2 <hypervisor-dhcp-address> 5555
 ```
 
 Devices on the same LAN can connect directly in bridge mode; there is no host
-port forwarding in that mode. The management shell is intentionally
-unauthenticated, so only expose bridge mode or a non-loopback bind address on a
-trusted management network.
+port forwarding in that mode. Token authentication protects lifecycle and
+serial-console access, but traffic remains unencrypted; use a trusted
+management network or a protected tunnel when credentials or guest console
+contents are sensitive.
 
 `NEL_OS_NET_BRIDGE`, `NEL_OS_NET_TAP`, and `NEL_OS_GUEST_NET_TAP` can override
 the default bridge and interface names. `NEL_OS_NET_MAC` and
